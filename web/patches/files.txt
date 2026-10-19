@@ -7,7 +7,6 @@ rt64 src/hle/rt64_workload_queue.cpp 521c1a1eef712d6bdbb7cd53c679d1147e424a4c
 rt64 src/render/rt64_shader_library.cpp 366dd2918d96bc0296b2228e74c1f59a3cd92753
 rt64 src/shaders/RasterPS.hlsl 2c2f5eebb82c4111c7ce61c11ec1e3557990dadc
 rt64 src/shaders/TextureSampler.hlsli 24660bf01c6dd754c90eed83b367593409fade4a
-rt64 src/render/rt64_texture_cache.cpp a36534f22fec71d029e7732eb428ba64a4695f1d
 N64ModernRuntime ultramodern/src/events.cpp fbf578b51918e2372476cb499c053ad749f63fb8
 RecompFrontend recompui/src/util/file.cpp 7dfcee2cf674b655b7f4b15bcea8527afa275a6d
 RecompFrontend recompui/src/composites/ui_mod_menu.cpp d8bfb9dd4b65506fe272a34d1c2a439b95f6310c
