@@ -35,11 +35,34 @@ add_compile_definitions(
     __PRFCHWINTRIN_H
 )
 
+# With Emscripten (emcmake cmake), the game builds as a page for a browser, Rush2Recompiled.html, through
+# lib/N64Recomp-browser/frontend: RT64 and the menus on WebGPU, mods off. tools/build_web.sh builds it, and patches the
+# submodules first: lib/patches/*.patch, then N64Recomp-browser's web support over them (web/patches/files.txt says
+# where the two meet), so the patch step below is the desktop build's only.
+if (EMSCRIPTEN)
+    # Threads are pthreads (SharedArrayBuffer), and the runtime ends a game thread by throwing. -msimd128 is wasm SIMD,
+    # which every browser with WebGPU has.
+    add_compile_options(-pthread -fwasm-exceptions -msimd128)
+    # With -msimd128 xxHash would take its NEON path through Emscripten's arm_neon.h, which doesn't compile in C++
+    # there. XXH_HAS_INCLUDE is used for nothing else, so XXH3 stays scalar.
+    add_compile_options("-DXXH_HAS_INCLUDE(x)=0")
+    add_link_options(-pthread -fwasm-exceptions)
+    # ccache when it is on PATH.
+    include(${CMAKE_SOURCE_DIR}/lib/N64Recomp-browser/frontend/build_speed.cmake)
+    # The shaders the page specializes at build time and builds before the game draws with them (web/rt64_shaders.txt
+    # says why and how it was recorded).
+    if (EXISTS "${CMAKE_SOURCE_DIR}/web/rt64_shaders.txt")
+        set(RT64_PREBUILT_SHADER_LIST ${CMAKE_SOURCE_DIR}/web/rt64_shaders.txt)
+    endif()
+endif()
+
 # Changes to the submodules in lib/ are kept as lib/patches/<submodule>.patch, so they commit with this project and the
 # submodules stay on their upstream commits. Each patch is applied to its submodule's working tree here. After editing
 # a submodule, write its patch again with `python tools/lib_patch.py save` before committing.
 find_package(Git REQUIRED)
-file(GLOB LIB_PATCHES "${CMAKE_SOURCE_DIR}/lib/patches/*.patch")
+if (NOT EMSCRIPTEN)
+    file(GLOB LIB_PATCHES "${CMAKE_SOURCE_DIR}/lib/patches/*.patch")
+endif()
 foreach(LIB_PATCH ${LIB_PATCHES})
     get_filename_component(LIB_NAME ${LIB_PATCH} NAME_WE)
     set(LIB_DIR "${CMAKE_SOURCE_DIR}/lib/${LIB_NAME}")
@@ -78,13 +101,22 @@ set(BUILD_SHARED_LIBS OFF)
 
 add_subdirectory(${CMAKE_SOURCE_DIR}/lib/N64ModernRuntime)
 
+if (EMSCRIPTEN)
+    add_subdirectory(${CMAKE_SOURCE_DIR}/lib/N64Recomp-browser/frontend ${CMAKE_BINARY_DIR}/web_frontend)
+    # fmt 11.1 (N64Recomp's) leans on <cstdlib> arriving through other headers, which Emscripten's libc++ doesn't do.
+    target_compile_options(fmt PRIVATE -include cstdlib)
+endif()
+
 # Online play (src/online/, docs/online.md): ENet for the connections, miniupnpc to open the host's port on the router.
-add_subdirectory(${CMAKE_SOURCE_DIR}/lib/enet ${CMAKE_BINARY_DIR}/enet)
-set(UPNPC_BUILD_SHARED OFF CACHE BOOL "" FORCE)
-set(UPNPC_BUILD_TESTS OFF CACHE BOOL "" FORCE)
-set(UPNPC_BUILD_SAMPLE OFF CACHE BOOL "" FORCE)
-set(UPNPC_NO_INSTALL ON CACHE BOOL "" FORCE)
-add_subdirectory(${CMAKE_SOURCE_DIR}/lib/miniupnp/miniupnpc ${CMAKE_BINARY_DIR}/miniupnpc)
+# A page has neither UDP nor a router to ask: the web build has no online play (src/online/online_web.cpp).
+if (NOT EMSCRIPTEN)
+    add_subdirectory(${CMAKE_SOURCE_DIR}/lib/enet ${CMAKE_BINARY_DIR}/enet)
+    set(UPNPC_BUILD_SHARED OFF CACHE BOOL "" FORCE)
+    set(UPNPC_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+    set(UPNPC_BUILD_SAMPLE OFF CACHE BOOL "" FORCE)
+    set(UPNPC_NO_INSTALL ON CACHE BOOL "" FORCE)
+    add_subdirectory(${CMAKE_SOURCE_DIR}/lib/miniupnp/miniupnpc ${CMAKE_BINARY_DIR}/miniupnpc)
+endif()
 
 target_include_directories(rt64 PRIVATE ${CMAKE_BINARY_DIR}/rt64/src)
 
@@ -113,6 +145,12 @@ target_include_directories(RecompiledFuncs PRIVATE
 file(GLOB FUNC_C_SOURCES ${CMAKE_SOURCE_DIR}/RecompiledFuncs/*.c)
 file(GLOB FUNC_CXX_SOURCES ${CMAKE_SOURCE_DIR}/RecompiledFuncs/*.cpp)
 target_sources(RecompiledFuncs PRIVATE ${FUNC_C_SOURCES} ${FUNC_CXX_SOURCES})
+
+# WebAssembly checks a call's signature when it links and turns a call to an undeclared function into a trap, so with
+# Emscripten that is an error in the recompiled code. N64Recomp's funcs.h declares everything its code calls.
+if (EMSCRIPTEN)
+    target_compile_options(RecompiledFuncs PRIVATE -Werror=implicit-function-declaration)
+endif()
 
 # Main executable
 add_executable(Rush2Recompiled)
@@ -198,9 +236,6 @@ target_sources(Rush2Recompiled PRIVATE
     ${CMAKE_SOURCE_DIR}/src/game_fixes.cpp
     ${CMAKE_SOURCE_DIR}/src/games_tab.cpp
     ${CMAKE_SOURCE_DIR}/src/online_tab.cpp
-    ${CMAKE_SOURCE_DIR}/src/online/online_net.cpp
-    ${CMAKE_SOURCE_DIR}/src/online/online_discovery.cpp
-    ${CMAKE_SOURCE_DIR}/src/online/online_upnp.cpp
     ${CMAKE_SOURCE_DIR}/src/online/online_game.cpp
     ${CMAKE_SOURCE_DIR}/src/online/online_lobby.cpp
     ${CMAKE_SOURCE_DIR}/src/ram_watch.cpp
@@ -274,6 +309,17 @@ target_sources(Rush2Recompiled PRIVATE
     ${CMAKE_SOURCE_DIR}/rsp/aspMain.cpp
 )
 
+# The online connections (ENet, UPnP), or on a page, where there are none, the same calls answering that.
+if (EMSCRIPTEN)
+    target_sources(Rush2Recompiled PRIVATE ${CMAKE_SOURCE_DIR}/src/online/online_web.cpp)
+else()
+    target_sources(Rush2Recompiled PRIVATE
+        ${CMAKE_SOURCE_DIR}/src/online/online_net.cpp
+        ${CMAKE_SOURCE_DIR}/src/online/online_discovery.cpp
+        ${CMAKE_SOURCE_DIR}/src/online/online_upnp.cpp
+    )
+endif()
+
 target_include_directories(Rush2Recompiled PRIVATE
     ${CMAKE_SOURCE_DIR}/include
     ${CMAKE_SOURCE_DIR}/lib/N64ModernRuntime/N64Recomp/lib/tomlplusplus
@@ -342,7 +388,7 @@ if (WIN32)
 
     # Executable icon (drawn by tools/build_icons.py). SDL also uses it for the window.
     target_sources(Rush2Recompiled PRIVATE ${CMAKE_SOURCE_DIR}/icons/app.rc)
-else()
+elseif (NOT EMSCRIPTEN)
     find_package(SDL2 REQUIRED)
     add_compile_definitions("PLUME_SDL_VULKAN_ENABLED")
     add_compile_definitions("RT64_SDL_WINDOW_VULKAN")
@@ -362,10 +408,12 @@ else()
     endif()
 endif()
 
-# Copy the UI assets and controller database next to the executable.
+# Copy the UI assets and controller database next to the executable (a page's are in its .data, below).
+if (NOT EMSCRIPTEN)
 add_custom_command(TARGET Rush2Recompiled POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_directory "${CMAKE_SOURCE_DIR}/assets" "$<TARGET_FILE_DIR:Rush2Recompiled>/assets"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different "${CMAKE_SOURCE_DIR}/recompcontrollerdb.txt" $<TARGET_FILE_DIR:Rush2Recompiled>)
+endif()
 
 # TODO fix the rt64 CMake script so that this doesn't need to be duplicated here
 # For DXC
@@ -378,9 +426,11 @@ set (DXC_CS_OPTS "${DXC_COMMON_OPTS}" "-E" "CSMain" "-T cs_6_0")
 set (DXC_GS_OPTS "${DXC_COMMON_OPTS}" "-E" "GSMain" "-T gs_6_0")
 set (DXC_RT_OPTS "${DXC_COMMON_OPTS}" "-D" "RT_SHADER" "-T" "lib_6_3" "-fspv-target-env=vulkan1.1spirv1.4" "-fspv-extension=SPV_KHR_ray_tracing" "-fspv-extension=SPV_EXT_descriptor_indexing")
 
-if (WIN32)
+# DXC runs on the machine that builds, which for the page (Emscripten) isn't the target, so the host picks the binary
+# (the page is 32-bit wasm, which would pick the arm64 dxc-linux on an x86-64 Linux host).
+if (CMAKE_HOST_WIN32)
     set (DXC "${PROJECT_SOURCE_DIR}/lib/rt64/src/contrib/dxc/bin/x64/dxc.exe")
-elseif (CMAKE_SIZEOF_VOID_P EQUAL 8 AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|amd64|AMD64")
+elseif (CMAKE_HOST_SYSTEM_PROCESSOR MATCHES "x86_64|amd64|AMD64")
     set (DXC "LD_LIBRARY_PATH=${PROJECT_SOURCE_DIR}/lib/rt64/src/contrib/dxc/lib/x64" "${PROJECT_SOURCE_DIR}/lib/rt64/src/contrib/dxc/bin/x64/dxc-linux")
 else()
     set (DXC "LD_LIBRARY_PATH=${PROJECT_SOURCE_DIR}/lib/rt64/src/contrib/dxc/lib/arm64" "${PROJECT_SOURCE_DIR}/lib/rt64/src/contrib/dxc/bin/arm64/dxc-linux")
@@ -400,19 +450,27 @@ if (WIN32)
 endif()
 
 target_link_libraries(Rush2Recompiled PRIVATE
-    enet
-    libminiupnpc-static
     RecompiledFuncs
     recompui
     recompinput
     librecomp
     ultramodern
     rt64
-    nfd
 )
 # recompinput uses recompui too; GNU ld only resolves symbols from libraries listed after their user.
 if (NOT WIN32)
     target_link_libraries(Rush2Recompiled PRIVATE recompui)
+endif()
+
+if (EMSCRIPTEN)
+    # The page (lib/N64Recomp-browser/frontend), with the menus' assets and the controller mappings in its .data file.
+    # No ROM: the player picks theirs in the launcher, and it stays in the browser.
+    n64recomp_browser_frontend_page(Rush2Recompiled)
+    target_link_options(Rush2Recompiled PRIVATE
+        "SHELL:--preload-file ${CMAKE_SOURCE_DIR}/assets@/assets"
+        "SHELL:--preload-file ${CMAKE_SOURCE_DIR}/recompcontrollerdb.txt@/recompcontrollerdb.txt")
+else()
+    target_link_libraries(Rush2Recompiled PRIVATE enet libminiupnpc-static nfd)
 endif()
 
 set_property(TARGET Rush2Recompiled PROPERTY VS_DEBUGGER_WORKING_DIRECTORY "${CMAKE_BINARY_DIR}")

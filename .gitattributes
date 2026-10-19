@@ -4,3 +4,6 @@ lib/patches/*.patch -text
 # Run or read on Linux (tools/build_linux.sh in WSL, the AppImage), where CRLF breaks them.
 *.sh text eol=lf
 linux/** text eol=lf
+
+# The page's own patches over those (web/patches, tools/build_web.sh), applied with git apply too.
+web/patches/*.patch -text

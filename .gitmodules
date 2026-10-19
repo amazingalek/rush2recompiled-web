@@ -18,3 +18,6 @@
 	path = lib/miniupnp
 	url = https://github.com/miniupnp/miniupnp
 	ignore = dirty
+[submodule "lib/N64Recomp-browser"]
+	path = lib/N64Recomp-browser
+	url = https://github.com/amazingalek/N64Recomp-browser

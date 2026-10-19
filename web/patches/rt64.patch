@@ -1,0 +1,1900 @@
+diff --git a/src/hle/rt64_present_queue.cpp b/src/hle/rt64_present_queue.cpp
+--- a/src/hle/rt64_present_queue.cpp
++++ b/src/hle/rt64_present_queue.cpp
+@@ -7,6 +7,10 @@
+ #include "common/rt64_thread.h"
+ #include "rhi/rt64_render_hooks.h"
+ 
++#if defined(__EMSCRIPTEN__)
++#   include <emscripten.h>
++#endif
++
+ #include "rt64_workload_queue.h"
+ 
+ namespace RT64 {
+@@ -39,6 +43,12 @@
+     }
+ 
+     void PresentQueue::advanceToNextPresent() {
++        // For present-stats, when the present was queued: before the stall below, which waits only while the present
++        // thread is the whole queue behind.
++        if (presentStats) {
++            presentQueued[writeCursor] = Timer::current();
++        }
++
+         int nextWriteCursor = (writeCursor + 1) % presents.size();
+ 
+         // Stall the thread until the barrier is lifted if we're trying to write on a present being used by the GPU.
+@@ -91,6 +101,15 @@
+ 
+         viRenderer = std::make_unique<VIRenderer>();
+ 
++#   if defined(__EMSCRIPTEN__)
++        // A page opened with ?uncapped measures how many presents a second it can make: plume reports the display's rate
++        // as the query's (360), the frames are interpolated to it, and none are paced (pace()), so that what the GPU
++        // and the browser can take is what is presented. The interpolated frames take turns in 8 color targets of the
++        // game's framebuffer at the output's scale (WorkloadQueue's InterpolatedTargetSlots), 0.25-0.55 GB at 3840x2000.
++        uncapped = MAIN_THREAD_EM_ASM_INT({ return new URLSearchParams(location.search).has('uncapped') ? 1 : 0; }) != 0;
++        presentStats = MAIN_THREAD_EM_ASM_INT({ return new URLSearchParams(location.search).has('present-stats') ? 1 : 0; }) != 0;
++#   endif
++
+         presentThreadRunning = true;
+         presentThread = new std::thread(&PresentQueue::threadLoop, this);
+     }
+@@ -117,6 +136,12 @@
+             targetRate = ext.sharedResources->targetRate;
+         }
+ 
++        // Presents are paced to a lower rate while the GPU can't keep up (pace()).
++        const uint32_t pacedRate = ext.sharedResources->pacedRate;
++        if ((pacedRate > 0) && (pacedRate < targetRate)) {
++            targetRate = pacedRate;
++        }
++
+         RenderTarget *colorTarget = nullptr;
+         int32_t framesToPresent = 1;
+         bool lockedWorkloadMutex = false;
+@@ -274,6 +299,7 @@
+             if ((framesToPresent > 1) && (usingMSAA || (i > 0))) {
+                 // Stall until the interpolated color target is available.
+                 const uint32_t targetIndex = usingMSAA ? i : (i - 1);
++                PhaseTimer phaseTimer(this, PhaseInterpolated);
+                 std::unique_lock<std::mutex> interpolatedLock(ext.sharedResources->interpolatedMutex);
+                 ext.sharedResources->interpolatedCondition.wait(interpolatedLock, [&]() {
+                     return (frameCounters.available > targetIndex) || ((frameCounters.available == targetIndex) && frameCounters.skipped);
+@@ -290,7 +316,8 @@
+ 
+                 if (i < framesToPresent) {
+                     uint32_t targetIndex = usingMSAA ? i : (i - 1);
+-                    colorTarget = ext.sharedResources->interpolatedColorTargets[targetIndex].get();
++                    const auto &interpolatedTargets = ext.sharedResources->interpolatedColorTargets;
++                    colorTarget = interpolatedTargets[targetIndex % interpolatedTargets.size()].get();
+                 }
+                 else {
+                     colorTarget = nullptr;
+@@ -302,7 +329,9 @@
+ 
+             uint32_t swapChainIndex = 0;
+             const bool presentFrame = (i < framesToPresent) && swapChainValid;
++            std::optional<PhaseTimer> drawTimer;
+             if (presentFrame) {
++                drawTimer.emplace(this, PhaseDraw);
+                 swapChainValid = ext.swapChain->acquireTexture(acquiredSemaphore.get(), &swapChainIndex);
+             }
+ 
+@@ -372,6 +401,7 @@
+                 }
+             }
+ 
++            drawTimer.reset();
+             if (lockedWorkloadMutex) {
+                 ext.sharedResources->workloadMutex.unlock();
+                 lockedWorkloadMutex = false;
+@@ -394,16 +424,50 @@
+             if (presentFrame && swapChainValid) {
+                 // Wait until the approximate time the next present should be at the current intended rate.
+                 if ((presentTimestamp != Timestamp()) && (targetRate > 0) && (targetRate > viOriginalRate)) {
++#               if defined(__EMSCRIPTEN__)
++                    // On a fixed timeline: each present's slot is one period after the last one's, not after the moment
++                    // it went out, so the time spent past a slot (the sleep waking on the browser's timer, wait()'s trip
++                    // to the page's thread) isn't added to every period. In Chrome the pages of games below the
++                    // display's rate presented every 18 ms, 55.6 a second, where those at its rate, which never sleep
++                    // here, presented 60. A present a whole period past its slot or more starts the slots from itself.
++                    // Where the swap chain learns of the display's frames as they come (WebGPU), the wait ends on one.
++                    const auto presentPeriod = std::chrono::nanoseconds(1'000'000'000 / targetRate);
++                    if ((presentSlot == Timestamp()) || ((presentTimestamp - presentSlot) >= presentPeriod)) {
++                        presentSlot = presentTimestamp;
++                    }
++
++                    presentSlot += presentPeriod;
++                    const bool slotAhead = presentStats && (presentSlot > Timer::current());
++                    {
++                        PhaseTimer phaseTimer(this, PhaseSleep);
++                        if (!ext.swapChain->sleepUntil(std::chrono::steady_clock::now() + (presentSlot - Timer::current()))) {
++                            Timer::preciseSleepUntil(presentSlot);
++                        }
++                    }
++
++                    // Only a sleep that had a slot to wait for woke past it: one already past (after a stall) didn't sleep.
++                    if (slotAhead) {
++                        busyLateMicro += std::max(Timer::deltaMicroseconds(presentSlot, Timer::current()), int64_t(0));
++                    }
++#               else
+                     Timer::preciseSleepUntil(presentTimestamp + std::chrono::nanoseconds(1'000'000'000 / targetRate));
++#               endif
++                }
++#           if defined(__EMSCRIPTEN__)
++                else {
++                    presentSlot = Timestamp();
+                 }
++#           endif
+ 
+                 if (presentWaitEnabled) {
++                    PhaseTimer phaseTimer(this, PhaseWait);
+                     ext.swapChain->wait();
+                 }
+ 
+                 RenderCommandSemaphore *waitSemaphore = drawSemaphores[swapChainIndex].get();
+                 presentTimestamp = Timer::current();
+                 if (presentProfileMark != nullptr) presentProfileMark(1);
++                PhaseTimer phaseTimer(this, PhasePresent);
+                 swapChainValid = ext.swapChain->present(swapChainIndex, &waitSemaphore, 1);
+                 if (presentProfileMark != nullptr) presentProfileMark(0);
+                 presentProfiler.logAndRestart();
+@@ -430,6 +494,186 @@
+         ext.sharedResources->interpolatedCondition.notify_all();
+     }
+ 
++    // Frames interpolated to the display's rate are drawn for evenly spaced moments, so motion looks even only if each
++    // is presented. When the GPU can't keep up, a game frame whose present is still waiting behind the next one is
++    // dropped whole, and the rest get one, two or three presents: some frames shown three times, some never. That
++    // happens in Chrome and Firefox alike on a laptop's integrated graphics. So while frames are being dropped (one
++    // present in ten or more over 2 s, 4 at least), each game frame gets fewer presents, a number that divides the
++    // display's rate evenly (a 30 fps game on a 60 Hz display: 1, at 30 a second), and a while later it tries the
++    // number above again: after 10 s, twice as long each time it falls straight back (2 min at most). The number is
++    // kept, not the rate, since a game's own rate moves (Banjo-Kazooie's between 20 and 30). A present dropped now and
++    // then is not the GPU falling behind: a pipeline built behind the game (Chrome) drops one every second or two, and
++    // counting those (2 in a second) held GoldenEye's cast credits, 8-12 game frames a second, at one present a frame
++    // for 10-30 s. Nor is a burst of a few: presents stop while the game waits for prebuilt shaders, come through at once
++    // after, and the GPU is busy for a moment with what it was given, so drops are counted over a whole 2 s of presents,
++    // never fewer: judged on the first few dozen after a wait, or after a try of the number above (which starts the count
++    // again), 4 dropped were enough, and Donkey Kong 64 in Firefox went to 30 presents a second right after its boot's
++    // wait and stayed there for 70 s, each try falling straight back. And the count starts again a second after any such
++    // wait ends: a wait shorter than 2 s left presents from before it in the count beside the burst after it, and
++    // Banjo-Kazooie in Chrome went to 30 a second 0.4 s after its 1.5 s wait, for 10 s. A game at about the display's
++    // rate (a launcher's 60 on a 59-61 Hz display) has nothing to be paced to, and its drops while a page loads aren't
++    // counted either. Nor is a page opened with ?uncapped paced, which drops presents by design.
++    // A page opened with ?present-stats prints where the present thread's time went before each present it drops
++    // (reportDroppedPresent()).
++    void PresentQueue::pace(bool presentDropped) {
++        const uint32_t targetRate = ext.sharedResources->targetRate;
++        const uint32_t originalRate = ext.sharedResources->viOriginalRate;
++        auto setPacedRate = [&](uint32_t pacedRate) {
++            if ((pacedRate == 0) != (ext.sharedResources->pacedRate == 0)) {
++                const char *what = (pacedRate > 0) ? "paced to the game's frames while the GPU falls behind" : "back at the display's rate";
++                printf("RT64: presents %s (the game at %u frames a second)\n", what, originalRate);
++            }
++
++            ext.sharedResources->pacedRate = pacedRate;
++        };
++
++        // Whether a number of presents a game frame is fewer than the display's rate gives it (by more than 5%), and
++        // whether it is spaced evenly on the display: the display's rate a whole multiple of the presents' (within 5%,
++        // for a 59 Hz display), or one a frame.
++        auto isFewer = [&](uint32_t multiple) {
++            return (multiple * originalRate * 20) < (targetRate * 19);
++        };
++
++        if (uncapped || (targetRate == 0) || (originalRate == 0) || !isFewer(1)) {
++            pacingMultiple = 0;
++            pacingPresents.clear();
++            pacingDropped = 0;
++            setPacedRate(0);
++            return;
++        }
++
++        auto isEven = [&](uint32_t multiple) {
++            const uint32_t rate = multiple * originalRate;
++            const uint32_t whole = (targetRate + rate / 2) / rate;
++            return (multiple == 1) || ((whole > 0) && (uint32_t(std::abs(int(targetRate) - int(whole * rate))) * 20 <= targetRate));
++        };
++
++        // The most presents a game frame can get that are fewer and even, at most a number, or one.
++        auto pacedMultipleAtMost = [&](uint32_t multiple) {
++            while ((multiple > 1) && (!isFewer(multiple) || !isEven(multiple))) {
++                multiple--;
++            }
++
++            return std::max(multiple, 1U);
++        };
++
++        const Timestamp now = Timer::current();
++        const int64_t minRetryMicro = 10'000'000;
++        const int64_t maxRetryMicro = 120'000'000;
++        const int64_t fallBackMicro = 3'000'000;
++        if (pacingRetryMicro == 0) {
++            pacingRetryMicro = minRetryMicro;
++            pacingChanged = now;
++        }
++
++        const uint32_t prebuildWaits = ext.sharedResources->prebuildWaits;
++        if (prebuildWaits != pacingPrebuildWaits) {
++            pacingPrebuildWaits = prebuildWaits;
++            pacingPrebuildWaited = now;
++        }
++
++        if ((pacingPrebuildWaited != Timestamp()) && (Timer::deltaMicroseconds(pacingPrebuildWaited, now) < 1'000'000)) {
++            pacingPresents.clear();
++            pacingDropped = 0;
++            return;
++        }
++
++        pacingPresents.emplace_back(now, presentDropped);
++        pacingDropped += presentDropped ? 1 : 0;
++        while (Timer::deltaMicroseconds(pacingPresents.front().first, now) > 2'000'000) {
++            pacingDropped -= pacingPresents.front().second ? 1 : 0;
++            pacingPresents.pop_front();
++        }
++
++        const bool wholeWindow = Timer::deltaMicroseconds(pacingPresents.front().first, now) >= 1'900'000;
++        const bool fallingBehind = wholeWindow && (pacingDropped >= 4) && ((pacingDropped * 10) >= pacingPresents.size());
++        const int64_t sinceChange = Timer::deltaMicroseconds(pacingChanged, now);
++        if (fallingBehind && (pacingMultiple != 1)) {
++            pacingMultiple = pacedMultipleAtMost((pacingMultiple > 0) ? (pacingMultiple - 1) : (targetRate / originalRate));
++
++            if ((pacingRaised != Timestamp()) && (Timer::deltaMicroseconds(pacingRaised, now) < fallBackMicro)) {
++                pacingRetryMicro = std::min(pacingRetryMicro * 2, maxRetryMicro);
++            }
++
++            pacingPresents.clear();
++            pacingDropped = 0;
++            pacingChanged = now;
++        }
++        else if ((pacingMultiple > 0) && (sinceChange >= pacingRetryMicro)) {
++            do {
++                pacingMultiple++;
++            } while (isFewer(pacingMultiple) && !isEven(pacingMultiple));
++
++            if (!isFewer(pacingMultiple)) {
++                pacingMultiple = 0;
++            }
++
++            pacingPresents.clear();
++            pacingDropped = 0;
++            pacingChanged = now;
++            pacingRaised = now;
++        }
++        else if ((pacingMultiple == 0) && (sinceChange >= maxRetryMicro)) {
++            pacingRetryMicro = minRetryMicro;
++        }
++
++        // The game's rate may have moved since the number was picked, so it is the even number at most that large.
++        setPacedRate((pacingMultiple > 0) ? (pacedMultipleAtMost(pacingMultiple) * originalRate) : 0);
++    }
++
++    PresentQueue::PhaseTimer::PhaseTimer(PresentQueue *queue, PresentPhase phase) : queue(queue), phase(phase) {
++        if (queue->presentStats) {
++            start = Timer::current();
++        }
++    }
++
++    PresentQueue::PhaseTimer::~PhaseTimer() {
++        if (queue->presentStats) {
++            queue->busyPhaseMicro[phase] += Timer::deltaMicroseconds(start, Timer::current());
++        }
++    }
++
++    void PresentQueue::resetBusyFrames() {
++        busyPhaseMicro.fill(0);
++        busyLateMicro = 0;
++        busyFrames = 0;
++        busyStart = Timer::current();
++    }
++
++    // With present-stats, a line for each present dropped because the next was already queued behind it (what pace()
++    // counts): how long it waited, and where the present thread's time went in the game frames since it last waited for
++    // a present or dropped one, as each frame's share: waiting for its workload, for the next interpolated frame, drawing
++    // and submitting each present, sleeping until each one's slot (and how far past the slots it woke), wait() (for
++    // fewer presents in flight, and the trips to the device thread it makes to ask), the present() calls, and the rest.
++    // The thread fell a game frame behind in those frames, so what grew in them is what dropped the present.
++    void PresentQueue::reportDroppedPresent(int droppedCursor, int nextCursor) {
++        const Timestamp now = Timer::current();
++        const double waitedMs = Timer::deltaMicroseconds(presentQueued[droppedCursor], now) / 1000.0;
++        const double nextMs = Timer::deltaMicroseconds(presentQueued[droppedCursor], presentQueued[nextCursor]) / 1000.0;
++        if (busyFrames == 0) {
++            printf("RT64: present dropped (it waited %.1f ms, the next came %.1f ms after it)\n", waitedMs, nextMs);
++        }
++        else {
++            const double frameMs = Timer::deltaMicroseconds(busyStart, now) / 1000.0 / busyFrames;
++            auto phaseMs = [&](PresentPhase phase) {
++                return busyPhaseMicro[phase] / 1000.0 / busyFrames;
++            };
++
++            double restMs = frameMs;
++            for (uint32_t p = 0; p < PhaseCount; p++) {
++                restMs -= phaseMs(PresentPhase(p));
++            }
++
++            printf("RT64: present dropped (it waited %.1f ms, the next came %.1f ms after it); the %u game frames before it "
++                "since the present thread last waited took %.1f ms each: workload %.1f, interpolated %.1f, draw %.1f, "
++                "sleep %.1f (%.1f past the slots), wait() %.1f, present() %.1f, the rest %.1f\n",
++                waitedMs, nextMs, busyFrames, frameMs, phaseMs(PhaseWorkload), phaseMs(PhaseInterpolated), phaseMs(PhaseDraw),
++                phaseMs(PhaseSleep), busyLateMicro / 1000.0 / busyFrames, phaseMs(PhaseWait), phaseMs(PhasePresent), restMs);
++        }
++
++        resetBusyFrames();
++    }
++
+     void PresentQueue::notifyPresentId(const Present &present) {
+         {
+             std::scoped_lock<std::mutex> cursorLock(presentIdMutex);
+@@ -464,8 +708,10 @@
+         const bool displayTiming = ext.device->getCapabilities().displayTiming;
+         bool swapChainValid = !ext.swapChain->needsResize();
+         while (presentThreadRunning) {
++            bool waited = false;
+             {
+                 std::unique_lock<std::mutex> cursorLock(cursorMutex);
++                waited = (writeCursor == threadCursor);
+                 cursorCondition.wait(cursorLock, [&]() {
+                     return (writeCursor != threadCursor) || !presentThreadRunning;
+                 });
+@@ -477,6 +723,22 @@
+                 }
+             }
+ 
++            // present-stats: a game frame ended at each present the thread came to without waiting for it, unless the one
++            // before was dropped (a second of a burst, reported without the frames).
++            if (presentStats && (processCursor >= 0)) {
++                if (waited) {
++                    resetBusyFrames();
++                }
++                else if (!lastPresentDropped) {
++                    busyFrames++;
++                }
++
++                lastPresentDropped = skipPresent;
++                if (skipPresent) {
++                    reportDroppedPresent(processCursor, threadCursor);
++                }
++            }
++
+             if (processCursor >= 0) {
+                 std::unique_lock<std::mutex> threadLock(threadMutex);
+                 const bool needsResize = ext.swapChain->needsResize() || !swapChainValid;
+@@ -518,12 +780,19 @@
+                 skipPresent = skipPresent || ext.swapChain->isEmpty();
+ 
+                 Present &present = presents[processCursor];
+-                ext.workloadQueue->waitForWorkloadId(present.workloadId);
++                {
++                    PhaseTimer phaseTimer(this, PhaseWorkload);
++                    ext.workloadQueue->waitForWorkloadId(present.workloadId);
++                }
+ 
+                 if (!presentThreadRunning) {
+                     continue;
+                 }
+ 
++#           if defined(__EMSCRIPTEN__)
++                pace(skipPresent && !ext.swapChain->isEmpty());
++#           endif
++
+                 if (skipPresent) {
+                     skipInterpolation();
+                     notifyPresentId(present);
+diff --git a/src/hle/rt64_workload_queue.cpp b/src/hle/rt64_workload_queue.cpp
+--- a/src/hle/rt64_workload_queue.cpp
++++ b/src/hle/rt64_workload_queue.cpp
+@@ -112,7 +112,11 @@
+ 
+         threadsRunning = true;
+         renderThread = new std::thread(&WorkloadQueue::renderThreadLoop, this);
++#ifndef __EMSCRIPTEN__
++        // Not in a browser: it keeps a desktop driver from lowering the GPU's clock, which a page has no say in, and every
++        // dispatch would be a trip to the thread that owns the WebGPU device.
+         idleThread = new std::thread(&WorkloadQueue::idleThreadLoop, this);
++#endif
+     }
+ 
+     void WorkloadQueue::updateMultisampling() {
+@@ -239,6 +243,12 @@
+         // Store the rate that was chosen for the configuration.
+         ext.sharedResources->targetRate = workloadConfig.targetRate;
+ 
++        // A lower rate the present queue paces the frames to while the GPU can't keep up with this one (PresentQueue::pace()).
++        const uint32_t pacedRate = ext.sharedResources->pacedRate;
++        if ((pacedRate > 0) && (pacedRate < workloadConfig.targetRate)) {
++            workloadConfig.targetRate = pacedRate;
++        }
++
+ #   if RT_ENABLED
+         workloadConfig.raytracingEnabled = rtEnabled;
+ 
+@@ -584,6 +594,10 @@
+                 }
+             }
+ 
++#       if RT64_WGSL
++            RenderTarget::matchColorToDepthTargets(ext.workloadGraphicsWorker, colorDepthPairs, resizedTargets);
++#       endif
++
+             for (RenderTarget *renderTarget : resizedTargets) {
+                 renderFramebufferManager->destroyAllWithRenderTarget(renderTarget);
+             }
+@@ -638,7 +652,8 @@
+                     drawParams.rtEnabled = workloadConfig.raytracingEnabled;
+                     drawParams.submissionFrame = workload.submissionFrame;
+                     drawParams.deltaTimeMs = deltaTimeMs;
+-                    drawParams.ubershadersOnly = ubershadersOnly;
++                    drawParams.ubershadersOnly = ubershadersOnly || workload.extended.pipelineWarmUp;
++                    drawParams.drawsNothing = workload.extended.pipelineWarmUp;
+                     drawParams.postBlendNoise = workloadConfig.postBlendNoise;
+                     drawParams.postBlendNoiseNegative = workloadConfig.postBlendNoiseNegative;
+                     drawParams.maxGameCall = std::min(gameCallCountMax - gameCallCursor, fbPair.gameCallCount);
+@@ -704,7 +719,7 @@
+             ext.workloadGraphicsWorker->commandList->begin();
+             ext.workloadGraphicsWorker->commandList->resetQueryPool(queryPool.get(), 0, 2);
+             ext.workloadGraphicsWorker->commandList->writeTimestamp(queryPool.get(), 0);
+-            framebufferRenderer->endFramebuffers(ext.workloadGraphicsWorker, &workload.drawBuffers, &workload.outputBuffers, workloadConfig.raytracingEnabled);
++            framebufferRenderer->endFramebuffers(ext.workloadGraphicsWorker, &workload.drawBuffers, &workload.outputBuffers, workload.drawData.gpuTiles, workload.drawData.rdpTiles, workloadConfig.raytracingEnabled);
+             framebufferRenderer->recordSetup(ext.workloadGraphicsWorker, bufferUploaders, processRSP ? rspProcessor.get() : nullptr, processWorldVertices ? vertexProcessor.get() : nullptr, &workload.outputBuffers, workloadConfig.raytracingEnabled);
+             
+             // Record all framebuffer pairs.
+@@ -901,6 +916,9 @@
+         Timestamp variableLastSample;            // When the last frame's weight was taken from the clock.
+         int64_t variableSampleMicro = 0;         // Smoothed time between samples: the rate frames are being shown at.
+         uint32_t variableLastSubmitted = 0;      // Frames the previous workload handed to the present queue.
++        GameFrame offscreenFrame;
++        bool lastWorkloadOffscreen = false;
++        bool barrierHeld = false;
+         while (threadsRunning) {
+             {
+                 std::unique_lock<std::mutex> cursorLock(cursorMutex);
+@@ -915,6 +933,12 @@
+             }
+ 
+             if (processCursor >= 0) {
++                // The game waits for the prebuilt shaders (RasterShaderCache::startPrebuild()) here, past its first frame.
++                // The present queue counts the waits, to leave the burst of presents after one out of its pacing.
++                if (ext.rasterShaderCache->waitForPrebuild()) {
++                    ext.sharedResources->prebuildWaits++;
++                }
++
+                 std::unique_lock<std::mutex> threadLock(threadMutex);
+                 Workload &workload = workloads[processCursor];
+                 ext.presentQueue->waitForPresentId(workload.presentId);
+@@ -927,22 +951,36 @@
+                 workloadProfiler.start();
+                 threadConfigurationUpdate(workload.viFbSize, workloadConfig);
+ 
++                // With RT64_OFFSCREEN_WORKLOADS a workload that draws only offscreen (Workload::offscreenOnly) is a pass of the
++                // game frame the next workload draws, as when a game draws its shadows' render targets in a display list of
++                // their own before the frame's. It's drawn, but it isn't a frame: the next one is matched against the frame
++                // before it, and the present's framebuffers and interpolated frames stay that frame's. Otherwise each workload
++                // is a frame, and the frame after such a pass matched nothing and was never interpolated. One pass at most
++                // between two frames: the frame before stays out of the writer's reach until the next frame is drawn (the
++                // barrier), and the queue holds two more workloads for it (WORKLOAD_QUEUE_SIZE).
++#           if RT64_OFFSCREEN_WORKLOADS
++                const bool offscreenPass = workload.offscreenOnly && !workload.paused && !lastWorkloadOffscreen && !gameFrames[curFrameIndex].workloads.empty();
++#           else
++                const bool offscreenPass = false;
++#           endif
++                lastWorkloadOffscreen = offscreenPass;
++
+                 // FIXME: This is a very hacky way to find out if we need to advance the frame if the workload was paused for the first time.
+-                if (!workload.paused || (!gameFrames[curFrameIndex].workloads.empty() && (gameFrames[curFrameIndex].workloads[0] != (uint32_t)processCursor))) {
++                if (!offscreenPass && (!workload.paused || (!gameFrames[curFrameIndex].workloads.empty() && (gameFrames[curFrameIndex].workloads[0] != (uint32_t)processCursor)))) {
+                     prevFrameIndex = curFrameIndex;
+                     curFrameIndex = (curFrameIndex + 1) % gameFrames.size();
+                 }
+                 
+                 // TODO: The frame detection needs to be more elaborate than just matching one workload to one frame.
+-                GameFrame &curFrame = gameFrames[curFrameIndex];
+-                const GameFrame &prevFrame = gameFrames[prevFrameIndex];
++                GameFrame &curFrame = offscreenPass ? offscreenFrame : gameFrames[curFrameIndex];
++                const GameFrame &prevFrame = offscreenPass ? offscreenFrame : gameFrames[prevFrameIndex];
+                 uint32_t workloadIndex = processCursor;
+                 curFrame.set(*this, &workloadIndex, 1);
+ 
+                 // Detect the color image to interpolate for this workload.
+                 RenderTargetKey interpolationTargetKey;
+                 int32_t interpolationTargetFbPairIndex = -1;
+-                {
++                if (!offscreenPass) {
+                     std::scoped_lock<std::mutex> managerLock(ext.sharedResources->managerMutex);
+                     FramebufferManager &fbManager = ext.sharedResources->framebufferManager;
+                     std::vector<uint32_t> &colorVector = ext.sharedResources->colorImageAddressVector;
+@@ -986,7 +1024,7 @@
+                 float prevFrameWeight = 0.0f;
+                 float curFrameWeight = 1.0f;
+                 float deltaTimeMs = 1.0f / 30.0f;
+-                const bool requiresFrameMatching = (workloadConfig.targetRate > 0) || workloadConfig.raytracingEnabled;
++                const bool requiresFrameMatching = !offscreenPass && ((workloadConfig.targetRate > 0) || workloadConfig.raytracingEnabled);
+                 bool generateInterpolatedFrames = false;
+                 bool velocityUploaderUsed = false;
+                 bool tileInterpolationUsed = false;
+@@ -1066,7 +1104,7 @@
+                 
+                 // Get the current and previous set of frame counters. The other set can be in use by the present queue. Skip if no new present event has arrived before this workload event.
+                 InterpolatedFrameCounters &prevFrameCounters = ext.sharedResources->interpolatedFrames[ext.sharedResources->interpolatedFramesIndex];
+-                const bool useDifferentCounters = (lastPresentId != workload.presentId);
++                const bool useDifferentCounters = !offscreenPass && (lastPresentId != workload.presentId);
+                 if (useDifferentCounters) {
+                     ext.sharedResources->interpolatedFramesIndex = ext.sharedResources->interpolatedFramesIndex ^ 1;
+                     lastPresentId = workload.presentId;
+@@ -1081,17 +1119,27 @@
+                 }
+ 
+                 InterpolatedFrameCounters &curFrameCounters = ext.sharedResources->interpolatedFrames[ext.sharedResources->interpolatedFramesIndex];
+-                curFrameCounters.skipped = false;
+-                curFrameCounters.presented = 0;
+-                curFrameCounters.available = 0;
+-                curFrameCounters.shown = 0;
+-                curFrameCounters.count = displayFrames;
++                if (!offscreenPass) {
++                    curFrameCounters.skipped = false;
++                    curFrameCounters.presented = 0;
++                    curFrameCounters.available = 0;
++                    curFrameCounters.shown = 0;
++                    curFrameCounters.count = displayFrames;
++                }
+ 
+                 // Create as many render targets as required to store the interpolated targets.
+                 auto &interpolatedTargets = ext.sharedResources->interpolatedColorTargets;
+                 const bool usingMSAA = (ext.sharedResources->renderTargetManager.multisampling.sampleCount > 1);
+                 const bool usesHDR = ext.sharedResources->renderTargetManager.usesHDR;
+                 uint32_t requiredFrames = (usingMSAA && generateInterpolatedFrames) ? displayFrames : (displayFrames - 1);
++#           if defined(__EMSCRIPTEN__)
++                // At most InterpolatedTargetSlots targets, used in turn: a frame past them waits for the frame drawn into its
++                // target to be presented. RT64 keeps a target for every display frame of a game frame and never frees one,
++                // so a page held as many as the slowest game frame of the visit took display frames: GoldenEye's targets
++                // are 5702x2970 (68 MB) at a 3840x2000 canvas, and ?uncapped (360 Hz) in Dam at ~8 fps kept 42 of them,
++                // 2.8 GB, until Firefox's device ran out of memory. At 60 Hz a game frame takes more only below 7.5 fps.
++                requiredFrames = std::min(requiredFrames, InterpolatedTargetSlots);
++#           endif
+                 if ((requiredFrames > 0) && (interpolatedTargets.size() < requiredFrames)) {
+                     uint32_t previousSize = uint32_t(interpolatedTargets.size());
+                     interpolatedTargets.resize(requiredFrames);
+@@ -1108,6 +1156,15 @@
+                 bool skipWorkloadNow = false;
+                 uint32_t targetIndex = 0;
+                 uint32_t framesRendered = 0;
++                auto newerWorkloadQueued = [&]() {
++                    std::scoped_lock<std::mutex> cursorLock(cursorMutex);
++                    bool newer = (writeCursor != threadCursor);
++#               if RT64_OFFSCREEN_WORKLOADS
++                    // An offscreen pass alone is the start of the next frame, not the frame: these frames go on.
++                    newer = newer && !(workloads[threadCursor].offscreenOnly && (int((threadCursor + 1) % workloads.size()) == writeCursor));
++#               endif
++                    return newer;
++                };
+                 int64_t renderTimeTotalMicro = 0;
+                 bool variableLastFrame = false;
+                 for (uint32_t frame = 0; (frame < displayFrames) && !skipWorkloadNow; frame++) {
+@@ -1202,15 +1259,43 @@
+                     if (generateInterpolatedFrames) {
+                         // Override the render target.
+                         if (usingMSAA || (frame > 0)) {
+-                            overrideTarget = interpolatedTargets[targetIndex].get();
+-                            overrideModifier = (targetIndex + 1);
++                            // The targets are used in turn when there are fewer than the frames (InterpolatedTargetSlots).
++                            const uint32_t targetSlots = uint32_t(interpolatedTargets.size());
++                            const uint32_t targetSlot = targetIndex % targetSlots;
++                            overrideTarget = interpolatedTargets[targetSlot].get();
++                            overrideModifier = (targetSlot + 1);
++
++#                       if defined(__EMSCRIPTEN__)
++                            if (targetIndex >= targetSlots) {
++                                // Wait until this workload's own frame drawn into the target has been presented, unless a newer
++                                // workload is waiting: then the rest of this one's frames are skipped, as they are after a frame.
++                                std::unique_lock<std::mutex> interpolatedLock(ext.sharedResources->interpolatedMutex);
++                                while ((curFrameCounters.presented <= (targetIndex - targetSlots)) && !skipWorkloadNow) {
++                                    ext.sharedResources->interpolatedCondition.wait_for(interpolatedLock, std::chrono::milliseconds(5));
++                                    if (curFrameCounters.presented <= (targetIndex - targetSlots)) {
++                                        interpolatedLock.unlock();
++                                        skipWorkloadNow = newerWorkloadQueued();
++                                        interpolatedLock.lock();
++                                    }
++                                }
++
++                                if (skipWorkloadNow) {
++                                    curFrameCounters.skipped = true;
++                                    interpolatedLock.unlock();
++                                    displayTicks += workload.viOriginalRate * (displayFrames - (frame + 1));
++                                    ext.sharedResources->interpolatedCondition.notify_all();
++                                    continue;
++                                }
++                            }
++#                       endif
+ 
+-                            if (useDifferentCounters && (prevFrameCounters.available > 0) && (targetIndex < prevFrameCounters.available)) {
++                            if (useDifferentCounters && (prevFrameCounters.available > targetSlot)) {
+                                 // Wait until the target has finished presenting if the alternate frame counter (used by the present queue) is making use of this target.
++                                const uint32_t prevTargetIndex = targetSlot + ((prevFrameCounters.available - 1 - targetSlot) / targetSlots) * targetSlots;
+                                 std::unique_lock<std::mutex> interpolatedLock(ext.sharedResources->interpolatedMutex);
+                                 ext.sharedResources->interpolatedCondition.wait(interpolatedLock, [&]() {
+-                                    frameReduction = frameReduction || (prevFrameCounters.presented <= targetIndex);
+-                                    return prevFrameCounters.presented > targetIndex;
++                                    frameReduction = frameReduction || (prevFrameCounters.presented <= prevTargetIndex);
++                                    return prevFrameCounters.presented > prevTargetIndex;
+                                 });
+                             }
+ 
+@@ -1246,10 +1331,7 @@
+ 
+                     // For every additional frame, we increase the frames available and notify the present queue.
+                     if (generateInterpolatedFrames && (usingMSAA || (frame > 0))) {
+-                        {
+-                            std::scoped_lock<std::mutex> cursorLock(cursorMutex);
+-                            skipWorkloadNow = !variableFrames && ((frame + 1) < displayFrames) && (writeCursor != threadCursor);
+-                        }
++                        skipWorkloadNow = !variableFrames && ((frame + 1) < displayFrames) && newerWorkloadQueued();
+ 
+                         {
+                             std::scoped_lock<std::mutex> managerLock(ext.sharedResources->interpolatedMutex);
+@@ -1288,7 +1370,16 @@
+ 
+                 threadConfigurationValidate();
+ 
+-                if (!workload.paused) {
++                // The barrier stays on the frame before an offscreen pass, and catches up once the next frame is drawn.
++                if (offscreenPass) {
++                    barrierHeld = true;
++                }
++                else if (!workload.paused) {
++                    if (barrierHeld) {
++                        threadAdvanceBarrier();
++                        barrierHeld = false;
++                    }
++
+                     threadAdvanceBarrier();
+                 }
+ 
+diff --git a/src/render/rt64_shader_library.cpp b/src/render/rt64_shader_library.cpp
+--- a/src/render/rt64_shader_library.cpp
++++ b/src/render/rt64_shader_library.cpp
+@@ -4,61 +4,118 @@
+ 
+ #include "rt64_shader_library.h"
+ 
++#include "rt64_rsp_processor.h"
++#include "rt64_vertex_processor.h"
++
+ #include "common/rt64_common.h"
+ #include "shared/rt64_ambient_occlusion.h"
+ #include "shared/rt64_render_target_copy.h"
+ #include "shared/rt64_rsp_vertex_test_z.h"
+ 
+-#include "shaders/FbChangesClearCS.hlsl.spirv.h"
+-#include "shaders/FbChangesDrawColorPS.hlsl.spirv.h"
+-#include "shaders/FbChangesDrawDepthPS.hlsl.spirv.h"
+-#include "shaders/FbReadAnyChangesCS.hlsl.spirv.h"
+-#include "shaders/FbReadAnyFullCS.hlsl.spirv.h"
+-#include "shaders/FbReinterpretCS.hlsl.spirv.h"
+-#include "shaders/FbWriteColorCS.hlsl.spirv.h"
+-#include "shaders/FbWriteDepthCS.hlsl.spirv.h"
+-#include "shaders/FbWriteDepthCSMS.hlsl.spirv.h"
+-#include "shaders/GaussianFilterRGB3x3CS.hlsl.spirv.h"
+-#include "shaders/BoxFilterCS.hlsl.spirv.h"
+-#include "shaders/BicubicScalingCS.hlsl.spirv.h"
+-#include "shaders/HistogramAverageCS.hlsl.spirv.h"
+-#include "shaders/HistogramClearCS.hlsl.spirv.h"
+-#include "shaders/HistogramSetCS.hlsl.spirv.h"
+-#include "shaders/IdleCS.hlsl.spirv.h"
+-#include "shaders/LuminanceHistogramCS.hlsl.spirv.h"
+-#include "shaders/RSPModifyCS.hlsl.spirv.h"
+-#include "shaders/RSPProcessCS.hlsl.spirv.h"
+-#include "shaders/RSPSmoothNormalCS.hlsl.spirv.h"
+-#include "shaders/RSPVertexTestZCS.hlsl.spirv.h"
+-#include "shaders/RSPVertexTestZCSMS.hlsl.spirv.h"
+-#include "shaders/RSPWorldCS.hlsl.spirv.h"
+-#include "shaders/RtCopyColorToDepthPS.hlsl.spirv.h"
+-#include "shaders/RtCopyColorToDepth2XPS.hlsl.spirv.h"
+-#include "shaders/RtCopyColorToDepth4XPS.hlsl.spirv.h"
+-#include "shaders/RtCopyColorToDepth8XPS.hlsl.spirv.h"
+-#include "shaders/RtCopyDepthToColorPS.hlsl.spirv.h"
+-#include "shaders/RtCopyDepthToColor2XPS.hlsl.spirv.h"
+-#include "shaders/RtCopyDepthToColor4XPS.hlsl.spirv.h"
+-#include "shaders/RtCopyDepthToColor8XPS.hlsl.spirv.h"
+-#include "shaders/TextureCopyPS.hlsl.spirv.h"
+-#include "shaders/TextureDecodeCS.hlsl.spirv.h"
+-#include "shaders/TextureResolveSamples2XPS.hlsl.spirv.h"
+-#include "shaders/TextureResolveSamples4XPS.hlsl.spirv.h"
+-#include "shaders/TextureResolveSamples8XPS.hlsl.spirv.h"
+-#include "shaders/VideoInterfacePSRegular.hlsl.spirv.h"
+-#include "shaders/VideoInterfacePSPixel.hlsl.spirv.h"
+-#include "shaders/FullScreenVS.hlsl.spirv.h"
+-#include "shaders/Im3DVS.hlsl.spirv.h"
+-#include "shaders/ComposePS.hlsl.spirv.h"
+-#include "shaders/AmbientOcclusionPS.hlsl.spirv.h"
+-#include "shaders/AmbientOcclusionPSMS.hlsl.spirv.h"
+-#include "shaders/AmbientOcclusionApplyPS.hlsl.spirv.h"
+-#include "shaders/CarReflectionCS.hlsl.spirv.h"
+-#include "shaders/CarReflectionVS.hlsl.spirv.h"
+-#include "shaders/CarReflectionPS.hlsl.spirv.h"
+-#include "shaders/DebugPS.hlsl.spirv.h"
+-#include "shaders/Im3DPS.hlsl.spirv.h"
+-#include "shaders/PostProcessPS.hlsl.spirv.h"
++#if defined(RT64_WGSL)
++#   include "shaders/FbChangesClearCS.hlsl.wgsl.h"
++#   include "shaders/FbChangesDrawColorPS.hlsl.wgsl.h"
++#   include "shaders/FbChangesDrawDepthPS.hlsl.wgsl.h"
++#   include "shaders/FbReadAnyChangesCS.hlsl.wgsl.h"
++#   include "shaders/FbReadAnyFullCS.hlsl.wgsl.h"
++#   include "shaders/FbReinterpretCS.hlsl.wgsl.h"
++#   include "shaders/FbWriteColorCS.hlsl.wgsl.h"
++#   include "shaders/FbWriteDepthCS.hlsl.wgsl.h"
++#   include "shaders/FbWriteDepthCSMS.hlsl.wgsl.h"
++#   include "shaders/GaussianFilterRGB3x3CS.hlsl.wgsl.h"
++#   include "shaders/BoxFilterCS.hlsl.wgsl.h"
++#   include "shaders/BicubicScalingCS.hlsl.wgsl.h"
++#   include "shaders/HistogramAverageCS.hlsl.wgsl.h"
++#   include "shaders/HistogramClearCS.hlsl.wgsl.h"
++#   include "shaders/HistogramSetCS.hlsl.wgsl.h"
++#   include "shaders/IdleCS.hlsl.wgsl.h"
++#   include "shaders/LuminanceHistogramCS.hlsl.wgsl.h"
++#   include "shaders/RSPModifyCS.hlsl.wgsl.h"
++#   include "shaders/RSPProcessCS.hlsl.wgsl.h"
++#   include "shaders/RSPSmoothNormalCS.hlsl.wgsl.h"
++#   include "shaders/RSPVertexTestZCS.hlsl.wgsl.h"
++#   include "shaders/RSPVertexTestZCSMS.hlsl.wgsl.h"
++#   include "shaders/RSPWorldCS.hlsl.wgsl.h"
++#   include "shaders/RtCopyColorToDepthPS.hlsl.wgsl.h"
++#   include "shaders/RtCopyColorToDepth2XPS.hlsl.wgsl.h"
++#   include "shaders/RtCopyColorToDepth4XPS.hlsl.wgsl.h"
++#   include "shaders/RtCopyColorToDepth8XPS.hlsl.wgsl.h"
++#   include "shaders/RtCopyDepthToColorPS.hlsl.wgsl.h"
++#   include "shaders/RtCopyDepthToColor2XPS.hlsl.wgsl.h"
++#   include "shaders/RtCopyDepthToColor4XPS.hlsl.wgsl.h"
++#   include "shaders/RtCopyDepthToColor8XPS.hlsl.wgsl.h"
++#   include "shaders/TextureCopyPS.hlsl.wgsl.h"
++#   include "shaders/TextureDecodeCS.hlsl.wgsl.h"
++#   include "shaders/TextureResolveSamples2XPS.hlsl.wgsl.h"
++#   include "shaders/TextureResolveSamples4XPS.hlsl.wgsl.h"
++#   include "shaders/TextureResolveSamples8XPS.hlsl.wgsl.h"
++#   include "shaders/VideoInterfacePSRegular.hlsl.wgsl.h"
++#   include "shaders/VideoInterfacePSPixel.hlsl.wgsl.h"
++#   include "shaders/FullScreenVS.hlsl.wgsl.h"
++#   include "shaders/Im3DVS.hlsl.wgsl.h"
++#   include "shaders/ComposePS.hlsl.wgsl.h"
++#   include "shaders/AmbientOcclusionPS.hlsl.wgsl.h"
++#   include "shaders/AmbientOcclusionPSMS.hlsl.wgsl.h"
++#   include "shaders/AmbientOcclusionApplyPS.hlsl.wgsl.h"
++#   include "shaders/CarReflectionCS.hlsl.wgsl.h"
++#   include "shaders/CarReflectionVS.hlsl.wgsl.h"
++#   include "shaders/CarReflectionPS.hlsl.wgsl.h"
++#   include "shaders/DebugPS.hlsl.wgsl.h"
++#   include "shaders/Im3DPS.hlsl.wgsl.h"
++#   include "shaders/PostProcessPS.hlsl.wgsl.h"
++#else
++#   include "shaders/FbChangesClearCS.hlsl.spirv.h"
++#   include "shaders/FbChangesDrawColorPS.hlsl.spirv.h"
++#   include "shaders/FbChangesDrawDepthPS.hlsl.spirv.h"
++#   include "shaders/FbReadAnyChangesCS.hlsl.spirv.h"
++#   include "shaders/FbReadAnyFullCS.hlsl.spirv.h"
++#   include "shaders/FbReinterpretCS.hlsl.spirv.h"
++#   include "shaders/FbWriteColorCS.hlsl.spirv.h"
++#   include "shaders/FbWriteDepthCS.hlsl.spirv.h"
++#   include "shaders/FbWriteDepthCSMS.hlsl.spirv.h"
++#   include "shaders/GaussianFilterRGB3x3CS.hlsl.spirv.h"
++#   include "shaders/BoxFilterCS.hlsl.spirv.h"
++#   include "shaders/BicubicScalingCS.hlsl.spirv.h"
++#   include "shaders/HistogramAverageCS.hlsl.spirv.h"
++#   include "shaders/HistogramClearCS.hlsl.spirv.h"
++#   include "shaders/HistogramSetCS.hlsl.spirv.h"
++#   include "shaders/IdleCS.hlsl.spirv.h"
++#   include "shaders/LuminanceHistogramCS.hlsl.spirv.h"
++#   include "shaders/RSPModifyCS.hlsl.spirv.h"
++#   include "shaders/RSPProcessCS.hlsl.spirv.h"
++#   include "shaders/RSPSmoothNormalCS.hlsl.spirv.h"
++#   include "shaders/RSPVertexTestZCS.hlsl.spirv.h"
++#   include "shaders/RSPVertexTestZCSMS.hlsl.spirv.h"
++#   include "shaders/RSPWorldCS.hlsl.spirv.h"
++#   include "shaders/RtCopyColorToDepthPS.hlsl.spirv.h"
++#   include "shaders/RtCopyColorToDepth2XPS.hlsl.spirv.h"
++#   include "shaders/RtCopyColorToDepth4XPS.hlsl.spirv.h"
++#   include "shaders/RtCopyColorToDepth8XPS.hlsl.spirv.h"
++#   include "shaders/RtCopyDepthToColorPS.hlsl.spirv.h"
++#   include "shaders/RtCopyDepthToColor2XPS.hlsl.spirv.h"
++#   include "shaders/RtCopyDepthToColor4XPS.hlsl.spirv.h"
++#   include "shaders/RtCopyDepthToColor8XPS.hlsl.spirv.h"
++#   include "shaders/TextureCopyPS.hlsl.spirv.h"
++#   include "shaders/TextureDecodeCS.hlsl.spirv.h"
++#   include "shaders/TextureResolveSamples2XPS.hlsl.spirv.h"
++#   include "shaders/TextureResolveSamples4XPS.hlsl.spirv.h"
++#   include "shaders/TextureResolveSamples8XPS.hlsl.spirv.h"
++#   include "shaders/VideoInterfacePSRegular.hlsl.spirv.h"
++#   include "shaders/VideoInterfacePSPixel.hlsl.spirv.h"
++#   include "shaders/FullScreenVS.hlsl.spirv.h"
++#   include "shaders/Im3DVS.hlsl.spirv.h"
++#   include "shaders/ComposePS.hlsl.spirv.h"
++#   include "shaders/AmbientOcclusionPS.hlsl.spirv.h"
++#   include "shaders/AmbientOcclusionPSMS.hlsl.spirv.h"
++#   include "shaders/AmbientOcclusionApplyPS.hlsl.spirv.h"
++#   include "shaders/CarReflectionCS.hlsl.spirv.h"
++#   include "shaders/CarReflectionVS.hlsl.spirv.h"
++#   include "shaders/CarReflectionPS.hlsl.spirv.h"
++#   include "shaders/DebugPS.hlsl.spirv.h"
++#   include "shaders/DebugPSPerDraw.hlsl.spirv.h"
++#   include "shaders/Im3DPS.hlsl.spirv.h"
++#   include "shaders/PostProcessPS.hlsl.spirv.h"
++#endif
+ 
+ #ifdef _WIN32
+ #   include "shaders/FbChangesClearCS.hlsl.dxil.h"
+@@ -173,22 +230,30 @@
+ #include "rt64_descriptor_sets.h"
+ #include "rt64_render_target.h"
+ 
+-#ifdef _WIN32
+-#   define CREATE_SHADER_INPUTS(DXIL_BLOB, SPIRV_BLOB, MSL_BLOB, ENTRY_NAME, SHADER_FORMAT)\
+-        (SHADER_FORMAT == RenderShaderFormat::DXIL) ? DXIL_BLOB : (SHADER_FORMAT == RenderShaderFormat::SPIRV) ? SPIRV_BLOB : nullptr,\
+-        (SHADER_FORMAT == RenderShaderFormat::DXIL) ? sizeof(DXIL_BLOB) : (SHADER_FORMAT == RenderShaderFormat::SPIRV) ? sizeof(SPIRV_BLOB) : 0,\
++// The shader's blobs are <NAME>BlobDXIL, <NAME>BlobSPIRV, <NAME>BlobMSL and <NAME>BlobWGSL; a build has the formats its
++// platform can use, and a WGSL build (WebGPU) only that one.
++#if defined(RT64_WGSL)
++#   define CREATE_SHADER_INPUTS(NAME, ENTRY_NAME, SHADER_FORMAT)\
++        (SHADER_FORMAT == RenderShaderFormat::WGSL) ? NAME##BlobWGSL : nullptr,\
++        (SHADER_FORMAT == RenderShaderFormat::WGSL) ? sizeof(NAME##BlobWGSL) : 0,\
++        ENTRY_NAME,\
++        SHADER_FORMAT
++#elif defined(_WIN32)
++#   define CREATE_SHADER_INPUTS(NAME, ENTRY_NAME, SHADER_FORMAT)\
++        (SHADER_FORMAT == RenderShaderFormat::DXIL) ? NAME##BlobDXIL : (SHADER_FORMAT == RenderShaderFormat::SPIRV) ? NAME##BlobSPIRV : nullptr,\
++        (SHADER_FORMAT == RenderShaderFormat::DXIL) ? sizeof(NAME##BlobDXIL) : (SHADER_FORMAT == RenderShaderFormat::SPIRV) ? sizeof(NAME##BlobSPIRV) : 0,\
+         ENTRY_NAME,\
+         SHADER_FORMAT
+ #elif defined(__APPLE__)
+-#   define CREATE_SHADER_INPUTS(DXIL_BLOB, SPIRV_BLOB, MSL_BLOB, ENTRY_NAME, SHADER_FORMAT)\
+-        (SHADER_FORMAT == RenderShaderFormat::METAL) ? MSL_BLOB : (SHADER_FORMAT == RenderShaderFormat::SPIRV) ? SPIRV_BLOB : nullptr,\
+-        (SHADER_FORMAT == RenderShaderFormat::METAL) ? sizeof(MSL_BLOB) : (SHADER_FORMAT == RenderShaderFormat::SPIRV) ? sizeof(SPIRV_BLOB) : 0,\
++#   define CREATE_SHADER_INPUTS(NAME, ENTRY_NAME, SHADER_FORMAT)\
++        (SHADER_FORMAT == RenderShaderFormat::METAL) ? NAME##BlobMSL : (SHADER_FORMAT == RenderShaderFormat::SPIRV) ? NAME##BlobSPIRV : nullptr,\
++        (SHADER_FORMAT == RenderShaderFormat::METAL) ? sizeof(NAME##BlobMSL) : (SHADER_FORMAT == RenderShaderFormat::SPIRV) ? sizeof(NAME##BlobSPIRV) : 0,\
+         ENTRY_NAME,\
+         SHADER_FORMAT
+ #else
+-#   define CREATE_SHADER_INPUTS(DXIL_BLOB, SPIRV_BLOB, MSL_BLOB, ENTRY_NAME, SHADER_FORMAT)\
+-        (SHADER_FORMAT == RenderShaderFormat::SPIRV) ? SPIRV_BLOB : nullptr,\
+-        (SHADER_FORMAT == RenderShaderFormat::SPIRV) ? sizeof(SPIRV_BLOB) : 0,\
++#   define CREATE_SHADER_INPUTS(NAME, ENTRY_NAME, SHADER_FORMAT)\
++        (SHADER_FORMAT == RenderShaderFormat::SPIRV) ? NAME##BlobSPIRV : nullptr,\
++        (SHADER_FORMAT == RenderShaderFormat::SPIRV) ? sizeof(NAME##BlobSPIRV) : 0,\
+         ENTRY_NAME,\
+         SHADER_FORMAT
+ #endif
+@@ -214,7 +279,7 @@
+         RenderPipelineLayoutBuilder layoutBuilder;
+ 
+         // Create shaders shared across all pipelines.
+-        std::unique_ptr<RenderShader> fullScreenVertexShader = device->createShader(CREATE_SHADER_INPUTS(FullScreenVSBlobDXIL, FullScreenVSBlobSPIRV, FullScreenVSBlobMSL, "VSMain", shaderFormat));
++        std::unique_ptr<RenderShader> fullScreenVertexShader = device->createShader(CREATE_SHADER_INPUTS(FullScreenVS, "VSMain", shaderFormat));
+         
+         auto fillSamplerSet = [&](SamplerSet &set, RenderFilter filter, bool anisotropyEnabled) {
+             RenderSamplerDesc samplerDesc;
+@@ -283,7 +348,7 @@
+             layoutBuilder.end();
+             bicubicScaling.pipelineLayout = layoutBuilder.create(device);
+             
+-            std::unique_ptr<RenderShader> computeShader = device->createShader(CREATE_SHADER_INPUTS(BicubicScalingCSBlobDXIL, BicubicScalingCSBlobSPIRV, BicubicScalingCSBlobMSL, "CSMain", shaderFormat));
++            std::unique_ptr<RenderShader> computeShader = device->createShader(CREATE_SHADER_INPUTS(BicubicScalingCS, "CSMain", shaderFormat));
+             RenderComputePipelineDesc pipelineDesc(bicubicScaling.pipelineLayout.get(), computeShader.get(), 8, 8, 1);
+             bicubicScaling.pipeline = device->createComputePipeline(pipelineDesc);
+         }
+@@ -297,7 +362,7 @@
+             layoutBuilder.end();
+             boxFilter.pipelineLayout = layoutBuilder.create(device);
+ 
+-            std::unique_ptr<RenderShader> computeShader = device->createShader(CREATE_SHADER_INPUTS(BoxFilterCSBlobDXIL, BoxFilterCSBlobSPIRV, BoxFilterCSBlobMSL, "CSMain", shaderFormat));
++            std::unique_ptr<RenderShader> computeShader = device->createShader(CREATE_SHADER_INPUTS(BoxFilterCS, "CSMain", shaderFormat));
+             RenderComputePipelineDesc pipelineDesc(boxFilter.pipelineLayout.get(), computeShader.get(), 8, 8, 1);
+             boxFilter.pipeline = device->createComputePipeline(pipelineDesc);
+         }
+@@ -310,7 +375,7 @@
+             layoutBuilder.end();
+             compose.pipelineLayout = layoutBuilder.create(device);
+ 
+-            std::unique_ptr<RenderShader> pixelShader = device->createShader(CREATE_SHADER_INPUTS(ComposePSBlobDXIL, ComposePSBlobSPIRV, ComposePSBlobMSL, "PSMain", shaderFormat));
++            std::unique_ptr<RenderShader> pixelShader = device->createShader(CREATE_SHADER_INPUTS(ComposePS, "PSMain", shaderFormat));
+             RenderGraphicsPipelineDesc pipelineDesc;
+             pipelineDesc.pipelineLayout = compose.pipelineLayout.get();
+             pipelineDesc.renderTargetBlend[0] = RenderBlendDesc::AlphaBlend();
+@@ -370,7 +435,7 @@
+             layoutBuilder.end();
+             idle.pipelineLayout = layoutBuilder.create(device);
+ 
+-            std::unique_ptr<RenderShader> computeShader = device->createShader(CREATE_SHADER_INPUTS(IdleCSBlobDXIL, IdleCSBlobSPIRV, IdleCSBlobMSL, "CSMain", shaderFormat));
++            std::unique_ptr<RenderShader> computeShader = device->createShader(CREATE_SHADER_INPUTS(IdleCS, "CSMain", shaderFormat));
+             RenderComputePipelineDesc pipelineDesc(idle.pipelineLayout.get(), computeShader.get(), 1, 1, 1);
+             idle.pipeline = device->createComputePipeline(pipelineDesc);
+         }
+@@ -383,7 +448,7 @@
+             layoutBuilder.end();
+             fbChangesClear.pipelineLayout = layoutBuilder.create(device);
+ 
+-            std::unique_ptr<RenderShader> computeShader = device->createShader(CREATE_SHADER_INPUTS(FbChangesClearCSBlobDXIL, FbChangesClearCSBlobSPIRV, FbChangesClearCSBlobMSL, "CSMain", shaderFormat));
++            std::unique_ptr<RenderShader> computeShader = device->createShader(CREATE_SHADER_INPUTS(FbChangesClearCS, "CSMain", shaderFormat));
+             RenderComputePipelineDesc pipelineDesc(fbChangesClear.pipelineLayout.get(), computeShader.get(), 1, 1, 1);
+             fbChangesClear.pipeline = device->createComputePipeline(pipelineDesc);
+         }
+@@ -400,10 +465,10 @@
+             fbReadAnyChanges.pipelineLayout = layoutBuilder.create(device);
+             fbReadAnyFull.pipelineLayout = layoutBuilder.create(device);
+ 
+-            std::unique_ptr<RenderShader> anyChangesShader = device->createShader(CREATE_SHADER_INPUTS(FbReadAnyChangesCSBlobDXIL, FbReadAnyChangesCSBlobSPIRV, FbReadAnyChangesCSBlobMSL, "CSMain", shaderFormat));
++            std::unique_ptr<RenderShader> anyChangesShader = device->createShader(CREATE_SHADER_INPUTS(FbReadAnyChangesCS, "CSMain", shaderFormat));
+             fbReadAnyChanges.pipeline = device->createComputePipeline(RenderComputePipelineDesc(fbReadAnyChanges.pipelineLayout.get(), anyChangesShader.get(), 8, 8, 1));
+ 
+-            std::unique_ptr<RenderShader> fullShader = device->createShader(CREATE_SHADER_INPUTS(FbReadAnyFullCSBlobDXIL, FbReadAnyFullCSBlobSPIRV, FbReadAnyFullCSBlobMSL, "CSMain", shaderFormat));
++            std::unique_ptr<RenderShader> fullShader = device->createShader(CREATE_SHADER_INPUTS(FbReadAnyFullCS, "CSMain", shaderFormat));
+             fbReadAnyFull.pipeline = device->createComputePipeline(RenderComputePipelineDesc(fbReadAnyFull.pipelineLayout.get(), fullShader.get(), 8, 8, 1));
+         }
+ 
+@@ -416,7 +481,7 @@
+             layoutBuilder.end();
+             fbReinterpret.pipelineLayout = layoutBuilder.create(device);
+ 
+-            std::unique_ptr<RenderShader> computeShader = device->createShader(CREATE_SHADER_INPUTS(FbReinterpretCSBlobDXIL, FbReinterpretCSBlobSPIRV, FbReinterpretCSBlobMSL, "CSMain", shaderFormat));
++            std::unique_ptr<RenderShader> computeShader = device->createShader(CREATE_SHADER_INPUTS(FbReinterpretCS, "CSMain", shaderFormat));
+             RenderComputePipelineDesc pipelineDesc(fbReinterpret.pipelineLayout.get(), computeShader.get(), 8, 8, 1);
+             fbReinterpret.pipeline = device->createComputePipeline(pipelineDesc);
+         }
+@@ -434,13 +499,13 @@
+             fbWriteDepth.pipelineLayout = layoutBuilder.create(device);
+             fbWriteDepthMS.pipelineLayout = layoutBuilder.create(device);
+ 
+-            std::unique_ptr<RenderShader> colorShader = device->createShader(CREATE_SHADER_INPUTS(FbWriteColorCSBlobDXIL, FbWriteColorCSBlobSPIRV, FbWriteColorCSBlobMSL, "CSMain", shaderFormat));
++            std::unique_ptr<RenderShader> colorShader = device->createShader(CREATE_SHADER_INPUTS(FbWriteColorCS, "CSMain", shaderFormat));
+             fbWriteColor.pipeline = device->createComputePipeline(RenderComputePipelineDesc(fbWriteColor.pipelineLayout.get(), colorShader.get(), 8, 8, 1));
+ 
+-            std::unique_ptr<RenderShader> depthShader = device->createShader(CREATE_SHADER_INPUTS(FbWriteDepthCSBlobDXIL, FbWriteDepthCSBlobSPIRV, FbWriteDepthCSBlobMSL, "CSMain", shaderFormat));
++            std::unique_ptr<RenderShader> depthShader = device->createShader(CREATE_SHADER_INPUTS(FbWriteDepthCS, "CSMain", shaderFormat));
+             fbWriteDepth.pipeline = device->createComputePipeline(RenderComputePipelineDesc(fbWriteDepth.pipelineLayout.get(), depthShader.get(), 8, 8, 1));
+ 
+-            std::unique_ptr<RenderShader> depthShaderMS = device->createShader(CREATE_SHADER_INPUTS(FbWriteDepthCSMSBlobDXIL, FbWriteDepthCSMSBlobSPIRV, FbWriteDepthCSMSBlobMSL, "CSMain", shaderFormat));
++            std::unique_ptr<RenderShader> depthShaderMS = device->createShader(CREATE_SHADER_INPUTS(FbWriteDepthCSMS, "CSMain", shaderFormat));
+             fbWriteDepthMS.pipeline = device->createComputePipeline(RenderComputePipelineDesc(fbWriteDepthMS.pipelineLayout.get(), depthShaderMS.get(), 8, 8, 1));
+         }
+ 
+@@ -453,7 +518,7 @@
+             layoutBuilder.end();
+             gaussianFilterRGB3x3.pipelineLayout = layoutBuilder.create(device);
+ 
+-            std::unique_ptr<RenderShader> computeShader = device->createShader(CREATE_SHADER_INPUTS(GaussianFilterRGB3x3CSBlobDXIL, GaussianFilterRGB3x3CSBlobSPIRV, GaussianFilterRGB3x3CSBlobMSL, "CSMain", shaderFormat));
++            std::unique_ptr<RenderShader> computeShader = device->createShader(CREATE_SHADER_INPUTS(GaussianFilterRGB3x3CS, "CSMain", shaderFormat));
+             RenderComputePipelineDesc pipelineDesc(gaussianFilterRGB3x3.pipelineLayout.get(), computeShader.get(), 8, 8, 1);
+             gaussianFilterRGB3x3.pipeline = device->createComputePipeline(pipelineDesc);
+         }
+@@ -467,7 +532,7 @@
+             layoutBuilder.end();
+             histogramAverage.pipelineLayout = layoutBuilder.create(device);
+ 
+-            std::unique_ptr<RenderShader> computeShader = device->createShader(CREATE_SHADER_INPUTS(HistogramAverageCSBlobDXIL, HistogramAverageCSBlobSPIRV, HistogramAverageCSBlobMSL, "CSMain", shaderFormat));
++            std::unique_ptr<RenderShader> computeShader = device->createShader(CREATE_SHADER_INPUTS(HistogramAverageCS, "CSMain", shaderFormat));
+             RenderComputePipelineDesc pipelineDesc(histogramAverage.pipelineLayout.get(), computeShader.get(), 8, 8, 1);
+             histogramAverage.pipeline = device->createComputePipeline(pipelineDesc);
+         }
+@@ -480,7 +545,7 @@
+             layoutBuilder.end();
+             histogramClear.pipelineLayout = layoutBuilder.create(device);
+ 
+-            std::unique_ptr<RenderShader> computeShader = device->createShader(CREATE_SHADER_INPUTS(HistogramClearCSBlobDXIL, HistogramClearCSBlobSPIRV, HistogramClearCSBlobMSL, "CSMain", shaderFormat));
++            std::unique_ptr<RenderShader> computeShader = device->createShader(CREATE_SHADER_INPUTS(HistogramClearCS, "CSMain", shaderFormat));
+             RenderComputePipelineDesc pipelineDesc(histogramClear.pipelineLayout.get(), computeShader.get(), 8, 8, 1);
+             histogramClear.pipeline = device->createComputePipeline(pipelineDesc);
+         }
+@@ -494,7 +559,7 @@
+             layoutBuilder.end();
+             histogramSet.pipelineLayout = layoutBuilder.create(device);
+ 
+-            std::unique_ptr<RenderShader> computeShader = device->createShader(CREATE_SHADER_INPUTS(HistogramSetCSBlobDXIL, HistogramSetCSBlobSPIRV, HistogramSetCSBlobMSL, "CSMain", shaderFormat));
++            std::unique_ptr<RenderShader> computeShader = device->createShader(CREATE_SHADER_INPUTS(HistogramSetCS, "CSMain", shaderFormat));
+             RenderComputePipelineDesc pipelineDesc(histogramSet.pipelineLayout.get(), computeShader.get(), 1, 1, 1);
+             histogramSet.pipeline = device->createComputePipeline(pipelineDesc);
+         }
+@@ -508,7 +573,7 @@
+             layoutBuilder.end();
+             luminanceHistogram.pipelineLayout = layoutBuilder.create(device);
+ 
+-            std::unique_ptr<RenderShader> computeShader = device->createShader(CREATE_SHADER_INPUTS(LuminanceHistogramCSBlobDXIL, LuminanceHistogramCSBlobSPIRV, LuminanceHistogramCSBlobMSL, "CSMain", shaderFormat));
++            std::unique_ptr<RenderShader> computeShader = device->createShader(CREATE_SHADER_INPUTS(LuminanceHistogramCS, "CSMain", shaderFormat));
+             RenderComputePipelineDesc pipelineDesc(luminanceHistogram.pipelineLayout.get(), computeShader.get(), 8, 8, 1);
+             luminanceHistogram.pipeline = device->createComputePipeline(pipelineDesc);
+         }
+@@ -522,7 +587,7 @@
+             layoutBuilder.end();
+             rspModify.pipelineLayout = layoutBuilder.create(device);
+ 
+-            std::unique_ptr<RenderShader> computeShader = device->createShader(CREATE_SHADER_INPUTS(RSPModifyCSBlobDXIL, RSPModifyCSBlobSPIRV, RSPModifyCSBlobMSL, "CSMain", shaderFormat));
++            std::unique_ptr<RenderShader> computeShader = device->createShader(CREATE_SHADER_INPUTS(RSPModifyCS, "CSMain", shaderFormat));
+             RenderComputePipelineDesc pipelineDesc(rspModify.pipelineLayout.get(), computeShader.get(), 64, 1, 1);
+             rspModify.pipeline = device->createComputePipeline(pipelineDesc);
+         }
+@@ -531,12 +596,12 @@
+         {
+             RSPProcessDescriptorSet descriptorSet;
+             layoutBuilder.begin();
+-            layoutBuilder.addPushConstant(0, 0, sizeof(uint32_t) * 4, RenderShaderStageFlag::COMPUTE);
++            layoutBuilder.addPushConstant(0, 0, sizeof(RSPProcessor::ProcessCB), RenderShaderStageFlag::COMPUTE);
+             layoutBuilder.addDescriptorSet(descriptorSet);
+             layoutBuilder.end();
+             rspProcess.pipelineLayout = layoutBuilder.create(device);
+ 
+-            std::unique_ptr<RenderShader> computeShader = device->createShader(CREATE_SHADER_INPUTS(RSPProcessCSBlobDXIL, RSPProcessCSBlobSPIRV, RSPProcessCSBlobMSL, "CSMain", shaderFormat));
++            std::unique_ptr<RenderShader> computeShader = device->createShader(CREATE_SHADER_INPUTS(RSPProcessCS, "CSMain", shaderFormat));
+             RenderComputePipelineDesc pipelineDesc(rspProcess.pipelineLayout.get(), computeShader.get(), 64, 1, 1);
+             rspProcess.pipeline = device->createComputePipeline(pipelineDesc);
+         }
+@@ -550,7 +615,7 @@
+             layoutBuilder.end();
+             rspSmoothNormal.pipelineLayout = layoutBuilder.create(device);
+ 
+-            std::unique_ptr<RenderShader> computeShader = device->createShader(CREATE_SHADER_INPUTS(RSPSmoothNormalCSBlobDXIL, RSPSmoothNormalCSBlobSPIRV, RSPSmoothNormalCSBlobMSL, "CSMain", shaderFormat));
++            std::unique_ptr<RenderShader> computeShader = device->createShader(CREATE_SHADER_INPUTS(RSPSmoothNormalCS, "CSMain", shaderFormat));
+             RenderComputePipelineDesc pipelineDesc(rspSmoothNormal.pipelineLayout.get(), computeShader.get(), 64, 1, 1);
+             rspSmoothNormal.pipeline = device->createComputePipeline(pipelineDesc);
+         }
+@@ -564,7 +629,7 @@
+             layoutBuilder.end();
+             carReflection.pipelineLayout = layoutBuilder.create(device);
+ 
+-            std::unique_ptr<RenderShader> computeShader = device->createShader(CREATE_SHADER_INPUTS(CarReflectionCSBlobDXIL, CarReflectionCSBlobSPIRV, CarReflectionCSBlobMSL, "CSMain", shaderFormat));
++            std::unique_ptr<RenderShader> computeShader = device->createShader(CREATE_SHADER_INPUTS(CarReflectionCS, "CSMain", shaderFormat));
+             RenderComputePipelineDesc pipelineDesc(carReflection.pipelineLayout.get(), computeShader.get(), 64, 1, 1);
+             carReflection.pipeline = device->createComputePipeline(pipelineDesc);
+         }
+@@ -573,12 +638,12 @@
+         {
+             RSPWorldDescriptorSet descriptorSet;
+             layoutBuilder.begin();
+-            layoutBuilder.addPushConstant(0, 0, sizeof(uint32_t) * 4, RenderShaderStageFlag::COMPUTE);
++            layoutBuilder.addPushConstant(0, 0, sizeof(VertexProcessor::WorldCB), RenderShaderStageFlag::COMPUTE);
+             layoutBuilder.addDescriptorSet(descriptorSet);
+             layoutBuilder.end();
+             rspWorld.pipelineLayout = layoutBuilder.create(device);
+ 
+-            std::unique_ptr<RenderShader> computeShader = device->createShader(CREATE_SHADER_INPUTS(RSPWorldCSBlobDXIL, RSPWorldCSBlobSPIRV, RSPWorldCSBlobMSL, "CSMain", shaderFormat));
++            std::unique_ptr<RenderShader> computeShader = device->createShader(CREATE_SHADER_INPUTS(RSPWorldCS, "CSMain", shaderFormat));
+             RenderComputePipelineDesc pipelineDesc(rspWorld.pipelineLayout.get(), computeShader.get(), 64, 1, 1);
+             rspWorld.pipeline = device->createComputePipeline(pipelineDesc);
+         }
+@@ -592,7 +657,7 @@
+             layoutBuilder.end();
+             textureCopy.pipelineLayout = layoutBuilder.create(device);
+ 
+-            std::unique_ptr<RenderShader> pixelShader = device->createShader(CREATE_SHADER_INPUTS(TextureCopyPSBlobDXIL, TextureCopyPSBlobSPIRV, TextureCopyPSBlobMSL, "PSMain", shaderFormat));
++            std::unique_ptr<RenderShader> pixelShader = device->createShader(CREATE_SHADER_INPUTS(TextureCopyPS, "PSMain", shaderFormat));
+             RenderGraphicsPipelineDesc pipelineDesc;
+             pipelineDesc.pipelineLayout = textureCopy.pipelineLayout.get();
+             pipelineDesc.renderTargetBlend[0] = RenderBlendDesc::Copy();
+@@ -612,15 +677,15 @@
+             layoutBuilder.end();
+             textureDecode.pipelineLayout = layoutBuilder.create(device);
+ 
+-            std::unique_ptr<RenderShader> computeShader = device->createShader(CREATE_SHADER_INPUTS(TextureDecodeCSBlobDXIL, TextureDecodeCSBlobSPIRV, TextureDecodeCSBlobMSL, "CSMain", shaderFormat));
++            std::unique_ptr<RenderShader> computeShader = device->createShader(CREATE_SHADER_INPUTS(TextureDecodeCS, "CSMain", shaderFormat));
+             RenderComputePipelineDesc pipelineDesc(textureDecode.pipelineLayout.get(), computeShader.get(), 8, 8, 1);
+             textureDecode.pipeline = device->createComputePipeline(pipelineDesc);
+         }
+ 
+         // Video Interface.
+         {
+-            std::unique_ptr<RenderShader> regularShader = device->createShader(CREATE_SHADER_INPUTS(VideoInterfacePSRegularBlobDXIL, VideoInterfacePSRegularBlobSPIRV, VideoInterfacePSRegularBlobMSL, "PSMain", shaderFormat));
+-            std::unique_ptr<RenderShader> pixelShader = device->createShader(CREATE_SHADER_INPUTS(VideoInterfacePSPixelBlobDXIL, VideoInterfacePSPixelBlobSPIRV, VideoInterfacePSPixelBlobMSL, "PSMain", shaderFormat));
++            std::unique_ptr<RenderShader> regularShader = device->createShader(CREATE_SHADER_INPUTS(VideoInterfacePSRegular, "PSMain", shaderFormat));
++            std::unique_ptr<RenderShader> pixelShader = device->createShader(CREATE_SHADER_INPUTS(VideoInterfacePSPixel, "PSMain", shaderFormat));
+ 
+             VideoInterfaceDescriptorSet nearestDescriptorSet(samplerLibrary.nearest.borderBorder.get());
+             VideoInterfaceDescriptorSet linearDescriptorSet(samplerLibrary.linear.borderBorder.get());
+@@ -633,7 +698,7 @@
+             RenderGraphicsPipelineDesc pipelineDesc;
+             pipelineDesc.vertexShader = fullScreenVertexShader.get();
+             pipelineDesc.pixelShader = regularShader.get();
+-            pipelineDesc.renderTargetFormat[0] = RenderFormat::B8G8R8A8_UNORM; // TODO: Use whatever format the swap chain was created with.
++            pipelineDesc.renderTargetFormat[0] = device->getCapabilities().preferredSwapChainFormat;
+             pipelineDesc.renderTargetBlend[0] = RenderBlendDesc::Copy();
+             pipelineDesc.renderTargetCount = 1;
+             pipelineDesc.pipelineLayout = videoInterfaceNearest.pipelineLayout.get();
+@@ -666,7 +731,7 @@
+         RenderPipelineLayoutBuilder layoutBuilder;
+ 
+         // Create shaders shared across all pipelines.
+-        std::unique_ptr<RenderShader> fullScreenVertexShader = device->createShader(CREATE_SHADER_INPUTS(FullScreenVSBlobDXIL, FullScreenVSBlobSPIRV, FullScreenVSBlobMSL, "VSMain", shaderFormat));
++        std::unique_ptr<RenderShader> fullScreenVertexShader = device->createShader(CREATE_SHADER_INPUTS(FullScreenVS, "VSMain", shaderFormat));
+ 
+         // Select shader blobs based on sample count.
+         const void *TextureResolvePSBlob = nullptr;
+@@ -751,6 +816,41 @@
+         }
+         else
+ #   endif
++#   if defined(RT64_WGSL)
++        if (shaderFormat == RenderShaderFormat::WGSL) {
++            RtCopyDepthToColorPSBlob = RtCopyDepthToColorPSBlobWGSL;
++            RtCopyDepthToColorPSBlobSize = std::size(RtCopyDepthToColorPSBlobWGSL);
++            RtCopyColorToDepthPSBlob = RtCopyColorToDepthPSBlobWGSL;
++            RtCopyColorToDepthPSBlobSize = std::size(RtCopyColorToDepthPSBlobWGSL);
++
++            switch (multisampling.sampleCount) {
++            case RenderSampleCount::COUNT_2:
++                TextureResolvePSBlob = TextureResolveSamples2XPSBlobWGSL;
++                TextureResolvePSBlobSize = std::size(TextureResolveSamples2XPSBlobWGSL);
++                RtCopyDepthToColorPSMSBlob = RtCopyDepthToColor2XPSBlobWGSL;
++                RtCopyDepthToColorPSMSBlobSize = std::size(RtCopyDepthToColor2XPSBlobWGSL);
++                RtCopyColorToDepthPSMSBlob = RtCopyColorToDepth2XPSBlobWGSL;
++                RtCopyColorToDepthPSMSBlobSize = std::size(RtCopyColorToDepth2XPSBlobWGSL);
++                break;
++            case RenderSampleCount::COUNT_4:
++                TextureResolvePSBlob = TextureResolveSamples4XPSBlobWGSL;
++                TextureResolvePSBlobSize = std::size(TextureResolveSamples4XPSBlobWGSL);
++                RtCopyDepthToColorPSMSBlob = RtCopyDepthToColor4XPSBlobWGSL;
++                RtCopyDepthToColorPSMSBlobSize = std::size(RtCopyDepthToColor4XPSBlobWGSL);
++                RtCopyColorToDepthPSMSBlob = RtCopyColorToDepth4XPSBlobWGSL;
++                RtCopyColorToDepthPSMSBlobSize = std::size(RtCopyColorToDepth4XPSBlobWGSL);
++                break;
++            case RenderSampleCount::COUNT_8:
++                TextureResolvePSBlob = TextureResolveSamples8XPSBlobWGSL;
++                TextureResolvePSBlobSize = std::size(TextureResolveSamples8XPSBlobWGSL);
++                RtCopyDepthToColorPSMSBlob = RtCopyDepthToColor8XPSBlobWGSL;
++                RtCopyDepthToColorPSMSBlobSize = std::size(RtCopyDepthToColor8XPSBlobWGSL);
++                RtCopyColorToDepthPSMSBlob = RtCopyColorToDepth8XPSBlobWGSL;
++                RtCopyColorToDepthPSMSBlobSize = std::size(RtCopyColorToDepth8XPSBlobWGSL);
++                break;
++            }
++        }
++#   else
+         if (shaderFormat == RenderShaderFormat::SPIRV) {
+             RtCopyDepthToColorPSBlob = RtCopyDepthToColorPSBlobSPIRV;
+             RtCopyDepthToColorPSBlobSize = std::size(RtCopyDepthToColorPSBlobSPIRV);
+@@ -784,6 +884,7 @@
+                 break;
+             }
+         }
++#   endif
+         else {
+             assert(false && "Unknown shader format.");
+         }
+@@ -798,7 +899,7 @@
+             fbChangesDrawColor.pipelineLayout = layoutBuilder.create(device);
+             fbChangesDrawDepth.pipelineLayout = layoutBuilder.create(device);
+ 
+-            std::unique_ptr<RenderShader> colorShader = device->createShader(CREATE_SHADER_INPUTS(FbChangesDrawColorPSBlobDXIL, FbChangesDrawColorPSBlobSPIRV, FbChangesDrawColorPSBlobMSL, "PSMain", shaderFormat));
++            std::unique_ptr<RenderShader> colorShader = device->createShader(CREATE_SHADER_INPUTS(FbChangesDrawColorPS, "PSMain", shaderFormat));
+             RenderGraphicsPipelineDesc pipelineDesc;
+             pipelineDesc.pipelineLayout = fbChangesDrawColor.pipelineLayout.get();
+             pipelineDesc.renderTargetBlend[0] = RenderBlendDesc::Copy();
+@@ -809,13 +910,13 @@
+             pipelineDesc.multisampling = multisampling;
+             fbChangesDrawColor.pipeline = device->createGraphicsPipeline(pipelineDesc);
+ 
+-            std::unique_ptr<RenderShader> depthShader = device->createShader(CREATE_SHADER_INPUTS(FbChangesDrawDepthPSBlobDXIL, FbChangesDrawDepthPSBlobSPIRV, FbChangesDrawDepthPSBlobMSL, "PSMain", shaderFormat));
++            std::unique_ptr<RenderShader> depthShader = device->createShader(CREATE_SHADER_INPUTS(FbChangesDrawDepthPS, "PSMain", shaderFormat));
+             pipelineDesc.pipelineLayout = fbChangesDrawDepth.pipelineLayout.get();
+             pipelineDesc.pixelShader = depthShader.get();
+             pipelineDesc.depthEnabled = true;
+             pipelineDesc.depthFunction = RenderComparisonFunction::ALWAYS;
+             pipelineDesc.depthWriteEnabled = true;
+-            pipelineDesc.depthTargetFormat = RenderFormat::D32_FLOAT;
++            pipelineDesc.depthTargetFormat = RenderTarget::depthBufferFormat();
+             fbChangesDrawDepth.pipeline = device->createGraphicsPipeline(pipelineDesc);
+         }
+ 
+@@ -852,7 +953,7 @@
+             pipelineDesc.depthEnabled = true;
+             pipelineDesc.depthFunction = RenderComparisonFunction::ALWAYS;
+             pipelineDesc.depthWriteEnabled = true;
+-            pipelineDesc.depthTargetFormat = RenderFormat::D32_FLOAT;
++            pipelineDesc.depthTargetFormat = RenderTarget::depthBufferFormat();
+             pipelineDesc.pipelineLayout = rtCopyColorToDepth.pipelineLayout.get();
+             pipelineDesc.pixelShader = colorToDepthShader.get();
+             pipelineDesc.multisampling = RenderMultisampling();
+@@ -874,7 +975,7 @@
+             layoutBuilder.end();
+             postProcess.pipelineLayout = layoutBuilder.create(device);
+ 
+-            std::unique_ptr<RenderShader> pixelShader = device->createShader(CREATE_SHADER_INPUTS(PostProcessPSBlobDXIL, PostProcessPSBlobSPIRV, PostProcessPSBlobMSL, "PSMain", shaderFormat));
++            std::unique_ptr<RenderShader> pixelShader = device->createShader(CREATE_SHADER_INPUTS(PostProcessPS, "PSMain", shaderFormat));
+             RenderGraphicsPipelineDesc pipelineDesc;
+             pipelineDesc.pipelineLayout = postProcess.pipelineLayout.get();
+             pipelineDesc.renderTargetBlend[0] = RenderBlendDesc::AlphaBlend();
+@@ -898,9 +999,9 @@
+             ambientOcclusionMS.pipelineLayout = layoutBuilder.create(device);
+             ambientOcclusionApply.pipelineLayout = layoutBuilder.create(device);
+ 
+-            std::unique_ptr<RenderShader> occlusionShader = device->createShader(CREATE_SHADER_INPUTS(AmbientOcclusionPSBlobDXIL, AmbientOcclusionPSBlobSPIRV, AmbientOcclusionPSBlobMSL, "PSMain", shaderFormat));
+-            std::unique_ptr<RenderShader> occlusionMSShader = device->createShader(CREATE_SHADER_INPUTS(AmbientOcclusionPSMSBlobDXIL, AmbientOcclusionPSMSBlobSPIRV, AmbientOcclusionPSMSBlobMSL, "PSMain", shaderFormat));
+-            std::unique_ptr<RenderShader> applyShader = device->createShader(CREATE_SHADER_INPUTS(AmbientOcclusionApplyPSBlobDXIL, AmbientOcclusionApplyPSBlobSPIRV, AmbientOcclusionApplyPSBlobMSL, "PSMain", shaderFormat));
++            std::unique_ptr<RenderShader> occlusionShader = device->createShader(CREATE_SHADER_INPUTS(AmbientOcclusionPS, "PSMain", shaderFormat));
++            std::unique_ptr<RenderShader> occlusionMSShader = device->createShader(CREATE_SHADER_INPUTS(AmbientOcclusionPSMS, "PSMain", shaderFormat));
++            std::unique_ptr<RenderShader> applyShader = device->createShader(CREATE_SHADER_INPUTS(AmbientOcclusionApplyPS, "PSMain", shaderFormat));
+             RenderGraphicsPipelineDesc pipelineDesc;
+             pipelineDesc.renderTargetBlend[0] = RenderBlendDesc::Copy();
+             pipelineDesc.renderTargetFormat[0] = RenderFormat::R16G16_FLOAT;
+@@ -953,8 +1054,8 @@
+                 RenderInputElement("TEXCOORD", 1, 2, RenderFormat::R32G32B32A32_FLOAT, 2, 0)
+             };
+ 
+-            std::unique_ptr<RenderShader> vertexShader = device->createShader(CREATE_SHADER_INPUTS(CarReflectionVSBlobDXIL, CarReflectionVSBlobSPIRV, CarReflectionVSBlobMSL, "VSMain", shaderFormat));
+-            std::unique_ptr<RenderShader> pixelShader = device->createShader(CREATE_SHADER_INPUTS(CarReflectionPSBlobDXIL, CarReflectionPSBlobSPIRV, CarReflectionPSBlobMSL, "PSMain", shaderFormat));
++            std::unique_ptr<RenderShader> vertexShader = device->createShader(CREATE_SHADER_INPUTS(CarReflectionVS, "VSMain", shaderFormat));
++            std::unique_ptr<RenderShader> pixelShader = device->createShader(CREATE_SHADER_INPUTS(CarReflectionPS, "PSMain", shaderFormat));
+             RenderBlendDesc alphaBlend;
+             alphaBlend.blendEnabled = true;
+             alphaBlend.srcBlend = RenderBlend::SRC_ALPHA;
+@@ -988,17 +1089,25 @@
+         // Raytracing debug.
+         {
+             FramebufferRendererDescriptorCommonSet descriptorCommonSet(samplerLibrary, deviceCapabilities.raytracing);
+-            FramebufferRendererDescriptorTextureSet descriptorTextureSet;
+             FramebufferRendererDescriptorFramebufferSet descriptorFramebufferSet;
+             layoutBuilder.begin();
+             layoutBuilder.addDescriptorSet(descriptorCommonSet);
+-            layoutBuilder.addDescriptorSet(descriptorTextureSet);
+-            layoutBuilder.addDescriptorSet(descriptorTextureSet);
++            addFramebufferRendererTextureSets(layoutBuilder, deviceCapabilities);
+             layoutBuilder.addDescriptorSet(descriptorFramebufferSet);
+             layoutBuilder.end();
+             debug.pipelineLayout = layoutBuilder.create(device);
+ 
+-            std::unique_ptr<RenderShader> pixelShader = device->createShader(CREATE_SHADER_INPUTS(DebugPSBlobDXIL, DebugPSBlobSPIRV, DebugPSBlobMSL, "PSMain", shaderFormat));
++            std::unique_ptr<RenderShader> pixelShader;
++#       if !defined(RT64_WGSL)
++            if (shaderFormat == RenderShaderFormat::SPIRV) {
++                const SPIRVBlob blob = RT64_TEXTURE_SETS_SPIRV(DebugPS, deviceCapabilities);
++                pixelShader = device->createShader(blob.data, blob.size, "PSMain", shaderFormat);
++            }
++            else
++#       endif
++            {
++                pixelShader = device->createShader(CREATE_SHADER_INPUTS(DebugPS, "PSMain", shaderFormat));
++            }
+             RenderGraphicsPipelineDesc pipelineDesc;
+             pipelineDesc.pipelineLayout = debug.pipelineLayout.get();
+             pipelineDesc.renderTargetBlend[0] = RenderBlendDesc::AlphaBlend();
+@@ -1022,10 +1131,10 @@
+             rspVertexTestZ.pipelineLayout = layoutBuilder.create(device);
+             rspVertexTestZMS.pipelineLayout = layoutBuilder.create(device);
+ 
+-            std::unique_ptr<RenderShader> computeShader = device->createShader(CREATE_SHADER_INPUTS(RSPVertexTestZCSBlobDXIL, RSPVertexTestZCSBlobSPIRV, RSPVertexTestZCSBlobMSL, "CSMain", shaderFormat));
++            std::unique_ptr<RenderShader> computeShader = device->createShader(CREATE_SHADER_INPUTS(RSPVertexTestZCS, "CSMain", shaderFormat));
+             rspVertexTestZ.pipeline = device->createComputePipeline(RenderComputePipelineDesc(rspVertexTestZ.pipelineLayout.get(), computeShader.get(), 1, 1, 1));
+ 
+-            std::unique_ptr<RenderShader> computeShaderMS = device->createShader(CREATE_SHADER_INPUTS(RSPVertexTestZCSMSBlobDXIL, RSPVertexTestZCSMSBlobSPIRV, RSPVertexTestZCSMSBlobMSL, "CSMain", shaderFormat));
++            std::unique_ptr<RenderShader> computeShaderMS = device->createShader(CREATE_SHADER_INPUTS(RSPVertexTestZCSMS, "CSMain", shaderFormat));
+             rspVertexTestZMS.pipeline = device->createComputePipeline(RenderComputePipelineDesc(rspVertexTestZMS.pipelineLayout.get(), computeShaderMS.get(), 1, 1, 1));
+         }
+ 
+diff --git a/src/shaders/RasterPS.hlsl b/src/shaders/RasterPS.hlsl
+--- a/src/shaders/RasterPS.hlsl
++++ b/src/shaders/RasterPS.hlsl
+@@ -45,9 +45,79 @@
+ }
+ #endif
+ 
++#if defined(DECAL_DEPTH_BOUNDS)
++// A decal's pixel shader on WebGPU, prebuilt: it reads no depth, so a decal draws in the pass that writes depth. A pass
++// can read the depth it draws to only if it writes none, and RT64 elsewhere ends the pass for each decal that follows
++// a draw that wrote depth and begins it again after: Banjo-Tooie ~25 times a frame, each pass ~70 us of Firefox's GPU
++// process. The decal check, |pixel - surface| <= max(CoplanarDepthTolerance(surface), dz), is two depth tests against
++// the surface's depth instead, in two draws with the stencil between them (RasterShader::createPipeline()): the first
++// writes the highest surface depth that passes (greater-equal; RasterParams' padding0 is 1 for it) and marks the
++// pixels, the second the lowest (less-equal), drawn where a mark is, which it takes back.
++static float decalDepth = 0.0f;
++
++// CoplanarDepthTolerance() is the same over each band of FloatToFixedDepth()'s exponent (0, 1, 2, 3 and more), so a
++// side's bound is the farthest one of the bands gives. Two depth tests pass one interval, and the check can pass two
++// pieces: within 0.0005 of where a band starts, a surface in the band below passes with its wider tolerance
++// while one in the pixel's own band just past its narrower one doesn't, and the interval draws there too.
++float decalDepthBound(float pixelDepth, float dz, bool high) {
++    // Where the exponent becomes 1, 2 and 3: FloatToFixedDepth() rounds, so half a step below 0x20000, 0x30000, 0x38000.
++    const float bandStart[4] = { 0.0f, 131071.5f / 262143.0f, 196607.5f / 262143.0f, 229375.5f / 262143.0f };
++    float bound = high ? (pixelDepth + dz) : (pixelDepth - dz);
++    for (uint e = 0; e < 4; e++) {
++        const float tolerance = 0.0005f / float(1U << e);
++        const float start = bandStart[e];
++        const float end = (e < 3) ? bandStart[e + 1] : 2.0f;
++        if (high && (pixelDepth + tolerance >= start)) {
++            // The band's surface depths up to the pixel's plus its tolerance: the last one below the next band at most.
++            bound = max(bound, min(pixelDepth + tolerance, asfloat(asuint(end) - 1U)));
++        }
++        else if (!high && (pixelDepth - tolerance < end)) {
++            bound = min(bound, max(pixelDepth - tolerance, start));
++        }
++    }
++
++    return bound;
++}
++#endif
++
++#if defined(WEBGPU) && defined(PER_DRAW_TEXTURES)
++// Samples texture 0 or 1 (t) as the two blocks below RasterPS's #else do. With mip LOD the tiles are picked per pixel,
++// so each tile's texture slot is a switch anyway (TextureSampler.hlsli), and RasterPS samples both in a loop the shader
++// keeps, which leaves sampleTexture() in it once: most of a prebuilt pixel shader with mip LOD. Without LOD a specialized
++// shader knows each tile's slot and clamp modes only if it samples them apart, as two calls (one of Majora's Mask's
++// with two tiles is 10 KB of WGSL that way, 60 in the loop). The ubershader always loops, and so does the spec constant
++// shader the browser specializes (SPEC_CONSTANT_LOOPS). Firefox 158 builds a section's pipelines one at a time while
++// the game waits, and in a test page built GoldenEye's Dam in 5.8-8.3 s against 14.8-19.1, Pilotwings 64's menus in
++// 5.7-8.2 against 13.9-16.3 and Conker's Windy in 4.1-4.4 against 6.3-8.4 (RTX 2070, three runs each, interleaved, a
++// busy host).
++float4 sampleDrawTile(uint t, OtherMode otherMode, RenderFlags flags, int tileIndex0, int tileIndex1, float2 lowResUV, float2 highResUV, float2 ddxUV, float2 ddyUV) {
++    const bool oneCycleHardwareBug = (otherMode.cycleType() == G_CYC_1CYCLE);
++    const bool firstTile = (t == 0) || oneCycleHardwareBug;
++    const uint tileIndex = firstTile ? tileIndex0 : tileIndex1;
++    const uint globalTileIndex = instanceRenderIndices[gConstants.renderIndex].rdpTileIndex + tileIndex;
++    RDPTile rdpTile = RDPTiles[globalTileIndex];
++    if (!renderFlagDynamicTiles(flags)) {
++        rdpTile.cms = firstTile ? renderCMS0(flags) : renderCMS1(flags);
++        rdpTile.cmt = firstTile ? renderCMT0(flags) : renderCMT1(flags);
++        rdpTile.nativeSampler = firstTile ? renderFlagNativeSampler0(flags) : renderFlagNativeSampler1(flags);
++    }
++
++    const GPUTile gpuTile = drawGPUTile(instanceRenderIndices[gConstants.renderIndex].rdpTileIndex, tileIndex);
++    const float2 textureUV = gpuTileFlagHighRes(gpuTile.flags) ? highResUV : lowResUV;
++    return sampleTexture(otherMode, flags, textureUV, ddxUV, ddyUV, rdpTile, gpuTile, (t == 1) && oneCycleHardwareBug);
++}
++#endif
++
+ LIBRARY_EXPORT bool RasterPS(const RenderParams rp, float4 vertexPosition, float2 vertexUV, float4 vertexSmoothColor, float4 vertexFlatColor,
+     bool isFrontFace, out float4 resultColor, out float4 resultAlpha, out uint resultCoverage) 
+ {
++    // Derivatives first, while every pixel of the quad is still running: they are undefined after a pixel returns, and
++    // WGSL refuses them in control flow that can differ between pixels.
++    const float ddxDepth = ddx(vertexPosition.z);
++    const float ddyDepth = ddy(vertexPosition.z);
++    float2 ddxVertexUV = ddx(vertexUV);
++    float2 ddyVertexUV = ddy(vertexUV);
++
+     const OtherMode otherMode = { rp.omL, rp.omH };
+ #if defined(DYNAMIC_RENDER_PARAMS)
+     if ((otherMode.cycleType() != G_CYC_COPY) && renderFlagCulling(rp.flags) && isFrontFace) {
+@@ -89,37 +159,51 @@
+     }
+ 
+     if (depthDecal) {
+-        // Sample the depth buffer for this pixel to compare for the decal check.
+-        int2 pixelPos = floor(vertexPosition.xy);
+-        uint sampleCount = 1U << renderFlagSampleCount(rp.flags);
+-        float surfaceDepth = sampleBackgroundDepth(pixelPos, sampleCount);
+-
+         // Calculate the decal depth tolerance based on the depth derivatives (or the prim dz value if prim depth source is enabled).
+         float dz;
+         if (zSourcePrim) {
+             dz = instanceRDPParams[instanceIndex].primDepth.y;
+         }
+         else {
+-            dz = (abs(ddx(vertexPosition.z)) + abs(ddy(vertexPosition.z))) * FbParams.resolutionScale.y;
++            dz = (abs(ddxDepth) + abs(ddyDepth)) * FbParams.resolutionScale.y;
+         }
+ 
++        const float pixelDepth = select(depthClampNear, max(vertexPosition.z, 0.0f), vertexPosition.z);
++#if defined(DECAL_DEPTH_BOUNDS)
++        // The depth tests do the check (decalDepthBound()).
++        decalDepth = decalDepthBound(pixelDepth, dz, gConstants.padding0 != 0);
++#else
++        // Sample the depth buffer for this pixel to compare for the decal check.
++        int2 pixelPos = floor(vertexPosition.xy);
++        uint sampleCount = 1U << renderFlagSampleCount(rp.flags);
++        float surfaceDepth = sampleBackgroundDepth(pixelPos, sampleCount);
++
+         // Perform the decal depth tolerance check.
+         const float DepthTolerance = max(CoplanarDepthTolerance(surfaceDepth), dz);
+-        const float pixelDepth = select(depthClampNear, max(vertexPosition.z, 0.0f), vertexPosition.z);
+         if (abs(pixelDepth - surfaceDepth) > DepthTolerance) {
+             return false;
+         }
++#endif
+     }
+     
+-    float2 ddxVertexUV = ddx(vertexUV);
+-    float2 ddyVertexUV = ddy(vertexUV);
+     float2 lowResUV = vertexUV;
+     if (!renderFlagUpscale2D(rp.flags)) {
+         float2 screenPos = floor(vertexPosition.xy);
+         screenPos.x += FbParams.horizontalMisalignment;
+         lowResUV -= fmod(screenPos.xy, FbParams.resolutionScale.yy) * float2(ddxVertexUV.x, ddyVertexUV.y);
+     }
+-    
++
++    // A high resolution tile is sampled at vertexUV, which on a rect drawn backwards (a negative dsdx or dtdy) runs
++    // one native pixel behind the texel the low resolution UV picks, so its last row or column samples outside the
++    // tile. With FLIPPED_RECT_HIGH_RES (RT64_FLIPPED_RECT_HIGH_RES, on with WGSL) each native pixel starts at the texel
++    // it shows instead.
++    float2 highResUV = vertexUV;
++#if defined(FLIPPED_RECT_HIGH_RES)
++    if (renderFlagRect(rp.flags) && !renderFlagUpscale2D(rp.flags)) {
++        highResUV -= min(float2(ddxVertexUV.x, ddyVertexUV.y), 0.0f) * FbParams.resolutionScale.yy;
++    }
++#endif
++
+     int tileIndex0 = 0;
+     int tileIndex1 = 1;
+     float lodFraction;
+@@ -149,6 +233,40 @@
+ 
+     float4 texVal0 = float4(0.0f, 0.0f, 0.0f, 1.0f);
+     float4 texVal1 = float4(0.0f, 0.0f, 0.0f, 1.0f);
++#if defined(WEBGPU) && defined(PER_DRAW_TEXTURES)
++    // The tiles in a loop or apart: sampleDrawTile() says when.
++    const bool usesTexture0 = renderFlagUsesTexture0(rp.flags);
++    const bool usesTexture1 = renderFlagUsesTexture1(rp.flags);
++    const bool loopTiles = usesTexture0 && usesTexture1 && (otherMode.textLOD() == G_TL_LOD);
++#if !defined(DYNAMIC_RENDER_PARAMS) && !defined(SPEC_CONSTANT_LOOPS)
++    if (!loopTiles) {
++        if (usesTexture0) {
++            texVal0 = sampleDrawTile(0, otherMode, rp.flags, tileIndex0, tileIndex1, lowResUV, highResUV, ddxVertexUV, ddyVertexUV);
++        }
++
++        if (usesTexture1) {
++            texVal1 = sampleDrawTile(1, otherMode, rp.flags, tileIndex0, tileIndex1, lowResUV, highResUV, ddxVertexUV, ddyVertexUV);
++        }
++    }
++    else
++#endif
++    {
++        [loop]
++        for (uint t = 0; t < 2; t++) {
++            if (!((t == 0) ? usesTexture0 : usesTexture1)) {
++                continue;
++            }
++
++            const float4 texVal = sampleDrawTile(t, otherMode, rp.flags, tileIndex0, tileIndex1, lowResUV, highResUV, ddxVertexUV, ddyVertexUV);
++            if (t == 0) {
++                texVal0 = texVal;
++            }
++            else {
++                texVal1 = texVal;
++            }
++        }
++    }
++#else
+     if (renderFlagUsesTexture0(rp.flags)) {
+         const uint globalTileIndex = instanceRenderIndices[gConstants.renderIndex].rdpTileIndex + tileIndex0;
+         RDPTile rdpTile = RDPTiles[globalTileIndex];
+@@ -158,14 +276,15 @@
+             rdpTile.nativeSampler = renderFlagNativeSampler0(rp.flags);
+         }
+         
+-        const GPUTile gpuTile = GPUTiles[globalTileIndex];
+-        const float2 textureUV = gpuTileFlagHighRes(gpuTile.flags) ? vertexUV : lowResUV;
++        const GPUTile gpuTile = drawGPUTile(instanceRenderIndices[gConstants.renderIndex].rdpTileIndex, tileIndex0);
++        const float2 textureUV = gpuTileFlagHighRes(gpuTile.flags) ? highResUV : lowResUV;
+         texVal0 = sampleTexture(otherMode, rp.flags, textureUV, ddxVertexUV, ddyVertexUV, rdpTile, gpuTile, false, gameLOD, filteredAmount);
+     }
+     
+     if (renderFlagUsesTexture1(rp.flags)) {
+         const bool oneCycleHardwareBug = (otherMode.cycleType() == G_CYC_1CYCLE);
+-        const uint globalTileIndex = instanceRenderIndices[gConstants.renderIndex].rdpTileIndex + (oneCycleHardwareBug ? tileIndex0 : tileIndex1);
++        const uint tileIndex = oneCycleHardwareBug ? tileIndex0 : tileIndex1;
++        const uint globalTileIndex = instanceRenderIndices[gConstants.renderIndex].rdpTileIndex + tileIndex;
+         RDPTile rdpTile = RDPTiles[globalTileIndex];
+         if (!renderFlagDynamicTiles(rp.flags)) {
+             rdpTile.cms = oneCycleHardwareBug ? renderCMS0(rp.flags) : renderCMS1(rp.flags);
+@@ -173,12 +292,13 @@
+             rdpTile.nativeSampler = oneCycleHardwareBug ? renderFlagNativeSampler0(rp.flags) : renderFlagNativeSampler1(rp.flags);
+         }
+         
+-        const GPUTile gpuTile = GPUTiles[globalTileIndex];
+-        const float2 textureUV = gpuTileFlagHighRes(gpuTile.flags) ? vertexUV : lowResUV;
++        const GPUTile gpuTile = drawGPUTile(instanceRenderIndices[gConstants.renderIndex].rdpTileIndex, tileIndex);
++        const float2 textureUV = gpuTileFlagHighRes(gpuTile.flags) ? highResUV : lowResUV;
+         const uint nativeSampler = renderFlagNativeSampler1(rp.flags);
+         texVal1 = sampleTexture(otherMode, rp.flags, textureUV, ddxVertexUV, ddyVertexUV, rdpTile, gpuTile, oneCycleHardwareBug, gameLOD, filteredAmount);
+     }
+-    
++#endif
++
+     // Color combiner.
+     float4 shadeColor = vertexColor;
+     float4 combinerColor;
+@@ -302,6 +422,14 @@
+         resultColor.a = resultCvg;
+     }
+     
++#if defined(WEBGPU) && !defined(DUAL_SOURCE_BLENDING)
++    // Without dual-source blending, which WebGPU leaves optional, an alpha-blended draw blends by the alpha of its one
++    // output, so the blend factor takes the coverage's place there.
++    if (alphaBlend) {
++        resultColor.a = resultAlpha.a;
++    }
++#endif
++
+     // Add highlight color to the last step.
+     uint highlightColorUint = instanceRenderIndices[gConstants.renderIndex].highlightColor;
+     if (highlightColorUint > 0) {
+@@ -338,9 +466,16 @@
+ #if defined(DYNAMIC_RENDER_PARAMS)
+     , bool isFrontFace : SV_IsFrontFace
+ #endif
++#if defined(WEBGPU) && !defined(DUAL_SOURCE_BLENDING)
++    , [[vk::location(0)]] out float4 pixelColor : SV_TARGET0
++#else
+     , [[vk::location(0)]] [[vk::index(0)]] out float4 pixelColor : SV_TARGET0
+     , [[vk::location(0)]] [[vk::index(1)]] out float4 pixelAlpha : SV_TARGET1
++#endif
+     , out uint pixelCoverage : SV_Coverage
++#if defined(DECAL_DEPTH_BOUNDS)
++    , out float pixelDepth : SV_Depth
++#endif
+ )
+ {
+ #if !defined(DYNAMIC_RENDER_PARAMS)
+@@ -358,7 +493,12 @@
+     }
+ 
+     pixelColor = resultColor;
++#if defined(DECAL_DEPTH_BOUNDS)
++    pixelDepth = decalDepth;
++#endif
++#if !defined(WEBGPU) || defined(DUAL_SOURCE_BLENDING)
+     pixelAlpha = resultAlpha;
++#endif
+     pixelCoverage = resultCoverage;
+ }
+ #endif
+\ No newline at end of file
+diff --git a/src/shaders/TextureSampler.hlsli b/src/shaders/TextureSampler.hlsli
+--- a/src/shaders/TextureSampler.hlsli
++++ b/src/shaders/TextureSampler.hlsli
+@@ -18,12 +18,96 @@
+ // We prefer using for loops to reduce the size of the final ubershader as much as possible.
+ // When using specialized shaders, we prefer to unroll the loop manually to give re-spirv an
+ // easier time to eliminate dead code, as its graph model can't handle the loop constructs yet.
+-#ifdef DYNAMIC_RENDER_PARAMS
++// A WGSL build's spec constant shaders, which the browser specializes with override values and nothing strips of dead
++// code beforehand, keep the loops too (SPEC_CONSTANT_LOOPS, CMakeLists.txt).
++#if defined(DYNAMIC_RENDER_PARAMS) || defined(SPEC_CONSTANT_LOOPS)
+ #define USE_FOR_LOOPS 1
+ #else
+ #define USE_FOR_LOOPS 0
+ #endif
+ 
++// Where a tile's texture is. With descriptor indexing, textureIndex is the texture cache index of the tile's texture
++// (set 1) or of its TMEM (set 2). Without it (PER_DRAW_TEXTURES), the renderer binds each draw's textures in a set of
++// their own, one slot per tile of the draw, so a texture is picked by the tile's number within its draw, which
++// drawGPUTile() puts in drawSlot. The cache index still finds the TMEM, in gTMEMPool. A switch picks the slot, since
++// core WebGPU can't index bindings. The slot is never read from a buffer, so a specialized shader that knows the
++// tile's number (one without mip LOD) knows its slot, and spirv-opt keeps only that case. In the bits of textureIndex,
++// every texture read stayed a switch of 8 reads: a prebuilt pixel shader without LOD is a third of the WGSL without
++// it, and in Firefox 158, which builds pipelines one at a time, Majora's Mask's Clock Town took 9.3-10.4 s against
++// 15.1-18.2 s and Rush 2049's boot 11.9-12.6 s against 13.6-14.6 s (RTX 2070). Shaders with LOD keep the switch.
++#ifdef PER_DRAW_TEXTURES
++#define tileTMEM(gpuTile) ((gpuTile).textureIndex * RDP_TMEM_BYTES)
++
++#define TILE_TEXTURE_SWITCH(gpuTile, TEXTURE_CALL) \
++    switch ((gpuTile).drawSlot) { \
++    case 0: return TEXTURE_CALL(gTileTexture0); \
++    case 1: return TEXTURE_CALL(gTileTexture1); \
++    case 2: return TEXTURE_CALL(gTileTexture2); \
++    case 3: return TEXTURE_CALL(gTileTexture3); \
++    case 4: return TEXTURE_CALL(gTileTexture4); \
++    case 5: return TEXTURE_CALL(gTileTexture5); \
++    case 6: return TEXTURE_CALL(gTileTexture6); \
++    default: return TEXTURE_CALL(gTileTexture7); \
++    }
++
++// The same with the slot's sampler (gTileSampler0 to 7), for a linear sample.
++#define TILE_TEXTURE_SAMPLER_SWITCH(gpuTile, TEXTURE_SAMPLER_CALL) \
++    switch ((gpuTile).drawSlot) { \
++    case 0: return TEXTURE_SAMPLER_CALL(gTileTexture0, gTileSampler0); \
++    case 1: return TEXTURE_SAMPLER_CALL(gTileTexture1, gTileSampler1); \
++    case 2: return TEXTURE_SAMPLER_CALL(gTileTexture2, gTileSampler2); \
++    case 3: return TEXTURE_SAMPLER_CALL(gTileTexture3, gTileSampler3); \
++    case 4: return TEXTURE_SAMPLER_CALL(gTileTexture4, gTileSampler4); \
++    case 5: return TEXTURE_SAMPLER_CALL(gTileTexture5, gTileSampler5); \
++    case 6: return TEXTURE_SAMPLER_CALL(gTileTexture6, gTileSampler6); \
++    default: return TEXTURE_SAMPLER_CALL(gTileTexture7, gTileSampler7); \
++    }
++#else
++#define tileTMEM(gpuTile) gTMEM[NonUniformResourceIndex((gpuTile).textureIndex)]
++#define TILE_TEXTURE_SWITCH(gpuTile, TEXTURE_CALL) return TEXTURE_CALL(gTextures[NonUniformResourceIndex((gpuTile).textureIndex)]);
++#endif
++
++// The GPU tile of the draw's tile tileIndex (0 to 7).
++GPUTile drawGPUTile(uint rdpTileIndex, uint tileIndex) {
++    GPUTile gpuTile = GPUTiles[rdpTileIndex + tileIndex];
++#ifdef PER_DRAW_TEXTURES
++    gpuTile.drawSlot = tileIndex;
++#endif
++    return gpuTile;
++}
++
++float4 loadTileTexture(const GPUTile gpuTile, int3 texelMip) {
++#define TEXTURE_CALL(texture) texture.Load(texelMip)
++    TILE_TEXTURE_SWITCH(gpuTile, TEXTURE_CALL)
++#undef TEXTURE_CALL
++}
++
++#ifdef PER_DRAW_TEXTURES
++// A texel for each tap of a filter (only the first without filtering), in one switch over the slots.
++#define LOAD_TILE_TEXELS(texture) \
++    samples[0] = texture.Load(int3(texels[0], mipLevel)); \
++    if (filtering) { \
++        samples[1] = texture.Load(int3(texels[1], mipLevel)); \
++        samples[2] = texture.Load(int3(texels[2], mipLevel)); \
++        samples[3] = texture.Load(int3(texels[3], mipLevel)); \
++    } \
++    break;
++
++void loadTileTexels(const GPUTile gpuTile, int2 texels[4], uint mipLevel, bool filtering, inout float4 samples[4]) {
++    switch (gpuTile.drawSlot) {
++    case 0: LOAD_TILE_TEXELS(gTileTexture0)
++    case 1: LOAD_TILE_TEXELS(gTileTexture1)
++    case 2: LOAD_TILE_TEXELS(gTileTexture2)
++    case 3: LOAD_TILE_TEXELS(gTileTexture3)
++    case 4: LOAD_TILE_TEXELS(gTileTexture4)
++    case 5: LOAD_TILE_TEXELS(gTileTexture5)
++    case 6: LOAD_TILE_TEXELS(gTileTexture6)
++    default: LOAD_TILE_TEXELS(gTileTexture7)
++    }
++}
++#undef LOAD_TILE_TEXELS
++#endif
++
+ void computeLOD(OtherMode otherMode, uint rdpTileCount, float2 primLOD, float resLodScale, float2 ddxUV, float2 ddyUV, inout int tileIndex0, inout int tileIndex1, out float lodFraction) {
+     const bool usesLOD = (otherMode.textLOD() == G_TL_LOD);
+     if (usesLOD) {
+@@ -71,7 +155,8 @@
+     }
+ }
+ 
+-float4 clampWrapMirrorSample(const RDPTile rdpTile, const GPUTile gpuTile, float2 tcScale, int2 texelInt, uint tlut, bool gpuTileUsesTMEM, uint mipLevel) {
++// The texel a tap reads, with the tile's clamp, wrap and mirror applied.
++int2 clampWrapMirrorTexel(const RDPTile rdpTile, const GPUTile gpuTile, float2 tcScale, int2 texelInt) {
+     if (rdpTile.cms & G_TX_CLAMP) {
+         texelInt.x = clamp(texelInt.x, 0, (round(tcScale.x * rdpTile.lrs) / 4) - (round(tcScale.x * rdpTile.uls) / 4) + round(tcScale.x - 1.0f));
+     }
+@@ -105,15 +190,19 @@
+     }
+     
+     // Allows selection of only particular columns or rows as defined by the tile.
+-    texelInt = (texelInt & gpuTile.texelMask) + gpuTile.texelShift;
++    return (texelInt & gpuTile.texelMask) + gpuTile.texelShift;
++}
++
++float4 clampWrapMirrorSample(const RDPTile rdpTile, const GPUTile gpuTile, float2 tcScale, int2 texelInt, uint tlut, bool gpuTileUsesTMEM, uint mipLevel) {
++    texelInt = clampWrapMirrorTexel(rdpTile, gpuTile, tcScale, texelInt);
+ 
+     // Check if tile requires TMEM decoding and sample using dynamic decoding.
+     if (gpuTileUsesTMEM) {
+-        return sampleTMEM(texelInt, rdpTile.siz, rdpTile.fmt, rdpTile.address, rdpTile.stride, tlut, rdpTile.palette, gTMEM[NonUniformResourceIndex(gpuTile.textureIndex)]);
++        return sampleTMEM(texelInt, rdpTile.siz, rdpTile.fmt, rdpTile.address, rdpTile.stride, tlut, rdpTile.palette, tileTMEM(gpuTile));
+     }
+     // Sample the color version directly.
+     else {
+-        return gTextures[NonUniformResourceIndex(gpuTile.textureIndex)].Load(int3(texelInt, mipLevel));
++        return loadTileTexture(gpuTile, int3(texelInt, mipLevel));
+     }
+ }
+ 
+@@ -137,10 +226,27 @@
+ 
+ static const float LowPrecision = 128.0f;
+ 
++#ifdef WEBGPU
++// WebGPU guarantees only 16 samplers in a stage, and nearest ones for every address mode would be 9 more. A nearest
++// sample at a texel's centre is that texel, so it is loaded, with the sampler's address mode applied to the texel coordinate first: outside
++// the switch over the draw's texture slots, which then holds only the load, rather than this once per slot.
++int2 nativeSamplerTexel(uint nativeSampler, int2 texelBaseInt, float2 textureSize) {
++    const int2 size = int2(textureSize);
++    const uint addressModeU = (nativeSampler - 1) / 3;
++    const uint addressModeV = (nativeSampler - 1) % 3;
++    int2 texel = texelBaseInt;
++    int2 period = int2(addressModeU == 1 ? 2 : 1, addressModeV == 1 ? 2 : 1) * size;
++    int2 wrapped = ((texel % period) + period) % period;
++    int2 mirrored = select(wrapped < size, wrapped, period - 1 - wrapped);
++    texel.x = (addressModeU == 2) ? clamp(texel.x, 0, size.x - 1) : mirrored.x;
++    texel.y = (addressModeV == 2) ? clamp(texel.y, 0, size.y - 1) : mirrored.y;
++    return texel;
++}
++#else
+ float4 sampleTextureNative(Texture2D texture, uint nativeSampler, int2 texelBaseInt, float2 textureSize) {
+     // Transform to native coordinate. Half pixel offset is required to reach the desired texel.
+     float2 nativeUVCoord = (float2(texelBaseInt) + 0.5f) / textureSize;
+-            
++
+     // Choose the native sampler that was determined to be compatible.
+     switch (nativeSampler) {
+         case NATIVE_SAMPLER_WRAP_WRAP:
+@@ -164,6 +270,57 @@
+             return texture.SampleLevel(gNearestClampClampSampler, nativeUVCoord, 0.0f);
+     }
+ }
++#endif
++
++#ifndef PER_DRAW_TEXTURES
++float4 sampleTextureGrad(Texture2D texture, uint nativeSampler, float2 nativeUVCoord, float2 ddxUVNorm, float2 ddyUVNorm) {
++    // Choose the native sampler that was determined to be compatible.
++    switch (nativeSampler) {
++        case NATIVE_SAMPLER_WRAP_WRAP:
++            return texture.SampleGrad(gLinearWrapWrapSampler, nativeUVCoord, ddxUVNorm, ddyUVNorm);
++        case NATIVE_SAMPLER_WRAP_MIRROR:
++            return texture.SampleGrad(gLinearWrapMirrorSampler, nativeUVCoord, ddxUVNorm, ddyUVNorm);
++        case NATIVE_SAMPLER_WRAP_CLAMP:
++            return texture.SampleGrad(gLinearWrapClampSampler, nativeUVCoord, ddxUVNorm, ddyUVNorm);
++        case NATIVE_SAMPLER_MIRROR_WRAP:
++            return texture.SampleGrad(gLinearMirrorWrapSampler, nativeUVCoord, ddxUVNorm, ddyUVNorm);
++        case NATIVE_SAMPLER_MIRROR_MIRROR:
++            return texture.SampleGrad(gLinearMirrorMirrorSampler, nativeUVCoord, ddxUVNorm, ddyUVNorm);
++        case NATIVE_SAMPLER_MIRROR_CLAMP:
++            return texture.SampleGrad(gLinearMirrorClampSampler, nativeUVCoord, ddxUVNorm, ddyUVNorm);
++        case NATIVE_SAMPLER_CLAMP_WRAP:
++            return texture.SampleGrad(gLinearClampWrapSampler, nativeUVCoord, ddxUVNorm, ddyUVNorm);
++        case NATIVE_SAMPLER_CLAMP_MIRROR:
++            return texture.SampleGrad(gLinearClampMirrorSampler, nativeUVCoord, ddxUVNorm, ddyUVNorm);
++        case NATIVE_SAMPLER_CLAMP_CLAMP:
++        default:
++            return texture.SampleGrad(gLinearClampClampSampler, nativeUVCoord, ddxUVNorm, ddyUVNorm);
++    }
++}
++#endif
++
++float4 sampleTileTextureNative(const GPUTile gpuTile, uint nativeSampler, int2 texelBaseInt) {
++#ifdef WEBGPU
++    return loadTileTexture(gpuTile, int3(nativeSamplerTexel(nativeSampler, texelBaseInt, gpuTile.textureDimensions.xy), 0));
++#else
++#define TEXTURE_CALL(texture) sampleTextureNative(texture, nativeSampler, texelBaseInt, gpuTile.textureDimensions.xy)
++    TILE_TEXTURE_SWITCH(gpuTile, TEXTURE_CALL)
++#undef TEXTURE_CALL
++#endif
++}
++
++float4 sampleTileTextureGrad(const GPUTile gpuTile, uint nativeSampler, float2 nativeUVCoord, float2 ddxUVNorm, float2 ddyUVNorm) {
++#ifdef PER_DRAW_TEXTURES
++    // The renderer bound the slot's sampler for nativeSampler (FramebufferRenderer::updateDrawTextureSets).
++#define TEXTURE_SAMPLER_CALL(texture, sampler) texture.SampleGrad(sampler, nativeUVCoord, ddxUVNorm, ddyUVNorm)
++    TILE_TEXTURE_SAMPLER_SWITCH(gpuTile, TEXTURE_SAMPLER_CALL)
++#undef TEXTURE_SAMPLER_CALL
++#else
++#define TEXTURE_CALL(texture) sampleTextureGrad(texture, nativeSampler, nativeUVCoord, ddxUVNorm, ddyUVNorm)
++    TILE_TEXTURE_SWITCH(gpuTile, TEXTURE_CALL)
++#undef TEXTURE_CALL
++#endif
++}
+ 
+ float4 sampleTextureLevel(const RDPTile rdpTile, const GPUTile gpuTile, bool filterBilerp, bool filterAverage, bool linearFiltering, float2 uvCoord, uint tlut, bool canDecodeTMEM, uint mipLevel, bool usesHDR) {
+     float2 tcScale = gpuTile.tcScale;
+@@ -184,6 +341,52 @@
+     float4 samples[4];
+     const uint nativeSampler = rdpTile.nativeSampler;
+     bool gpuTileUsesTMEM = canDecodeTMEM && gpuTileFlagRawTMEM(gpuTile.flags);
++#if defined(WEBGPU) && defined(PER_DRAW_TEXTURES) && !USE_FOR_LOOPS
++    // Every tap's texel is found first, by the native sampler's address mode or by the tile's clamp, wrap and mirror,
++    // and the taps are then loaded in one switch over the draw's texture slots (loadTileTexels()). A switch for each
++    // tap and for each way of finding its texel left a pixel shader whose slot is picked per pixel (mip LOD) with 32
++    // switches of 8 loads: one of GoldenEye's, 224 KB of WGSL, is 185 KB this way with half the loads, and builds in
++    // about 60% of the time in Firefox 158 and Chrome 155 (RTX 2070). GoldenEye's prebuilt list is 16.3 MB of WGSL
++    // instead of 19.0, and Firefox, which builds a section one shader at a time while the game waits, waited 8.7-9.4 s
++    // for its boot and 14.0-21.7 s for Dam against 10.4-11.6 and 17.7-23.3 (three runs each, interleaved). The
++    // ubershader reads its taps in a loop (USE_FOR_LOOPS), a load site already, and keeps it.
++    // Rush 2: a generated mipmap level and a region of a larger image are read by the tile, not a native sampler
++    // (a region's texels are shifted into its image, which the native samplers can't do).
++    const bool nativeAddress = (nativeSampler != NATIVE_SAMPLER_NONE) && !gpuTileUsesTMEM && (mipLevel == 0) &&
++        !gpuTileFlagSourceRegion(gpuTile.flags);
++    int2 texels[4];
++    [unroll]
++    for (int i = 0; i < 4; i++) {
++        const int2 texelInt = texelBaseInt + int2(i >> 1, i & 1);
++        if (nativeAddress) {
++            texels[i] = nativeSamplerTexel(nativeSampler, texelInt, gpuTile.textureDimensions.xy);
++        }
++        else {
++            texels[i] = clampWrapMirrorTexel(rdpTile, gpuTile, tcScale, texelInt);
++            // Rush 2: a filter neighbor past a region reads the image's own next texel, as sampleTexel() does.
++            if (gpuTileFlagSourceRegion(gpuTile.flags) && (i > 0) && !gpuTileUsesTMEM) {
++                const int2 tileMax = int2(floor(round(tcScale * float2(rdpTile.lrs, rdpTile.lrt)) / 4.0f) - floor(round(tcScale * float2(rdpTile.uls, rdpTile.ult)) / 4.0f) + round(tcScale - 1.0f));
++                const int2 imageTexel = texelInt + int2(gpuTile.texelShift);
++                const bool baseInside = all(texelBaseInt >= 0) && all(texelBaseInt <= tileMax);
++                if (baseInside && any(texelInt > tileMax) && all(imageTexel < int2(gpuTile.textureDimensions.xy))) {
++                    texels[i] = imageTexel;
++                }
++            }
++        }
++    }
++
++    if (gpuTileUsesTMEM) {
++        samples[0] = sampleTMEM(texels[0], rdpTile.siz, rdpTile.fmt, rdpTile.address, rdpTile.stride, tlut, rdpTile.palette, tileTMEM(gpuTile));
++        if (filtering) {
++            samples[1] = sampleTMEM(texels[1], rdpTile.siz, rdpTile.fmt, rdpTile.address, rdpTile.stride, tlut, rdpTile.palette, tileTMEM(gpuTile));
++            samples[2] = sampleTMEM(texels[2], rdpTile.siz, rdpTile.fmt, rdpTile.address, rdpTile.stride, tlut, rdpTile.palette, tileTMEM(gpuTile));
++            samples[3] = sampleTMEM(texels[3], rdpTile.siz, rdpTile.fmt, rdpTile.address, rdpTile.stride, tlut, rdpTile.palette, tileTMEM(gpuTile));
++        }
++    }
++    else {
++        loadTileTexels(gpuTile, texels, nativeAddress ? 0 : mipLevel, filtering, samples);
++    }
++#else
+     // A region's texels are shifted into its image, which the native samplers can't do.
+     if ((nativeSampler == NATIVE_SAMPLER_NONE) || gpuTileUsesTMEM || (mipLevel > 0) || gpuTileFlagSourceRegion(gpuTile.flags)) {
+ #if USE_FOR_LOOPS
+@@ -203,23 +406,23 @@
+ #endif
+     }
+     else {
+-        Texture2D texture = gTextures[NonUniformResourceIndex(gpuTile.textureIndex)];
+ #if USE_FOR_LOOPS
+         int numSamples = select_uint(filtering, 4, 1);
+         [unroll]
+         for (int i = 0; i < numSamples; i++) {
+-            samples[i] = sampleTextureNative(texture, nativeSampler, texelBaseInt + int2(i >> 1, i & 1), gpuTile.textureDimensions.xy);
++            samples[i] = sampleTileTextureNative(gpuTile, nativeSampler, texelBaseInt + int2(i >> 1, i & 1));
+         }
+ #else
+-        samples[0] = sampleTextureNative(texture, nativeSampler, texelBaseInt, gpuTile.textureDimensions.xy);
++        samples[0] = sampleTileTextureNative(gpuTile, nativeSampler, texelBaseInt);
+         
+         if (filtering) {
+-            samples[1] = sampleTextureNative(texture, nativeSampler, texelBaseInt + int2(0, 1), gpuTile.textureDimensions.xy);
+-            samples[2] = sampleTextureNative(texture, nativeSampler, texelBaseInt + int2(1, 0), gpuTile.textureDimensions.xy);
+-            samples[3] = sampleTextureNative(texture, nativeSampler, texelBaseInt + int2(1, 1), gpuTile.textureDimensions.xy);
++            samples[1] = sampleTileTextureNative(gpuTile, nativeSampler, texelBaseInt + int2(0, 1));
++            samples[2] = sampleTileTextureNative(gpuTile, nativeSampler, texelBaseInt + int2(1, 0));
++            samples[3] = sampleTileTextureNative(gpuTile, nativeSampler, texelBaseInt + int2(1, 1));
+         }
+ #endif
+     }
++#endif
+     
+     float4 sample00 = samples[0];
+     if (filtering) {
+@@ -413,8 +616,6 @@
+ 
+     // Determine the RDP sample count and mip levels.
+     if (flagHasMipmaps) {
+-        // Retrieve the dimensions of the texture for either type of sampler.
+-        Texture2D texture = gTextures[NonUniformResourceIndex(gpuTile.textureIndex)];
+         if (nativeSampler == NATIVE_SAMPLER_NONE) {
+             float2 ddxUVScaled = ddxUV * gpuTile.tcScale;
+             float2 ddyUVScaled = ddyUV * gpuTile.tcScale;
+@@ -433,28 +634,7 @@
+             float2 ddxUVNorm = ddxUV / originalSize;
+             float2 ddyUVNorm = ddyUV / originalSize;
+             
+-            // Choose the native sampler that was determined to be compatible.
+-            switch (nativeSampler) {
+-                case NATIVE_SAMPLER_WRAP_WRAP:
+-                    return texture.SampleGrad(gLinearWrapWrapSampler, nativeUVCoord, ddxUVNorm, ddyUVNorm);
+-                case NATIVE_SAMPLER_WRAP_MIRROR:
+-                    return texture.SampleGrad(gLinearWrapMirrorSampler, nativeUVCoord, ddxUVNorm, ddyUVNorm);
+-                case NATIVE_SAMPLER_WRAP_CLAMP:
+-                    return texture.SampleGrad(gLinearWrapClampSampler, nativeUVCoord, ddxUVNorm, ddyUVNorm);
+-                case NATIVE_SAMPLER_MIRROR_WRAP:
+-                    return texture.SampleGrad(gLinearMirrorWrapSampler, nativeUVCoord, ddxUVNorm, ddyUVNorm);
+-                case NATIVE_SAMPLER_MIRROR_MIRROR:
+-                    return texture.SampleGrad(gLinearMirrorMirrorSampler, nativeUVCoord, ddxUVNorm, ddyUVNorm);
+-                case NATIVE_SAMPLER_MIRROR_CLAMP:
+-                    return texture.SampleGrad(gLinearMirrorClampSampler, nativeUVCoord, ddxUVNorm, ddyUVNorm);
+-                case NATIVE_SAMPLER_CLAMP_WRAP:
+-                    return texture.SampleGrad(gLinearClampWrapSampler, nativeUVCoord, ddxUVNorm, ddyUVNorm);
+-                case NATIVE_SAMPLER_CLAMP_MIRROR:
+-                    return texture.SampleGrad(gLinearClampMirrorSampler, nativeUVCoord, ddxUVNorm, ddyUVNorm);
+-                case NATIVE_SAMPLER_CLAMP_CLAMP:
+-                default:
+-                    return texture.SampleGrad(gLinearClampClampSampler, nativeUVCoord, ddxUVNorm, ddyUVNorm);
+-            }
++            return sampleTileTextureGrad(gpuTile, nativeSampler, nativeUVCoord, ddxUVNorm, ddyUVNorm);
+         }
+     }
+     else {
+@@ -469,6 +649,21 @@
+     for (uint i = 0; i < numRDPSamples; i++) {
+         textureSamples[i] = sampleTextureLevel(rdpTile, gpuTile, filterBilerp, filterAverage, linearFiltering, uvCoord, tlut, canDecodeTMEM, RDPMipLevels[i], usesHDR);
+     }
++#elif defined(WEBGPU) && defined(PER_DRAW_TEXTURES)
++    // A level is its four taps' texels found and loaded (sampleTextureLevel()), most of a pixel shader with mip LOD, so
++    // the two levels are sampled in a loop the shader keeps ([loop]) and that code is in it once, not twice. Each index
++    // is a constant, or dxc keeps the arrays in memory. With RasterPS's loop over its two tiles (sampleDrawTile()), a
++    // prebuilt pixel shader with mip LOD is about 70 KB of WGSL instead of 185 (RasterPS.hlsl has what Firefox saves).
++    [loop]
++    for (uint i = 0; i < numRDPSamples; i++) {
++        const float4 levelSample = sampleTextureLevel(rdpTile, gpuTile, filterBilerp, filterAverage, linearFiltering, uvCoord, tlut, canDecodeTMEM, (i == 0) ? RDPMipLevels[0] : RDPMipLevels[1], usesHDR);
++        if (i == 0) {
++            textureSamples[0] = levelSample;
++        }
++        else {
++            textureSamples[1] = levelSample;
++        }
++    }
+ #else
+     textureSamples[0] = sampleTextureLevel(rdpTile, gpuTile, filterBilerp, filterAverage, linearFiltering, uvCoord, tlut, canDecodeTMEM, RDPMipLevels[0], usesHDR);
+     

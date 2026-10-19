@@ -1,0 +1,11 @@
+# The files tools/build_web.sh leaves out of N64Recomp-browser's web patches, where Rush 2 Recompiled's own patches
+# (lib/patches) change the same lines, whose web change is in web/patches/<project>.patch, made on top of Rush 2's:
+# <project> <file> <hash of the web's change it was merged from> (tools/check_web_patches.sh).
+# merged from N64Recomp-browser a1237d4f47e5613e025fa3acfc66bacfa44a3878
+rt64 src/hle/rt64_present_queue.cpp b919e95c63a4f5704a082c12c916a51e46cfdac9
+rt64 src/hle/rt64_workload_queue.cpp 521c1a1eef712d6bdbb7cd53c679d1147e424a4c
+rt64 src/render/rt64_shader_library.cpp 366dd2918d96bc0296b2228e74c1f59a3cd92753
+rt64 src/shaders/RasterPS.hlsl 2c2f5eebb82c4111c7ce61c11ec1e3557990dadc
+rt64 src/shaders/TextureSampler.hlsli 24660bf01c6dd754c90eed83b367593409fade4a
+N64ModernRuntime ultramodern/src/events.cpp fbf578b51918e2372476cb499c053ad749f63fb8
+RecompFrontend recompui/src/util/file.cpp 7dfcee2cf674b655b7f4b15bcea8527afa275a6d

@@ -13,7 +13,9 @@
 #include <vector>
 
 #include "hitch_profiler.h"
-#include "nfd.h"
+#ifndef __EMSCRIPTEN__
+#include "nfd.h" // a browser has no native file dialogs; RecompFrontend asks the page instead
+#endif
 #include "texture_census.h"
 #include "texture_derive.h"
 
@@ -40,6 +42,9 @@
 #include "recompui/config.h"
 #include "elements/ui_image.h"
 #include "util/file.h"
+#ifdef __EMSCRIPTEN__
+#include "audio_output.h"
+#endif
 #include "recompinput/input_events.h"
 #include "recompinput/recompinput.h"
 #include "recompinput/profiles.h"
@@ -88,7 +93,13 @@ ultramodern::gfx_callbacks_t::gfx_data_t create_gfx() {
     SDL_SetHint(SDL_HINT_JOYSTICK_RAWINPUT, "0");
     SDL_SetHint(SDL_HINT_JOYSTICK_THREAD, "1");
 
-    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER | SDL_INIT_JOYSTICK | SDL_INIT_HAPTIC) > 0) {
+    // Emscripten's SDL2 is built without haptics, and asking for them there fails the whole call, gamepads with it.
+#ifdef __EMSCRIPTEN__
+    const Uint32 sdl_subsystems = SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER | SDL_INIT_JOYSTICK;
+#else
+    const Uint32 sdl_subsystems = SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER | SDL_INIT_JOYSTICK | SDL_INIT_HAPTIC;
+#endif
+    if (SDL_Init(sdl_subsystems) > 0) {
         exit_error("Failed to initialize SDL2: %s\n", SDL_GetError());
     }
 
@@ -156,8 +167,8 @@ ultramodern::renderer::WindowHandle create_window(ultramodern::gfx_callbacks_t::
         exit_error("Failed to create window: %s\n", SDL_GetError());
     }
 
-#if !defined(_WIN32)
-    // On Windows, SDL takes the window icon from the executable's icon resource (icons/app.rc).
+#if !defined(_WIN32) && !defined(__EMSCRIPTEN__)
+    // On Windows, SDL takes the window icon from the executable's icon resource (icons/app.rc). A page has none.
     set_window_icon(window);
 #endif
 
@@ -168,7 +179,8 @@ ultramodern::renderer::WindowHandle create_window(ultramodern::gfx_callbacks_t::
 #if defined(_WIN32)
     rush2::steam_input_filter::install(wmInfo.info.win.window);
     return ultramodern::renderer::WindowHandle{ wmInfo.info.win.window, GetCurrentThreadId() };
-#elif defined(__linux__) || defined(__ANDROID__)
+#elif defined(__linux__) || defined(__ANDROID__) || defined(__EMSCRIPTEN__)
+    // In a browser the window is the page's canvas, sized by the page (SDL follows its CSS size).
 #if defined(__linux__)
     // The file pickers stay in front of the game (src/linux_window.cpp).
     rush2::linux_window::set_dialog_parent(wmInfo.subsystem == SDL_SYSWM_X11 ? (unsigned long)wmInfo.info.x11.window : 0);
@@ -232,6 +244,27 @@ static uint32_t discarded_output_frames;
 
 constexpr uint32_t bytes_per_frame = input_channels * sizeof(float);
 
+// On a page, sound plays through N64Recomp-browser's AudioWorklet output (audio_output.h) instead of SDL's queue:
+// Emscripten's SDL2 plays from the page's thread, where WebGPU's work runs, and its sound broke up whenever that
+// thread was busy.
+#ifdef __EMSCRIPTEN__
+static uint64_t get_queued_audio_bytes() {
+    return uint64_t(n64recomp_browser::audio::queued_frames()) * output_channels * sizeof(float);
+}
+
+static void queue_audio(const float* samples, uint32_t byte_count) {
+    n64recomp_browser::audio::queue(samples, byte_count / (output_channels * sizeof(float)));
+}
+#else
+static uint64_t get_queued_audio_bytes() {
+    return SDL_GetQueuedAudioSize(audio_device);
+}
+
+static void queue_audio(const float* samples, uint32_t byte_count) {
+    SDL_QueueAudio(audio_device, samples, byte_count);
+}
+#endif
+
 void queue_samples(int16_t* audio_data, size_t sample_count) {
     if (rush2::sim::active()) {
         return; // a simulation run is silent, and in turbo makes audio far faster than it plays
@@ -276,7 +309,7 @@ void queue_samples(int16_t* audio_data, size_t sample_count) {
     }
 
     // The queue holds converted audio, so measure it at the output rate (the game runs at 22050 Hz).
-    uint64_t cur_queued_microseconds = uint64_t(SDL_GetQueuedAudioSize(audio_device)) / (output_channels * sizeof(float)) * 1000000 / output_sample_rate;
+    uint64_t cur_queued_microseconds = get_queued_audio_bytes() / (output_channels * sizeof(float)) * 1000000 / output_sample_rate;
     uint32_t num_bytes_to_queue = audio_convert.len_cvt - output_channels * discarded_output_frames * sizeof(swap_buffer[0]);
     float* samples_to_queue = swap_buffer.data() + output_channels * discarded_output_frames / 2;
 
@@ -291,7 +324,7 @@ void queue_samples(int16_t* audio_data, size_t sample_count) {
         }
     }
 
-    SDL_QueueAudio(audio_device, samples_to_queue, num_bytes_to_queue);
+    queue_audio(samples_to_queue, num_bytes_to_queue);
 }
 
 size_t get_frames_remaining() {
@@ -299,7 +332,7 @@ size_t get_frames_remaining() {
     // up. At 1 VI the SDL queue regularly ran dry (silence padding = small random pops in the music); 2 VIs keeps
     // it at 20 ms or more.
     constexpr float buffer_offset_frames = 2.0f;
-    uint64_t buffered_byte_count = SDL_GetQueuedAudioSize(audio_device);
+    uint64_t buffered_byte_count = get_queued_audio_bytes();
     buffered_byte_count = buffered_byte_count * 2 * sample_rate / output_sample_rate / output_channels;
 
     uint32_t frames_per_vi = (sample_rate / 60);
@@ -326,6 +359,9 @@ void set_frequency(uint32_t freq) {
 }
 
 bool reset_audio(uint32_t output_freq) {
+#ifdef __EMSCRIPTEN__
+    output_freq = n64recomp_browser::audio::open(output_channels);
+#else
     SDL_AudioSpec spec_desired{
         .freq = (int)output_freq,
         .format = AUDIO_F32,
@@ -345,6 +381,7 @@ bool reset_audio(uint32_t output_freq) {
         return false;
     }
     SDL_PauseAudioDevice(audio_device, 0);
+#endif
 
     output_sample_rate = output_freq;
     update_audio_converter();
@@ -634,7 +671,9 @@ int main(int argc, char** argv) {
 #ifdef __linux__
     rush2::linux_window::prepare_gtk(); // Before NFD_Init starts GTK.
 #endif
+#ifndef __EMSCRIPTEN__
     NFD_Init();
+#endif
 #ifdef __linux__
     recompui::set_folder_opener(rush2::linux_window::open_folder);
 #endif
@@ -774,7 +813,9 @@ int main(int argc, char** argv) {
         threads_callbacks
     );
 
+#ifndef __EMSCRIPTEN__
     NFD_Quit();
+#endif
 
 #ifdef _WIN32
     timeEndPeriod(1);

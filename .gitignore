@@ -19,3 +19,7 @@ tools/rush2049/m2c/
 tools/rush1/out/
 tools/rush1/cpp_test/out/
 .discord_webhook
+
+# The web page (tools/build_web.sh)
+build-web/
+build-web-prep/
