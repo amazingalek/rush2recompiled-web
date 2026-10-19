@@ -149,6 +149,46 @@ Settings and the ROM copy live in `%LOCALAPPDATA%\Rush2Recompiled`, or next to t
 (General tab > Data Location, which creates `portable.txt` and copies your data over on the next launch). Players are assigned in the config menu's Players
 tab and buttons are bound in the game's own Controls screen.
 
+## The web page
+
+This fork's `main` branch also builds with [Emscripten](https://emscripten.org) into a page, `Rush2Recompiled.html`,
+that draws through WebGPU. `lib/rt64`, `lib/N64ModernRuntime` and `lib/RecompFrontend` are Rush 2 Recompiled's own, at
+the same commits, and [N64Recomp-browser](https://github.com/amazingalek/N64Recomp-browser) (`lib/N64Recomp-browser`)
+patches their checkouts with the web support and makes the game a page. The desktop build is unchanged: its patches,
+`lib/patches`, are applied by `CMakeLists.txt` as before, and nothing of the web's is.
+
+On Linux, with the Emscripten SDK installed and activated, clang, Ninja, Python 3 and
+[naga](https://github.com/gfx-rs/wgpu/tree/trunk/naga) (`cargo install naga-cli`):
+
+```bash
+bash tools/build_web.sh <US ROM>
+```
+
+It patches the submodules (Rush 2's own patches first, then the web's, with the files where both change the same lines
+merged by hand in `web/patches`), builds `N64Recomp` and `RSPRecomp` from the patched checkout, makes the ROM images,
+recompiles, and builds the page; its header says each step, and `tools/check_web_patches.sh`'s says when `web/patches`
+has to be merged again. `build-web` then holds `Rush2Recompiled.html`, `.js`, `.wasm`, `.data` and
+`coi_serviceworker.js`. The page needs a browser with WebGPU and must be cross-origin isolated: serve the folder with
+`Cross-Origin-Opener-Policy: same-origin` and `Cross-Origin-Embedder-Policy: require-corp`, or on a host that can't set
+headers, as is, and `coi_serviceworker.js` sets them after one reload. The player picks their ROM in the launcher; it,
+the settings and the saves are kept in the browser's IndexedDB for that origin.
+
+What the page leaves out: online play (a browser gives a page no UDP sockets or router to open a port on, so
+`src/online/online_web.cpp` stands in for ENet, LAN discovery and UPnP, and the game sees an offline machine), the
+external texture upscaler (a page starts no programs), N64: Recompiled code mods (the live recompiler writes machine
+code, which a page can't load), and the file pickers' native dialogs (the page's own picker opens instead).
+
+The page builds the game's shaders from `web/rt64_shaders.txt`, recorded by `web/shader_plan.json` with
+N64Recomp-browser's `tools/record_shaders.mjs` (its header says how): section 0, built before the game starts, is the
+launcher, the boot, the title and the menus; then the title's demos, the races (one on each of the 7 tracks) and a
+stunt course. A shader it missed is built behind the game, which draws with the ubershader until it is ready, and the
+page remembers it and builds it with the rest on the next visit. `web/play_plan.json` plays the page for
+`tools/play_page.mjs`: the menus to a race on Las Vegas, driven about 70 s.
+
+How the page plays, in each browser and on which GPU, is recorded in N64Recomp-browser's
+[plays.jsonl](https://github.com/amazingalek/N64Recomp-browser/blob/main/plays.jsonl) and its
+[games table](https://github.com/amazingalek/N64Recomp-browser#games).
+
 ## Releases
 
 Pushing master builds the pushed commit and publishes it as a GitHub release (`tools/hooks/pre-push` runs
