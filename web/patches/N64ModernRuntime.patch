@@ -1,7 +1,7 @@
 diff --git a/ultramodern/src/events.cpp b/ultramodern/src/events.cpp
 --- a/ultramodern/src/events.cpp
 +++ b/ultramodern/src/events.cpp
-@@ -177,6 +177,98 @@
+@@ -177,6 +177,98 @@ uint64_t total_vis = 0;
  
  
  extern std::atomic_bool exited;
@@ -100,7 +100,7 @@ diff --git a/ultramodern/src/events.cpp b/ultramodern/src/events.cpp
  extern moodycamel::LightweightSemaphore graphics_shutdown_ready;
  
  void set_dummy_vi(bool odd);
-@@ -235,10 +327,25 @@
+@@ -235,10 +327,25 @@ void vi_thread_func() {
                  // printf("Skipping the next VI wait\n");
                  next = std::chrono::high_resolution_clock::now();
              }

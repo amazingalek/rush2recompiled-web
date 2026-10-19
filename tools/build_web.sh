@@ -18,9 +18,10 @@
 #      among the WGSL ones, its sampleTexture LOD arguments and coverage output beside the web's per-draw tiles and
 #      decal depth); in TextureSampler.hlsli the web's texel loads keep Rush 2's rule that a generated mipmap level
 #      and a region of a larger image are read by the tile, and that a filter neighbour past a region reads the
-#      image's own next texel.
+#      image's own next texel, and Rush 2's generated mipmaps and region texels are read through the web's draw texture
+#      slots (sampleTileTextureGrad(), loadTileTexture()), not the desktop's texture array.
 #      N64ModernRuntime: the VI thread's wait for the browser's frame inside Rush 2's not-turbo branch.
-#      RecompFrontend: the page's file picker beside Rush 2's Windows one.
+#      RecompFrontend: the page's file picker beside Rush 2's Windows one, and the page's no-op in Rush 2's open_folder().
 # 2. N64Recomp and RSPRecomp, built natively from the patched checkout: the page needs the code the web-patched
 #    N64Recomp writes.
 # 3. The ROM images (tools/extract.py) and the recompiled game and audio microcode (docs/BUILDING.md, steps 2 and 3).

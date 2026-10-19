@@ -5,14 +5,15 @@
 #   bash tools/check_web_patches.sh [--update]
 #
 # Rush 2 Recompiled's own patches on rt64, the runtime and the menus (lib/patches) change some of the files
-# N64Recomp-browser's web patches change, so the build leaves those files out of the web patches and applies web/patches/<project>.patch to them instead, the two changes
-# merged by hand (build_web.sh, step 1). web/patches/files.txt names each such file with a hash of the web's change to
+# N64Recomp-browser's web patches change, so the build leaves those
+# files out of the web patches and applies web/patches/<project>.patch to them instead, the two changes merged by hand (build_web.sh, step 1). web/patches/files.txt names each such file with a hash of the web's change to
 # it that web/patches was merged from: the file's part of lib/N64Recomp-browser/patches/<project>.patch, less its
 # index line. When N64Recomp-browser moves and the web's change to one of them is another, the build would quietly go
 # without the new change, so this stops naming the files: merge their new change into web/patches/<project>.patch
 # (the old one is in N64Recomp-browser's history at the commit files.txt names), then run it with --update, which
 # writes the hashes and that commit anew. A file the build has to leave out now (the web's change and the port's meet
-# in it, so the web patch no longer applies to it) is added to files.txt by hand, then --update.
+# in it, so the web patch no longer applies to it, or applies but names what the port renamed, as in ui_mod_menu.cpp)
+# is added to files.txt by hand, then --update.
 set -euo pipefail
 root="$(cd "$(dirname "$0")/.." && pwd)"
 browser="$root/lib/N64Recomp-browser"
