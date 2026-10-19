@@ -1502,7 +1502,7 @@ diff --git a/src/shaders/RasterPS.hlsl b/src/shaders/RasterPS.hlsl
      // Add highlight color to the last step.
      uint highlightColorUint = instanceRenderIndices[gConstants.renderIndex].highlightColor;
      if (highlightColorUint > 0) {
-@@ -338,9 +466,16 @@ void PSMain(
+@@ -338,9 +466,18 @@ void PSMain(
  #if defined(DYNAMIC_RENDER_PARAMS)
      , bool isFrontFace : SV_IsFrontFace
  #endif
@@ -1512,14 +1512,16 @@ diff --git a/src/shaders/RasterPS.hlsl b/src/shaders/RasterPS.hlsl
      , [[vk::location(0)]] [[vk::index(0)]] out float4 pixelColor : SV_TARGET0
      , [[vk::location(0)]] [[vk::index(1)]] out float4 pixelAlpha : SV_TARGET1
 +#endif
++#if !defined(WEBGPU)
      , out uint pixelCoverage : SV_Coverage
++#endif
 +#if defined(DECAL_DEPTH_BOUNDS)
 +    , out float pixelDepth : SV_Depth
 +#endif
  )
  {
  #if !defined(DYNAMIC_RENDER_PARAMS)
-@@ -358,7 +493,12 @@ void PSMain(
+@@ -358,7 +495,17 @@ void PSMain(
      }
  
      pixelColor = resultColor;
@@ -1529,7 +1531,12 @@ diff --git a/src/shaders/RasterPS.hlsl b/src/shaders/RasterPS.hlsl
 +#if !defined(WEBGPU) || defined(DUAL_SOURCE_BLENDING)
      pixelAlpha = resultAlpha;
 +#endif
++    // naga takes no SampleMask output (its SPIR-V front end gives the variable an initializer of another type), so a
++    // page has no coverage output: with one sample, as a page draws, RasterPSs coverage is all of the pixels samples
++    // or a discard, the same without it.
++#if !defined(WEBGPU)
      pixelCoverage = resultCoverage;
++#endif
  }
  #endif
 \ No newline at end of file
