@@ -1558,7 +1558,7 @@ namespace {
         for (const ModelFile& f : files) {
             std::error_code ec;
             auto time = std::filesystem::last_write_time(mods[f.mod].path, ec);
-            signature += mods[f.mod].mod_id + ":" + f.path + ":" + std::to_string(ec ? 0 : time.time_since_epoch().count()) + ";";
+            signature += mods[f.mod].mod_id + ":" + f.path + ":" + std::to_string(ec ? 0 : static_cast<long long>(time.time_since_epoch().count())) + ";";
         }
         if (signature == model_signature) return false;
         model_signature = signature;
@@ -1678,7 +1678,7 @@ namespace {
                 files.emplace_back(i, f);
                 std::error_code ec;
                 auto time = std::filesystem::last_write_time(mods[i].path, ec);
-                signature += mods[i].mod_id + ":" + f + ":" + std::to_string(ec ? 0 : time.time_since_epoch().count()) + ";";
+                signature += mods[i].mod_id + ":" + f + ":" + std::to_string(ec ? 0 : static_cast<long long>(time.time_since_epoch().count())) + ";";
             }
         }
         if (signature == livery_signature) return false;
