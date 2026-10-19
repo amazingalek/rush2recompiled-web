@@ -1958,3 +1958,73 @@ diff --git a/src/shaders/TextureSampler.hlsli b/src/shaders/TextureSampler.hlsli
  #else
      textureSamples[0] = sampleTextureLevel(rdpTile, gpuTile, filterBilerp, filterAverage, linearFiltering, uvCoord, tlut, canDecodeTMEM, RDPMipLevels[0], usesHDR);
      
+diff --git a/src/render/rt64_texture_cache.cpp b/src/render/rt64_texture_cache.cpp
+--- a/src/render/rt64_texture_cache.cpp
++++ b/src/render/rt64_texture_cache.cpp
+@@ -397,14 +397,17 @@ namespace RT64 {
+             hasMipmaps = GeneratedMipmapsEnabled && (textureDimensions.z > 1.0f);
+         }
+ 
+-        // Remove the existing entry from the list if it exists.
++        // Remove the existing entry from the list if it exists. A use is marked twice, when the state prepares the
++        // workload and when the workload is drawn, a few workloads apart, so the entry keeps the later of the two.
++        uint64_t accessFrame = submissionFrame;
+         AccessList::iterator listIt = listIterators[textureIndex];
+         if (listIt != accessList.end()) {
++            accessFrame = std::max(accessFrame, listIt->second);
+             accessList.erase(listIt);
+         }
+ 
+         // Push a new access entry to the front of the list and store the new iterator.
+-        accessList.push_front({ textureIndex, submissionFrame });
++        accessList.push_front({ textureIndex, accessFrame });
+         listIterators[textureIndex] = accessList.begin();
+         return true;
+     }
+@@ -1157,7 +1160,13 @@ namespace RT64 {
+                 uploadQueueChanged.wait(queueLock, [this]() {
+                     return !uploadThreadRunning || !uploadQueue.empty() || !resolvedPathQueue.empty() || !streamResultQueue.empty() || !liveUploadQueue.empty() || !liveApplyQueue.empty();
+                 });
++            }
+ 
++            // The batch runs from taking the queues until its textures and replacements are in the map, with no reload of
++            // the replacement directories in between (replacementBatchMutex).
++            std::unique_lock batchLock(replacementBatchMutex);
++            {
++                std::unique_lock queueLock(uploadQueueMutex);
+                 if (!uploadQueue.empty()) {
+                     queueCopy = uploadQueue;
+                 }
+@@ -1288,7 +1297,12 @@ namespace RT64 {
+                         dstTexture->texture = directWorker->device->createTexture(RenderTextureDesc::Texture2D(upload.width, upload.height, mipLevels, dstTexture->format, RenderTextureFlag::STORAGE | RenderTextureFlag::UNORDERED_ACCESS));
+                         dstTexture->texture->setName("Texture Cache RGBA32 #" + std::to_string(TextureGlobalCounter++));
+                         descSet->setTexture(descSet->TMEM, dstTexture->tmem.get(), RenderTextureLayout::SHADER_READ);
+-                        descSet->setTexture(descSet->RGBA32, dstTexture->texture.get(), RenderTextureLayout::GENERAL);
++                        // The first level is written through a view of it too: WebGPU takes one level as a storage
++                        // texture, and the texture's own view is all of them.
++                        RenderTextureViewDesc baseViewDesc = RenderTextureViewDesc::Texture2D(dstTexture->format);
++                        baseViewDesc.mipLevels = 1;
++                        dstTexture->mipViews.emplace_back(dstTexture->texture->createTextureView(baseViewDesc));
++                        descSet->setTexture(descSet->RGBA32, dstTexture->texture.get(), RenderTextureLayout::GENERAL, dstTexture->mipViews.back().get());
+ 
+                         // The decoder fills each level in from TMEM in a dispatch of its own, through a view of the level.
+                         for (uint32_t m = 1; m < mipLevels; m++) {
+@@ -1830,6 +1844,9 @@ namespace RT64 {
+     }
+ 
+     void TextureCache::clearReplacementDirectories() {
++        // Wait for the upload thread's batch and hold off the next (replacementBatchMutex).
++        std::lock_guard batchLock(replacementBatchMutex);
++
+         // Wait for the streaming threads to be finished.
+         waitForAllStreamThreads(true);
+ 
+@@ -1888,6 +1905,8 @@ namespace RT64 {
+     }
+     
+     bool TextureCache::loadReplacementDirectories(const std::vector<ReplacementDirectory> &replacementDirectories) {
++        // No upload batch until the new directories are loaded and their replacements queued (replacementBatchMutex).
++        std::lock_guard batchLock(replacementBatchMutex);
+         clearReplacementDirectories();
+ 
+         std::unique_lock lock(textureMapMutex);
