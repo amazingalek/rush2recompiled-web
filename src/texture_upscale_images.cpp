@@ -789,6 +789,11 @@ int run_command(const std::string& command_line, const std::atomic<bool>* cancel
     CloseHandle(process.hThread);
     CloseHandle(process.hProcess);
     return (int)exit_code;
+#elif defined(__EMSCRIPTEN__)
+    // A page starts no programs, so its run fails as one with no upscaler installed does.
+    (void)command_line;
+    (void)cancel;
+    return -1;
 #else
     const char* argv[] = { "nice", "-n", "10", "sh", "-c", command_line.c_str(), nullptr };
     pid_t pid;
