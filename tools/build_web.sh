@@ -11,8 +11,9 @@
 #    another. First Rush 2 Recompiled's own, lib/patches/<submodule>.patch, as the desktop build's CMakeLists.txt
 #    applies them; then N64Recomp-browser's web support (lib/N64Recomp-browser/patches/apply.cmake, project by
 #    project), but for the files where the two change the same lines: the web's change to those (web/patches/files.txt)
-#    is web/patches/<project>.patch instead, made on top of Rush 2's and remade when either side changes those files:
-#    tools/check_web_patches.sh stops the build when the web's change to one of them has moved since.
+#    is web/patches/<project>.patch instead, made on top of Rush 2's from the N64Recomp-browser commit
+#    web/patches/files.txt names, with what the web has changed in them since merged in by apply.cmake --since (only
+#    a change that meets Rush 2's own lines stops the build, for another merge by hand).
 #      rt64: what both add beside each other (Rush 2's present profiling mark beside the web's phase timer, its
 #      Variable frame rate's timeline beside the offscreen workloads, its car reflection and ambient occlusion shaders
 #      among the WGSL ones, its sampleTexture LOD arguments and coverage output beside the web's per-draw tiles and
@@ -47,16 +48,16 @@ step "Submodules"
     git submodule update --init --recursive lib/rt64 lib/N64ModernRuntime lib/RecompFrontend $browser
 
 step "Patches"
-bash tools/check_web_patches.sh
-# <name> <checkout> [files left to web/patches/<name>.patch]
+# <name> <checkout> [files left to web/patches/<name>.patch, merged from the commit files.txt names]
 shared() { awk -v p="$1" '!/^#/ && $1 == p { printf "%s ", $2 }' web/patches/files.txt; }
+merged_from="$(sed -n 's/^# merged from N64Recomp-browser //p' web/patches/files.txt)"
 web_patches="rt64 lib/rt64 $(shared rt64)
 plume lib/rt64/src/contrib/plume
 hlslpp lib/rt64/src/contrib/hlslpp
 N64ModernRuntime lib/N64ModernRuntime $(shared N64ModernRuntime)
 N64Recomp lib/N64ModernRuntime/N64Recomp
 RecompFrontend lib/RecompFrontend $(shared RecompFrontend)"
-stamp="$(git -C $browser rev-parse HEAD) $( (cat lib/patches/*.patch web/patches/*.patch; echo "$web_patches") | sha1sum | cut -c1-40)"
+stamp="$(git -C $browser rev-parse HEAD) $( (cat lib/patches/*.patch web/patches/*.patch web/patches/files.txt; echo "$web_patches") | sha1sum | cut -c1-40)"
 if [[ "$(cat $prep/web-patched 2> /dev/null)" != "$stamp" ]]; then
     for s in lib/rt64 lib/N64ModernRuntime lib/RecompFrontend; do
         git -C $s submodule foreach --recursive -q 'git reset -q --hard && git clean -fdq'
@@ -69,6 +70,7 @@ if [[ "$(cat $prep/web-patched 2> /dev/null)" != "$stamp" ]]; then
     while read -r name checkout skip; do
         cmake -P $browser/patches/apply.cmake "$name" "$checkout" $skip
         [[ ! -f web/patches/$name.patch ]] || git -C "$checkout" apply --whitespace=nowarn "$root/web/patches/$name.patch"
+        [[ -z "$skip" ]] || cmake -P $browser/patches/apply.cmake "$name" "$checkout" --since "$merged_from" $skip
     done <<< "$web_patches"
     echo "$stamp" > $prep/web-patched
 fi

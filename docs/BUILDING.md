@@ -166,8 +166,8 @@ bash tools/build_web.sh <US ROM>
 
 It patches the submodules (Rush 2's own patches first, then the web's, with the files where both change the same lines
 merged by hand in `web/patches`), builds `N64Recomp` and `RSPRecomp` from the patched checkout, makes the ROM images,
-recompiles, and builds the page; its header says each step, and `tools/check_web_patches.sh`'s says when `web/patches`
-has to be merged again. `build-web` then holds `Rush2Recompiled.html`, `.js`, `.wasm`, `.data` and
+recompiles, and builds the page; its header says each step, and `web/patches/files.txt`'s when `web/patches` has to
+be merged again by hand. `build-web` then holds `Rush2Recompiled.html`, `.js`, `.wasm`, `.data` and
 `coi_serviceworker.js`. The page needs a browser with WebGPU and must be cross-origin isolated: serve the folder with
 `Cross-Origin-Opener-Policy: same-origin` and `Cross-Origin-Embedder-Policy: require-corp`, or on a host that can't set
 headers, as is, and `coi_serviceworker.js` sets them after one reload. The player picks their ROM in the launcher; it,
