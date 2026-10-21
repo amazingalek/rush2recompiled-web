@@ -1,19 +1,26 @@
 {
  "header": [
-  "The page's plan for N64Recomp-browser's tools/play_page.mjs: the launcher, Load ROM on a new profile, Start Game,",
-  "then through the menus as a player (web/shader_plan.json's header has the keys and the RDRAM it reads) to a race on Las",
-  "Vegas in the first car, driven about 70 s with the gas held and a weave."
+  "The page's plan for N64Recomp-browser's tools/play_page.mjs, its regular play of 2-3 minutes: the launcher, Load ROM",
+  "on a new profile once the shader list Chrome builds behind it is done (Firefox builds none there and says so), Start",
+  "Game, then through the menus as a player (web/shader_plan.json's header has the keys and the RDRAM it reads) to ONE",
+  "RACE on Las Vegas in the first car, driven about 35 s. The race's start is a need that the game is racing (game_state",
+  "0x8010C0D0 3) on the track asked for (0x8010C3F0) in ONE RACE (0x8010C3E8). The No Race Timer cheat is on",
+  "(0x800D9E88), so a race driven blind never runs out of time. A race is driven by the race layout's keys",
+  "(src/controls.cpp: the gas ArrowUp, steering ArrowLeft and ArrowRight; Space, the menus' A, is the wings' key there),",
+  "the gas held and a weave, its waits and holds on the game's clock (timer_game_time 0x80117488, seconds), with a shot",
+  "about 5 s in and a need there that the car is doing 15 mph or more. web/play_plan_extended.json goes on to Alcatraz,",
+  "for when a longer play is needed."
  ],
  "page": "Rush2Recompiled.html",
  "load": [
   [
    "until",
-   "Device Name",
-   60000
+   "RT64: all \\d+ prebuilt shaders built|once the game draws",
+   45000
   ],
   [
    "wait",
-   5000
+   2000
   ]
  ],
  "setup": [
@@ -24,7 +31,7 @@
   ],
   [
    "wait",
-   4000
+   3000
   ]
  ],
  "start": [
@@ -36,12 +43,12 @@
  ],
  "play": [
   [
-   "eval",
-   "new Promise((ok, no) => { const t0 = Date.now(); const t = setInterval(() => { if (((n64r(0x800E7BC4) >>> 16) << 16 >> 16) == 16) { clearInterval(t); ok(); } else if (Date.now() - t0 > 90000) { clearInterval(t); no(new Error('timed out: ((n64r(0x800E7BC4) >>> 16) << 16 >> 16) == 16')); } }, 100); })"
+   "need",
+   "((() => { const f32 = (a) => new Float32Array(new Uint32Array([n64r(a)]).buffer)[0]; globalThis.planWhere = () => 'state ' + n64r(0x8010C0D0) + ' screen ' + ((n64r(0x800E7BC4) >>> 16) << 16 >> 16) + ' mode ' + n64r(0x8010C3E8) + ' track ' + (n64r(0x8010C3F0) >> 24) + ' entry ' + ((n64r(0x803D05B4) >>> 16) << 16 >> 16); globalThis.planWait = (test, name, ms) => new Promise((ok) => { const t0 = Date.now(); const t = setInterval(() => { let y = false; try { y = test(); } catch (e) {} if (y) { clearInterval(t); ok(true); } else if (Date.now() - t0 > ms) { clearInterval(t); let w = ''; try { w = planWhere(); } catch (e) { w = String(e); } console.log('[plan] ' + name + ' timed out: ' + w); ok(false); } }, 100); }); globalThis.planSpeed = (name, min) => { let s = -1; for (let i = 0; i < 8; i++) { if ((n64r(0x800F5470 + i * 0x81C + 0x7E8) >>> 24) == 2) { s = i; break; } } if (s < 0) { console.log('[plan] ' + name + ' speed: no player car'); return false; } const c = 0x800F5470 + s * 0x81C; const mph = Math.hypot(f32(c + 0x218), f32(c + 0x21C), f32(c + 0x220)) * 15 / 22; console.log('[plan] ' + name + ' speed: car ' + s + ' ' + mph.toFixed(1) + ' mph, throttle ' + f32(c + 0x734).toFixed(2)); return mph >= min; }; })(), planWait(() => ((n64r(0x800E7BC4) >>> 16) << 16 >> 16) == 16, 'title', 20000))"
   ],
   [
    "wait",
-   1500
+   1000
   ],
   [
    "pressUntil",
@@ -51,11 +58,25 @@
    150,
    1500,
    "((n64r(0x800E7BC4) >>> 16) << 16 >> 16) == 0",
-   30000
+   6000
   ],
   [
    "wait",
-   1500
+   1000
+  ],
+  [
+   "pressUntil",
+   "ArrowDown",
+   "ArrowDown",
+   40,
+   150,
+   800,
+   "(n64r(0x80023064) >>> 16) == 0",
+   3000
+  ],
+  [
+   "wait",
+   500
   ],
   [
    "pressUntil",
@@ -65,7 +86,7 @@
    150,
    1500,
    "((n64r(0x800E7BC4) >>> 16) << 16 >> 16) == 1",
-   30000
+   4500
   ],
   [
    "wait",
@@ -101,21 +122,7 @@
    150,
    1500,
    "n64r(0x8010C0D0) == 1",
-   30000
-  ],
-  [
-   "wait",
-   2500
-  ],
-  [
-   "pressUntil",
-   "ArrowRight",
-   "ArrowRight",
-   39,
-   150,
-   1500,
-   "((n64r(0x803D05B4) >>> 16) << 16 >> 16) == 0",
-   60000
+   4500
   ],
   [
    "wait",
@@ -123,7 +130,11 @@
   ],
   [
    "eval",
-   "console.log('[plan] track: state ' + n64r(0x8010C0D0) + ' screen ' + ((n64r(0x800E7BC4) >>> 16) << 16 >> 16) + ' track ' + ((n64r(0x803D05B4) >>> 16) << 16 >> 16))"
+   "console.log('[plan] las vegas track select: ' + planWhere())"
+  ],
+  [
+   "eval",
+   "n64w(0x800D9E88, (n64r(0x800D9E88) & 0x00FFFFFF) | 0x01000000), n64r(0x800D9E88) >>> 24"
   ],
   [
    "pressUntil",
@@ -133,11 +144,11 @@
    150,
    1500,
    "n64r(0x8010C0D0) == 2",
-   30000
+   4500
   ],
   [
    "wait",
-   3000
+   2500
   ],
   [
    "pressUntil",
@@ -147,31 +158,40 @@
    150,
    1500,
    "n64r(0x8010C0D0) != 2",
-   30000
+   4500
+  ],
+  [
+   "need",
+   "planWait(() => n64r(0x8010C0D0) == 3 && (n64r(0x8010C3F0) >> 24) == 0 && n64r(0x8010C3E8) == 0, 'las vegas', 20000)"
   ],
   [
    "eval",
-   "new Promise((ok, no) => { const t0 = Date.now(); const t = setInterval(() => { if (n64r(0x8010C0D0) == 3) { clearInterval(t); ok(); } else if (Date.now() - t0 > 60000) { clearInterval(t); no(new Error('timed out: n64r(0x8010C0D0) == 3')); } }, 100); })"
+   "n64w(0x800D9E88, (n64r(0x800D9E88) & 0x00FFFFFF) | 0x01000000), n64r(0x800D9E88) >>> 24"
   ],
   [
    "eval",
-   "console.log('[plan] racing: state ' + n64r(0x8010C0D0) + ' screen ' + ((n64r(0x800E7BC4) >>> 16) << 16 >> 16) + ' track ' + ((n64r(0x803D05B4) >>> 16) << 16 >> 16))"
+   "console.log('[plan] las vegas: ' + planWhere())"
+  ],
+  [
+   "clock",
+   "Math.floor(new Float32Array(new Uint32Array([n64r(0x80117488)]).buffer)[0] * 60)",
+   60
   ],
   [
    "wait",
-   4000
+   1000
   ],
   [
    "down",
-   "Space",
-   " ",
-   32
+   "ArrowUp",
+   "ArrowUp",
+   38
   ],
   [
    "hold",
-   "KeyA",
-   "a",
-   65,
+   "ArrowLeft",
+   "ArrowLeft",
+   37,
    700
   ],
   [
@@ -180,20 +200,28 @@
   ],
   [
    "hold",
-   "KeyD",
-   "d",
-   68,
+   "ArrowRight",
+   "ArrowRight",
+   39,
    700
   ],
   [
    "wait",
-   1800
+   1000
+  ],
+  [
+   "shot",
+   "las-vegas.png"
+  ],
+  [
+   "need",
+   "planSpeed('las vegas', 15)"
   ],
   [
    "hold",
-   "KeyA",
-   "a",
-   65,
+   "ArrowLeft",
+   "ArrowLeft",
+   37,
    400
   ],
   [
@@ -202,9 +230,9 @@
   ],
   [
    "hold",
-   "KeyD",
-   "d",
-   68,
+   "ArrowRight",
+   "ArrowRight",
+   39,
    400
   ],
   [
@@ -213,9 +241,9 @@
   ],
   [
    "hold",
-   "KeyA",
-   "a",
-   65,
+   "ArrowLeft",
+   "ArrowLeft",
+   37,
    700
   ],
   [
@@ -224,9 +252,9 @@
   ],
   [
    "hold",
-   "KeyD",
-   "d",
-   68,
+   "ArrowRight",
+   "ArrowRight",
+   39,
    700
   ],
   [
@@ -235,9 +263,9 @@
   ],
   [
    "hold",
-   "KeyA",
-   "a",
-   65,
+   "ArrowLeft",
+   "ArrowLeft",
+   37,
    400
   ],
   [
@@ -246,9 +274,9 @@
   ],
   [
    "hold",
-   "KeyD",
-   "d",
-   68,
+   "ArrowRight",
+   "ArrowRight",
+   39,
    400
   ],
   [
@@ -257,9 +285,9 @@
   ],
   [
    "hold",
-   "KeyA",
-   "a",
-   65,
+   "ArrowLeft",
+   "ArrowLeft",
+   37,
    700
   ],
   [
@@ -268,9 +296,9 @@
   ],
   [
    "hold",
-   "KeyD",
-   "d",
-   68,
+   "ArrowRight",
+   "ArrowRight",
+   39,
    700
   ],
   [
@@ -279,9 +307,9 @@
   ],
   [
    "hold",
-   "KeyA",
-   "a",
-   65,
+   "ArrowLeft",
+   "ArrowLeft",
+   37,
    400
   ],
   [
@@ -290,9 +318,9 @@
   ],
   [
    "hold",
-   "KeyD",
-   "d",
-   68,
+   "ArrowRight",
+   "ArrowRight",
+   39,
    400
   ],
   [
@@ -301,9 +329,9 @@
   ],
   [
    "hold",
-   "KeyA",
-   "a",
-   65,
+   "ArrowLeft",
+   "ArrowLeft",
+   37,
    700
   ],
   [
@@ -312,178 +340,27 @@
   ],
   [
    "hold",
-   "KeyD",
-   "d",
-   68,
+   "ArrowRight",
+   "ArrowRight",
+   39,
    700
   ],
   [
    "wait",
    1800
-  ],
-  [
-   "hold",
-   "KeyA",
-   "a",
-   65,
-   400
-  ],
-  [
-   "wait",
-   2500
-  ],
-  [
-   "hold",
-   "KeyD",
-   "d",
-   68,
-   400
-  ],
-  [
-   "wait",
-   2100
-  ],
-  [
-   "hold",
-   "KeyA",
-   "a",
-   65,
-   700
-  ],
-  [
-   "wait",
-   1800
-  ],
-  [
-   "hold",
-   "KeyD",
-   "d",
-   68,
-   700
-  ],
-  [
-   "wait",
-   1800
-  ],
-  [
-   "hold",
-   "KeyA",
-   "a",
-   65,
-   400
-  ],
-  [
-   "wait",
-   2500
-  ],
-  [
-   "hold",
-   "KeyD",
-   "d",
-   68,
-   400
-  ],
-  [
-   "wait",
-   2100
-  ],
-  [
-   "hold",
-   "KeyA",
-   "a",
-   65,
-   700
-  ],
-  [
-   "wait",
-   1800
-  ],
-  [
-   "hold",
-   "KeyD",
-   "d",
-   68,
-   700
-  ],
-  [
-   "wait",
-   1800
-  ],
-  [
-   "hold",
-   "KeyA",
-   "a",
-   65,
-   400
-  ],
-  [
-   "wait",
-   2500
-  ],
-  [
-   "hold",
-   "KeyD",
-   "d",
-   68,
-   400
-  ],
-  [
-   "wait",
-   2100
-  ],
-  [
-   "hold",
-   "KeyA",
-   "a",
-   65,
-   700
-  ],
-  [
-   "wait",
-   1800
-  ],
-  [
-   "hold",
-   "KeyD",
-   "d",
-   68,
-   700
-  ],
-  [
-   "wait",
-   1800
-  ],
-  [
-   "hold",
-   "KeyA",
-   "a",
-   65,
-   400
-  ],
-  [
-   "wait",
-   2500
-  ],
-  [
-   "hold",
-   "KeyD",
-   "d",
-   68,
-   400
-  ],
-  [
-   "wait",
-   2100
-  ],
-  [
-   "up",
-   "Space",
-   " ",
-   32
   ],
   [
    "eval",
-   "console.log('[plan] end: state ' + n64r(0x8010C0D0) + ' screen ' + ((n64r(0x800E7BC4) >>> 16) << 16 >> 16) + ' track ' + ((n64r(0x803D05B4) >>> 16) << 16 >> 16))"
+   "planSpeed('las vegas end', 0)"
+  ],
+  [
+   "up",
+   "ArrowUp",
+   "ArrowUp",
+   38
+  ],
+  [
+   "clock"
   ]
  ]
 }

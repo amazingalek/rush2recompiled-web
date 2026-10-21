@@ -3,7 +3,8 @@
 # track select's shown entry 0x803D05B4; docs/menus.md), keys held 150 ms (A Space, B Left Shift, Start Enter, the d-pad the
 # arrows, the stick A and D). Section 0 is the launcher, the boot logos and the title; menus (in section 0 too) the race-type
 # rows, Select Player, every track on the track select and the car select; attract the title's demos; then a race on each
-# of the 7 tracks with the gas held and a weave, about 50 s each, and the first stunt course.
+# of the 7 tracks with the gas held and a weave, about 50 s each, and the first stunt course. The last 8 of attract are
+# what the page missed in plays of web/play_plan_extended.json: the pause menu over a race and its QUIT, and a race's.
 00504241 0080acaf fcffffff fffcf279 008a000b
 0f0a7009 00802caf fc30fe61 55fef379 0003540b
 c8112078 0098acaf fc121603 fffffff8 088a000e
@@ -71,6 +72,14 @@ c8113278 0098acaf fc127fff fffff238 0803540e
 c8112230 0098acaf fc127fff fffff238 0803540e
 c8112078 0098acaf fc567fff 4ffe7c38 0800000e
 c8112078 0098acaf fc127eac f0fff238 0ccb540e
+00504240 00002cf0 fcff97ff ff2cfe7f 04cb540b
+00504240 00002cf0 fcffffff fffdf6fb 0800000b
+c8112231 0098acaf fc127fff fffff238 088a000a
+c8104a51 00982caf fc127fff fffff238 088a000a
+c8112231 0098acaf fcffffff fffe7c38 0800000a
+c8112231 0098acaf fc127fff fffff238 099b100a
+c8112231 0098acaf fc127fff fffff238 0ccb540a
+00504241 00802caf fcffffff fffdf6fb 0800000b
 section race
 0f0a4000 0088acaf fcffffff fffe793c 0800000e
 0f0a4000 0088acaf fc121824 ff33ffff 0ccb540e

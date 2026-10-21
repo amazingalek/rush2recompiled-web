@@ -183,7 +183,9 @@ N64Recomp-browser's `tools/record_shaders.mjs` (its header says how): section 0,
 launcher, the boot, the title and the menus; then the title's demos, the races (one on each of the 7 tracks) and a
 stunt course. A shader it missed is built behind the game, which draws with the ubershader until it is ready, and the
 page remembers it and builds it with the rest on the next visit. `web/play_plan.json` plays the page for
-`tools/play_page.mjs`: the menus to a race on Las Vegas, driven about 70 s.
+`tools/play_page.mjs` in 2-3 minutes: the menus to a race on Las Vegas, driven with the race layout's keys.
+`web/play_plan_extended.json`, for when a longer play is needed, goes on to Alcatraz in the same load, in at most 5
+minutes; their headers say how.
 
 How the page plays, in each browser and on which GPU, is recorded in N64Recomp-browser's
 [plays.jsonl](https://github.com/amazingalek/N64Recomp-browser/blob/main/plays.jsonl) and its
