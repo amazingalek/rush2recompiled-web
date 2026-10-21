@@ -4,6 +4,7 @@
 # Python 3:
 #
 #   bash tools/build_web.sh <US ROM> [--prepare]
+#   bash tools/build_web.sh --patches          step 1 alone: no ROM, and only git and CMake
 #
 # 1. The submodules the page needs (not ENet or miniupnpc: a page has no online play, src/online/online_web.cpp), and
 #    their patches, from clean whenever lib/patches, lib/N64Recomp-browser or web/patches moved since the last time
@@ -27,10 +28,15 @@
 #    N64Recomp writes.
 # 3. The ROM images (tools/extract.py) and the recompiled game and audio microcode (docs/BUILDING.md, steps 2 and 3).
 # 4. The page, with emcmake, in build-web (CMakeLists.txt's EMSCRIPTEN parts). --prepare stops before it.
+# --patches stops after step 1. N64Recomp-browser's CI runs it with its own checkout as lib/N64Recomp-browser and the
+# submodules checked out, so a web change there that meets this port's own lines in a file left out is red where it is
+# made: merge it into the patch by hand then.
 set -euo pipefail
 root="$(cd "$(dirname "$0")/.." && pwd)"
-[[ $# -ge 1 ]] || { echo "usage: $0 <US ROM> [--prepare]" >&2; exit 2; }
-rom="$(realpath "$1")"
+[[ $# -ge 1 ]] || { echo "usage: $0 <US ROM> [--prepare] | --patches" >&2; exit 2; }
+patches_only=0
+[[ "$1" == --patches ]] && patches_only=1
+[[ $patches_only == 1 ]] || rom="$(realpath "$1")"
 prepare_only=0
 [[ "${2:-}" == --prepare ]] && prepare_only=1
 cd "$root"
@@ -74,6 +80,8 @@ if [[ "$(cat $prep/web-patched 2> /dev/null)" != "$stamp" ]]; then
     done <<< "$web_patches"
     echo "$stamp" > $prep/web-patched
 fi
+
+[[ $patches_only == 1 ]] && exit 0
 
 # --- 2. N64Recomp and RSPRecomp ---
 step "N64Recomp"
