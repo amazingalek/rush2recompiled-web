@@ -1,3 +1,16 @@
+diff --git a/recompui/src/composites/ui_mod_menu.cpp b/recompui/src/composites/ui_mod_menu.cpp
+--- a/recompui/src/composites/ui_mod_menu.cpp
++++ b/recompui/src/composites/ui_mod_menu.cpp
+@@ -313,6 +313,9 @@ void recompui::open_folder(const std::filesystem::path& folder) {
+ #elif defined(__APPLE__)
+     std::string command = "open \"" + folder.string() + "\"";
+     std::system(command.c_str());
++#elif defined(__EMSCRIPTEN__)
++    // A page has no folders to show; mods are off there anyway.
++    (void)folder;
+ #else
+     static_assert(false, "Not implemented for this platform.");
+ #endif
 diff --git a/recompui/src/util/file.cpp b/recompui/src/util/file.cpp
 --- a/recompui/src/util/file.cpp
 +++ b/recompui/src/util/file.cpp
@@ -24,7 +37,7 @@ diff --git a/recompui/src/util/file.cpp b/recompui/src/util/file.cpp
  #endif
  
  namespace recompui {
-@@ -198,6 +206,99 @@ namespace recompui {
+@@ -198,6 +206,108 @@ namespace recompui {
      }
  #endif
  
@@ -37,8 +50,17 @@ diff --git a/recompui/src/util/file.cpp b/recompui/src/util/file.cpp
 +    // page, the page shows a button of its own for it.
 +    EM_JS(void, recompui_web_pick_files, (int multiple, const char *folder_ptr, int32_t *state_ptr), {
 +        const folder = UTF8ToString(folder_ptr), state = state_ptr >> 2;
-+        const finish = (result) => { Atomics.store(HEAP32, state, result); Atomics.notify(HEAP32, state); };
 +        const input = document.createElement('input');
++        const finish = (result) => {
++            Module.pickerInputs.delete(input);
++            Atomics.store(HEAP32, state, result);
++            Atomics.notify(HEAP32, state);
++        };
++        // Chrome holds an open picker's input only weakly: one nothing else holds is collected by a GC while the picker
++        // is open, and what is picked then never reaches it (no change, no cancel), so the thread that asked would wait
++        // for good and every later request be ignored. So it is held until it is answered.
++        Module.pickerInputs = Module.pickerInputs || new Set();
++        Module.pickerInputs.add(input);
 +        input.type = 'file';
 +        input.multiple = !!multiple;
 +        input.addEventListener('cancel', () => finish(2));
@@ -124,7 +146,7 @@ diff --git a/recompui/src/util/file.cpp b/recompui/src/util/file.cpp
      static void perform_file_dialog_operation(const std::function<void(bool, const std::filesystem::path&)>& callback) {
          nfdnchar_t* native_path = nullptr;
          nfdresult_t result = NFD_OpenDialogN(&native_path, nullptr, 0, nullptr);
-@@ -235,6 +336,7 @@ namespace recompui {
+@@ -235,6 +345,7 @@ namespace recompui {
  
          callback(success, paths);
      }
@@ -132,7 +154,7 @@ diff --git a/recompui/src/util/file.cpp b/recompui/src/util/file.cpp
  
      std::filesystem::path file::get_app_folder_path() {
          // directly check for portable.txt (windows and native linux binary)
-@@ -261,7 +363,8 @@ namespace recompui {
+@@ -261,7 +372,8 @@ namespace recompui {
          }
  
          CoTaskMemFree(known_path);
@@ -142,16 +164,3 @@ diff --git a/recompui/src/util/file.cpp b/recompui/src/util/file.cpp
          // check for APP_FOLDER_PATH env var
          if (getenv("APP_FOLDER_PATH") != nullptr) {
              return std::filesystem::path{getenv("APP_FOLDER_PATH")};
-diff --git a/recompui/src/composites/ui_mod_menu.cpp b/recompui/src/composites/ui_mod_menu.cpp
---- a/recompui/src/composites/ui_mod_menu.cpp
-+++ b/recompui/src/composites/ui_mod_menu.cpp
-@@ -313,6 +313,9 @@ void recompui::open_folder(const std::filesystem::path& folder) {
- #elif defined(__APPLE__)
-     std::string command = "open \"" + folder.string() + "\"";
-     std::system(command.c_str());
-+#elif defined(__EMSCRIPTEN__)
-+    // A page has no folders to show; mods are off there anyway.
-+    (void)folder;
- #else
-     static_assert(false, "Not implemented for this platform.");
- #endif

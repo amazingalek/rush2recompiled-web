@@ -16,6 +16,7 @@ rt64 src/render/rt64_shader_library.cpp
 rt64 src/render/rt64_texture_cache.cpp
 rt64 src/shaders/RasterPS.hlsl
 rt64 src/shaders/TextureSampler.hlsli
+N64ModernRuntime librecomp/src/config.cpp
 N64ModernRuntime ultramodern/src/events.cpp
 RecompFrontend recompui/src/util/file.cpp
 RecompFrontend recompui/src/composites/ui_mod_menu.cpp
