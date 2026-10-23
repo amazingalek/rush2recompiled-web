@@ -68,7 +68,8 @@ N64ModernRuntime lib/N64ModernRuntime $(shared N64ModernRuntime)
 N64Recomp lib/N64ModernRuntime/N64Recomp
 RecompFrontend lib/RecompFrontend $(shared RecompFrontend)"
 stamp="$(git -C $browser rev-parse HEAD) $( (cat lib/patches/*.patch web/patches/*.patch web/patches/files.txt; echo "$web_patches") | sha1sum | cut -c1-40)"
-if [[ "$(cat $prep/web-patched 2> /dev/null)" != "$stamp" ]]; then
+# A checkout reset since (rt64 clean) is patched again whatever the stamp says.
+if [[ "$(cat $prep/web-patched 2> /dev/null)" != "$stamp" ]] || git -C lib/rt64 diff --quiet; then
     for s in lib/rt64 lib/N64ModernRuntime lib/RecompFrontend; do
         git -C $s submodule foreach --recursive -q 'git reset -q --hard && git clean -fdq'
         git -C $s reset -q --hard && git -C $s clean -fdq
