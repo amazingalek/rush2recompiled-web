@@ -1,4 +1,5 @@
 diff --git a/src/hle/rt64_application.cpp b/src/hle/rt64_application.cpp
+index 3c40137..50d976a 100644
 --- a/src/hle/rt64_application.cpp
 +++ b/src/hle/rt64_application.cpp
 @@ -18,12 +18,18 @@
@@ -133,6 +134,7 @@ diff --git a/src/hle/rt64_application.cpp b/src/hle/rt64_application.cpp
      }
  
 diff --git a/src/hle/rt64_present_queue.cpp b/src/hle/rt64_present_queue.cpp
+index 883cf36..cc224e1 100644
 --- a/src/hle/rt64_present_queue.cpp
 +++ b/src/hle/rt64_present_queue.cpp
 @@ -7,6 +7,10 @@
@@ -535,6 +537,7 @@ diff --git a/src/hle/rt64_present_queue.cpp b/src/hle/rt64_present_queue.cpp
                      skipInterpolation();
                      notifyPresentId(present);
 diff --git a/src/hle/rt64_workload_queue.cpp b/src/hle/rt64_workload_queue.cpp
+index 35ab5c9..e47c85d 100644
 --- a/src/hle/rt64_workload_queue.cpp
 +++ b/src/hle/rt64_workload_queue.cpp
 @@ -112,12 +112,19 @@ namespace RT64 {
@@ -908,6 +911,7 @@ diff --git a/src/hle/rt64_workload_queue.cpp b/src/hle/rt64_workload_queue.cpp
                  }
  
 diff --git a/src/render/rt64_raster_shader.cpp b/src/render/rt64_raster_shader.cpp
+index 9ecd2d1..802c3e0 100644
 --- a/src/render/rt64_raster_shader.cpp
 +++ b/src/render/rt64_raster_shader.cpp
 @@ -7,18 +7,46 @@
@@ -1154,7 +1158,21 @@ diff --git a/src/render/rt64_raster_shader.cpp b/src/render/rt64_raster_shader.c
      }
  
      RasterShader::~RasterShader() { }
-@@ -361,7 +493,7 @@ namespace RT64 {
+@@ -273,11 +405,13 @@ namespace RT64 {
+             }
+         }
+ #   endif
++#   if !defined(RT64_WGSL)
+         if (shaderFormat == RenderShaderFormat::SPIRV) {
+             XXH3_64bits_update(state, RasterVSSpecConstantBlobSPIRV, sizeof(RasterVSSpecConstantBlobSPIRV));
+             XXH3_64bits_update(state, RasterPSSpecConstantBlobSPIRV, sizeof(RasterPSSpecConstantBlobSPIRV));
+             XXH3_64bits_update(state, RasterPSSpecConstantMSBlobSPIRV, sizeof(RasterPSSpecConstantMSBlobSPIRV));
+         }
++#   endif
+         const uint64_t key = XXH3_64bits_digest(state);
+         XXH3_freeState(state);
+         return key;
+@@ -361,7 +495,7 @@ namespace RT64 {
          pipelineDesc.depthEnabled = c.zCmp || c.zUpd;
          pipelineDesc.depthFunction = c.zCmp ? RenderComparisonFunction::LESS : RenderComparisonFunction::ALWAYS;
          pipelineDesc.depthWriteEnabled = c.zUpd;
@@ -1163,7 +1181,7 @@ diff --git a/src/render/rt64_raster_shader.cpp b/src/render/rt64_raster_shader.c
          pipelineDesc.multisampling = c.multisampling;
          pipelineDesc.inputSlots = RasterInputSlots;
          pipelineDesc.inputSlotsCount = uint32_t(std::size(RasterInputSlots));
-@@ -373,13 +505,16 @@ namespace RT64 {
+@@ -373,13 +507,16 @@ namespace RT64 {
          pipelineDesc.pixelShader = c.pixelShader;
          pipelineDesc.specConstants = c.specConstants.data();
          pipelineDesc.specConstantsCount = uint32_t(c.specConstants.size());
@@ -1182,7 +1200,7 @@ diff --git a/src/render/rt64_raster_shader.cpp b/src/render/rt64_raster_shader.c
              targetBlend.blendOp = RenderBlendOperation::ADD;
          }
  
-@@ -389,6 +524,38 @@ namespace RT64 {
+@@ -389,6 +526,38 @@ namespace RT64 {
              targetBlend.dstBlendAlpha = RenderBlend::ONE;
          }
  
@@ -1221,7 +1239,7 @@ diff --git a/src/render/rt64_raster_shader.cpp b/src/render/rt64_raster_shader.c
          return c.device->createGraphicsPipeline(pipelineDesc);
      }
      
-@@ -467,12 +634,33 @@ namespace RT64 {
+@@ -467,12 +636,33 @@ namespace RT64 {
              PSBlobSize = uint32_t(useMSAA ? std::size(RasterPSDynamicMSBlobDXIL) : std::size(RasterPSDynamicBlobDXIL));
              break;
  #   endif
@@ -1260,7 +1278,7 @@ diff --git a/src/render/rt64_raster_shader.cpp b/src/render/rt64_raster_shader.c
  #   ifdef __APPLE__
          case RenderShaderFormat::METAL:
              VSBlob = RasterVSDynamicBlobMSL;
-@@ -490,14 +678,12 @@ namespace RT64 {
+@@ -490,14 +680,12 @@ namespace RT64 {
          pixelShader = device->createShader(PSBlob, PSBlobSize, "PSMain", shaderFormat);
  
          FramebufferRendererDescriptorCommonSet descriptorCommonSet(shaderLibrary->samplerLibrary, device->getCapabilities().raytracing);
@@ -1276,7 +1294,7 @@ diff --git a/src/render/rt64_raster_shader.cpp b/src/render/rt64_raster_shader.c
          layoutBuilder.addDescriptorSet(descriptorFramebufferSet);
          layoutBuilder.end();
          pipelineLayout = layoutBuilder.create(device);
-@@ -547,11 +733,24 @@ namespace RT64 {
+@@ -547,11 +735,24 @@ namespace RT64 {
              postBlendSubNegativePixelShader = device->createShader(PostBlendDitherNoiseSubNegativePSBlobDXIL, std::size(PostBlendDitherNoiseSubNegativePSBlobDXIL), "PSMain", shaderFormat);
              break;
  #   endif
@@ -1305,7 +1323,7 @@ diff --git a/src/render/rt64_raster_shader.cpp b/src/render/rt64_raster_shader.c
  #   ifdef __APPLE__
          case RenderShaderFormat::METAL:
              postBlendAddPixelShader = device->createShader(PostBlendDitherNoiseAddPSBlobMSL, std::size(PostBlendDitherNoiseAddPSBlobMSL), "PSMain", shaderFormat);
-@@ -569,7 +768,7 @@ namespace RT64 {
+@@ -569,7 +770,7 @@ namespace RT64 {
          postBlendDesc.renderTargetFormat[0] = RenderTarget::colorBufferFormat(shaderLibrary->usesHDR);
          postBlendDesc.renderTargetCount = 1;
          postBlendDesc.cullMode = RenderCullMode::NONE;
@@ -1315,6 +1333,7 @@ diff --git a/src/render/rt64_raster_shader.cpp b/src/render/rt64_raster_shader.c
          postBlendDesc.inputSlots = RasterInputSlots;
          postBlendDesc.inputSlotsCount = uint32_t(std::size(RasterInputSlots));
 diff --git a/src/render/rt64_raster_shader.h b/src/render/rt64_raster_shader.h
+index 938f6a7..1f2ec63 100644
 --- a/src/render/rt64_raster_shader.h
 +++ b/src/render/rt64_raster_shader.h
 @@ -10,6 +10,7 @@
@@ -1394,6 +1413,7 @@ diff --git a/src/render/rt64_raster_shader.h b/src/render/rt64_raster_shader.h
          static std::unique_ptr<RenderPipeline> createPipeline(const PipelineCreation &c);
          static RenderMultisampling generateMultisamplingPattern(uint32_t sampleCount, bool sampleLocationsSupported);
 diff --git a/src/render/rt64_raster_shader_cache.cpp b/src/render/rt64_raster_shader_cache.cpp
+index e08e4ce..b508445 100644
 --- a/src/render/rt64_raster_shader_cache.cpp
 +++ b/src/render/rt64_raster_shader_cache.cpp
 @@ -8,6 +8,52 @@
@@ -2066,6 +2086,7 @@ diff --git a/src/render/rt64_raster_shader_cache.cpp b/src/render/rt64_raster_sh
          }
  
 diff --git a/src/render/rt64_raster_shader_cache.h b/src/render/rt64_raster_shader_cache.h
+index 794f565..4572ea2 100644
 --- a/src/render/rt64_raster_shader_cache.h
 +++ b/src/render/rt64_raster_shader_cache.h
 @@ -4,17 +4,26 @@
@@ -2176,6 +2197,7 @@ diff --git a/src/render/rt64_raster_shader_cache.h b/src/render/rt64_raster_shad
          RasterShader *getGPUShader(const ShaderDescription &desc);
          RasterShaderUber *getGPUShaderUber() const;
 diff --git a/src/render/rt64_shader_library.cpp b/src/render/rt64_shader_library.cpp
+index 47db0f1..0dbf4ad 100644
 --- a/src/render/rt64_shader_library.cpp
 +++ b/src/render/rt64_shader_library.cpp
 @@ -4,61 +4,118 @@
@@ -2790,6 +2812,7 @@ diff --git a/src/render/rt64_shader_library.cpp b/src/render/rt64_shader_library
          }
  
 diff --git a/src/render/rt64_texture_cache.cpp b/src/render/rt64_texture_cache.cpp
+index 315d140..4faabc2 100644
 --- a/src/render/rt64_texture_cache.cpp
 +++ b/src/render/rt64_texture_cache.cpp
 @@ -439,14 +439,17 @@ namespace RT64 {
@@ -2846,6 +2869,7 @@ diff --git a/src/render/rt64_texture_cache.cpp b/src/render/rt64_texture_cache.c
          if ((p == nullptr) || !p->valid) {
              return false;
 diff --git a/src/shaders/RasterPS.hlsl b/src/shaders/RasterPS.hlsl
+index 5f2454e..b051a1d 100644
 --- a/src/shaders/RasterPS.hlsl
 +++ b/src/shaders/RasterPS.hlsl
 @@ -5,6 +5,7 @@
@@ -3173,6 +3197,7 @@ diff --git a/src/shaders/RasterPS.hlsl b/src/shaders/RasterPS.hlsl
  #endif
 \ No newline at end of file
 diff --git a/src/shaders/TextureSampler.hlsli b/src/shaders/TextureSampler.hlsli
+index 069d113..e3ddf51 100644
 --- a/src/shaders/TextureSampler.hlsli
 +++ b/src/shaders/TextureSampler.hlsli
 @@ -18,12 +18,96 @@
