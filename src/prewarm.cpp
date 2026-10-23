@@ -64,6 +64,10 @@ namespace {
 #ifdef _WIN32
         SetThreadDescription(GetCurrentThread(), name);
         if (low) SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+#elif defined(__EMSCRIPTEN__)
+        // A page's threads are workers, which have no priority.
+        (void)name;
+        (void)low;
 #else
         (void)name;
         if (low) setpriority(PRIO_PROCESS, (id_t)syscall(SYS_gettid), 10);
