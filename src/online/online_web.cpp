@@ -3,6 +3,9 @@
 // the web build has these: online isn't available, nothing hosts or joins, and the rest of the game (online_game.cpp,
 // online_lobby.cpp, the Online tab) sees an offline machine, as it does on a desktop whose ENet didn't start.
 
+#include <array>
+#include <cstdarg>
+#include <cstdio>
 #include <mutex>
 #include <string>
 #include <vector>
@@ -14,6 +17,14 @@ namespace rush2::online {
 namespace {
     std::mutex name_mutex;
     std::string my_name;
+}
+
+// No session to log to a file: the console only.
+void session_log(const char* format, ...) {
+    va_list args;
+    va_start(args, format);
+    std::vfprintf(stderr, format, args);
+    va_end(args);
 }
 
 bool available() { return false; }
@@ -37,6 +48,7 @@ std::vector<std::string> local_addresses() { return {}; }
 std::string public_address() { return {}; }
 
 void set_local_games(uint8_t) {}
+void set_local_mod_cars(const std::array<uint32_t, max_mod_cars>&) {}
 void set_local_gameplay(const std::string&) {}
 
 // The name is kept, as the desktop keeps it offline: the Controls tab shows and edits it.
@@ -71,13 +83,15 @@ bool host_menu(MenuState*) { return false; }
 std::vector<LanLobby> lan_lobbies() { return {}; }
 bool racing() { return false; }
 void submit_local_input(uint32_t, const std::vector<PlayerInput>&) {}
-Wait wait_frame_inputs(uint32_t, PlayerInput*, int) { return Wait::Ended; }
+Wait wait_frame_inputs(uint32_t, PlayerInput*, int, bool*) { return Wait::Ended; }
+void send_snapshot(uint32_t, const std::vector<uint8_t>&) {}
+Wait wait_snapshot(uint32_t, std::vector<uint8_t>*, int) { return Wait::Ended; }
 uint32_t input_delay() { return 0; }
 uint32_t race_seed() { return 0; }
 RaceSettings race_settings() { return {}; }
 std::vector<RosterEntry> race_roster() { return {}; }
 void report_state_hash(uint32_t, uint32_t) {}
-void report_loaded(uint32_t) {}
+void report_loaded(uint32_t, uint32_t, uint32_t) {}
 void race_finished() {}
 std::string race_status() { return {}; }
 void update() {}
