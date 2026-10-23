@@ -864,8 +864,11 @@ int main(int argc, char** argv) {
     ultramodern::renderer::callbacks_t renderer_callbacks{
         .create_render_context = [](uint8_t* rdram, ultramodern::renderer::WindowHandle window_handle, bool developer_mode) {
             rush2::census::set_rdram(rdram);
+#if !defined(__EMSCRIPTEN__)
             // RT64 keeps every specialized shader it compiles here and builds them all at launch (docs/hitch_profiler.md).
+            // Not on a page: it builds its prebuilt shader list (web/rt64_shaders.txt) instead.
             RT64::RasterShaderCache::setDiskCacheDirectory(recomp::get_config_path() / "shader_cache");
+#endif
             auto presentation_mode = ultramodern::renderer::PresentationMode::PresentEarly;
             return recompui::renderer::create_render_context(rdram, window_handle, presentation_mode, developer_mode);
         },

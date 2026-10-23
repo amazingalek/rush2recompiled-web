@@ -4,10 +4,16 @@
 # --since), and stops only where that meets Rush 2's own lines: then merge it into web/patches/<project>.patch by hand
 # and move the commit below to the one merged from. A file the web patch applies to but names what the port renamed
 # (ui_mod_menu.cpp) is listed too.
-# merged from N64Recomp-browser a1237d4f47e5613e025fa3acfc66bacfa44a3878
+# merged from N64Recomp-browser 1f20b01af437db0abb977ca2ef84c3b7ec4c1514
+rt64 src/hle/rt64_application.cpp
 rt64 src/hle/rt64_present_queue.cpp
 rt64 src/hle/rt64_workload_queue.cpp
+rt64 src/render/rt64_raster_shader.cpp
+rt64 src/render/rt64_raster_shader.h
+rt64 src/render/rt64_raster_shader_cache.cpp
+rt64 src/render/rt64_raster_shader_cache.h
 rt64 src/render/rt64_shader_library.cpp
+rt64 src/render/rt64_texture_cache.cpp
 rt64 src/shaders/RasterPS.hlsl
 rt64 src/shaders/TextureSampler.hlsli
 N64ModernRuntime ultramodern/src/events.cpp

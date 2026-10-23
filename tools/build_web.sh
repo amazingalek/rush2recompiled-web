@@ -22,6 +22,9 @@
 #      and a region of a larger image are read by the tile, and that a filter neighbour past a region reads the
 #      image's own next texel, and Rush 2's generated mipmaps and region texels are read through the web's draw texture
 #      slots (sampleTileTextureGrad(), loadTileTexture()), not the desktop's texture array.
+#      Beside Rush 2's disk shader cache, RasterShader takes the web's WGSL cache as well as Rush 2's compiled blobs,
+#      RasterShaderCache has both's members, the shader threads are one on a page and Rush 2's at most 4 elsewhere, and
+#      the web's replacement batch lock is held in Rush 2's applyReplacementDirectories, where packs are swapped in.
 #      N64ModernRuntime: the VI thread's wait for the browser's frame inside Rush 2's not-turbo branch.
 #      RecompFrontend: the page's file picker beside Rush 2's Windows one, and the page's no-op in Rush 2's open_folder().
 # 2. N64Recomp and RSPRecomp, built natively from the patched checkout: the page needs the code the web-patched
