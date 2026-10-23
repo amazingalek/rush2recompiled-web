@@ -331,6 +331,11 @@ void rush2_track1_breakable_model(uint8_t* rdram, recomp_context* ctx);
 int rush2_track1_breakable_hit(uint8_t* rdram, recomp_context* ctx);
 void rush2_track1_wrong_way(uint8_t* rdram, recomp_context* ctx);
 void rush2_track1_fall_floor(uint8_t* rdram, recomp_context* ctx);
+
+// Wheels (src/game_fixes.cpp).
+void rush2_fix_wheel_spin_step(uint8_t* rdram, recomp_context* ctx);
+void rush2_hood_front_wheels(uint8_t* rdram, recomp_context* ctx);
+void rush2_hood_front_wheels_x(uint8_t* rdram, recomp_context* ctx);
 void rush2_track49_movers_car(uint8_t* rdram, recomp_context* ctx);
 void rush2_track49_movers_probe_begin(uint8_t* rdram, recomp_context* ctx);
 void rush2_track49_movers_probe(uint8_t* rdram, recomp_context* ctx);
