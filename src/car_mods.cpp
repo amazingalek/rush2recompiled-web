@@ -2181,7 +2181,7 @@ namespace {
         for (const ModFile& m : mods) {
             std::error_code ec;
             auto time = std::filesystem::last_write_time(m.path, ec);
-            key += std::to_string(ec ? 0 : time.time_since_epoch().count()) + ";";
+            key += std::to_string(ec ? 0 : static_cast<long long>(time.time_since_epoch().count())) + ";";
         }
         return key;
     }
