@@ -150,14 +150,20 @@ class Track:
         return self._texels
 
     def worlds(self):
-        """worlds.rom: u32 1, u32 0x18, a 16-byte root record (TEMP), then 0x4C-byte instances: char name[8] (the
-        object's name cut to 8 characters, see object_named; bytes after its NUL are leftovers), u8 flags[8], f32 matrix[9], f32 position[3], u32 0,
-        s16 next record (-1 ends), s16 -1, u32 0. Returns (name, flags bytes, matrix, position)."""
+        """worlds.rom: u32 1, u32 0x18, a 16-byte root record (TEMP), then 0x4C-byte instances: char name[15], u8 1,
+        f32 matrix[9], f32 position[3], u32 0, s16 next record (-1 ends), s16 -1, u32 0. The bytes after a name's NUL
+        are leftovers of longer names, so a name that fills 8 characters runs on past them: AF_G3226 then '5' is
+        AF_G32265 (the arcade tracks 1, 2, 3 and 7 place hundreds of objects so). When the long name isn't an object the
+        first 8 characters are kept (object_named). Returns (name, bytes 8-15, matrix, position)."""
         w = self.read('worlds.rom')
         first = struct.unpack_from('<I', w, 4)[0]
         out = []
         for o in range(first, len(w) - 0x4B, 0x4C):
-            out.append((w[o:o + 8].split(b'\0')[0].decode('latin1'), w[o + 8:o + 16],
+            name = w[o:o + 8].split(b'\0')[0].decode('latin1')
+            long_name = w[o:o + 15].split(b'\0')[0].decode('latin1')
+            if len(long_name) > len(name) and long_name in self.by_name:
+                name = long_name
+            out.append((name, w[o + 8:o + 16],
                         struct.unpack_from('<9f', w, o + 16), struct.unpack_from('<3f', w, o + 52)))
         return out
 
@@ -173,11 +179,29 @@ class Track:
                 break
             nm = b[o:o + n].split(b'\0')[0].decode('latin1'); o += n
             sl = struct.unpack_from('<H', b, o)[0]; o += 2
-            script = [ln.strip() for ln in b[o:o + sl].split(b'\0')[0].decode('latin1').splitlines() if ln.strip()]
+            # The arcade splits a script into words at ":=# \t\r\n" (ProjectR 0x1406EA215, its dobs parser's
+            # separators), so '#followy 70 450' is followy, not a comment; a line here is still one command.
+            text = b[o:o + sl].split(b'\0')[0].decode('latin1')
+            text = text.replace(':', ' ').replace('=', ' ').replace('#', ' ')
+            script = [ln.strip() for ln in text.splitlines() if ln.strip()]
             o += sl
             m, p = struct.unpack_from('<9f', b, o), struct.unpack_from('<3f', b, o + 36); o += 48
             out.append((nm, script, m, p))
         return out
+
+    def roaddat(self):
+        """roaddat.rom is a run of blocks, each starting with its u32 size (the header below); the track's collision is
+        the largest. It is the first on most tracks, with small blocks after it (TRACK7); TRACK6 (Mission) has a
+        13-polygon block before it."""
+        d = self.read('roaddat.rom')
+        best, o = (0, 0), 0
+        while o + 28 <= len(d):
+            size = struct.unpack_from('<I', d, o)[0]
+            if size < 28 or o + size > len(d):
+                break
+            best = max(best, (size, o))
+            o += size
+        return d[best[1]:best[1] + best[0]] if best[0] else d
 
     def collision(self, with_segment=False):
         """roaddat.rom, the source of the N64 port's collision files (tools/rush2049/collision.py) in its own layout:
@@ -194,11 +218,12 @@ class Track:
         vertex list is followed by its u16 segment index (segments()).
         Returns (flags, [world xyz...], world normal) per polygon, plus the segment index (None unless 0x3000) with
         with_segment."""
-        d = self.read('roaddat.rom')
+        d = self.roaddat()
         size, nn, npl, nv, ns, nleaf, nvl = struct.unpack_from('<7I', d, 0)
         po = 0x40 + nn * 0x24
         vo = po + npl * 0x1C
-        vlo = size - nvl * 2
+        # The vertex lists follow the leaves (TRACK8's file ends in 2 bytes of padding, so not size - nvl * 2).
+        vlo = vo + nv * 12 + ns * 0xA4 + nleaf * 2
         verts = [struct.unpack_from('<3i', d, vo + 12 * k) for k in range(nv)]
         out = []
         for i in range(npl):
@@ -231,7 +256,7 @@ class Track:
         taken a quarter and three quarters across. Checked against arcade Marina's N64 port (file 139): every field of
         the segments both keep equal to float precision; on Alcatraz every spline polygon corner is within 0.05 ft of
         its segment's surface. The next segment is the following record, as on N64."""
-        d = self.read('roaddat.rom')
+        d = self.roaddat()
         size, nn, npl, nv, ns = struct.unpack_from('<5I', d, 0)
         at = 0x40 + nn * 0x24 + npl * 0x1C + nv * 12
         q = lambda v: [v[1], -v[2], v[0]]       # path frame -> world (to_world_path, for directions)

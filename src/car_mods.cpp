@@ -32,9 +32,12 @@
 #include <initializer_list>
 #include <iterator>
 #include <cctype>
+#include <condition_variable>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -48,6 +51,7 @@
 #include "car_mods.h"
 #include "data_files.h"
 #include "players4.h"
+#include "rush2.h"
 #include "paint_colors.h"
 #include "texture_derive.h"
 #include "texture_upscale.h"
@@ -287,10 +291,15 @@ namespace {
     // ---- stand-in textures -------------------------------------------------------------------------------------
     struct Rgba { uint8_t r, g, b, a; };
     std::vector<Rgba> car_palette; // CARPALETTE, 256 entries
+    std::mutex palette_mutex;
+    bool palette_loaded = false;
 
-    bool load_car_palette(uint8_t* rdram) {
+    // From the ROM (no game memory), once: a background plan (rush2::car_mods::prepare) needs it before the boot.
+    bool load_car_palette() {
+        std::lock_guard lock{ palette_mutex };
+        if (palette_loaded) return true;
         std::vector<uint8_t> d;
-        if (!rush2::assets::read_original(rdram, stripe_asset, d) || d.size() < 0x28) return false;
+        if (!rush2::assets::rom_original(stripe_asset, d) || d.size() < 0x28) return false;
         uint32_t table = be32(d, 12), count = be32(d, 24);
         for (uint32_t i = 0; i < count && table + i * 0x18 + 0x18 <= d.size(); i++) {
             uint32_t r = table + i * 0x18;
@@ -303,6 +312,7 @@ namespace {
                 auto five = [](int v) { return uint8_t((v << 3) | (v >> 2)); };
                 car_palette.push_back({ five((c >> 11) & 31), five((c >> 6) & 31), five((c >> 1) & 31), uint8_t(c & 1 ? 255 : 0) });
             }
+            palette_loaded = true;
             return true;
         }
         return false;
@@ -1197,7 +1207,7 @@ namespace {
         std::lock_guard lock{ livery_tables_mutex };
         for (uint32_t offset : livery_tables) {
             uint32_t at = records - offset;
-            if (at >= 0x80000000u && at < 0x80800000u && (uint32_t)MEM_W(8, (int32_t)at) == offset) return at;
+            if (rush2::in_game_ram(at) && (uint32_t)MEM_W(8, (int32_t)at) == offset) return at;
         }
         return 0;
     }
@@ -1356,7 +1366,7 @@ void rush2::car_mods::paint_livery(uint8_t* rdram, int id) {
         auto own = style > 0 ? livery_parts.find(part) : livery_parts.end();
         for (uint32_t l = 0; l < lods_of(i); l++) {
             uint32_t list = list_of(i, l);
-            if (list < 0x80000000u + 0x400 || list >= 0x80800000u) continue;
+            if (list < 0x80000000u + 0x400 || list >= 0x81000000u) continue;
             uint32_t to = own != livery_parts.end() ? list_of(own->second, std::min(l, lods_of(own->second) - 1)) : 0;
             uint32_t& t = branch_to[list];
             if (to != 0) t = to;
@@ -1417,15 +1427,74 @@ namespace {
     constexpr int new_car_slots = rush2::car_types::count_mod;
     Applied applied_new[new_car_slots]; // the new cars (rush2/new_cars), by slot
     std::string applied_new_key[new_car_slots]; // mod id, car id and the hash of its files
+    // A hash of each slot's key (0 empty), for online races (rush2::car_mods::online_car_checks; any thread).
+    std::atomic<uint32_t> online_checks[new_car_slots] = {};
+    uint32_t online_check(const std::string& key) {
+        if (key.empty()) return 0;
+        uint32_t h = 2166136261u;
+        for (char c : key) h = (h ^ uint8_t(c)) * 16777619u;
+        return h == 0 ? 1 : h;
+    }
     bool has_own[types] = {};
     std::vector<uint8_t> own[types];     // each type's asset before its mod (a recomp fix, or empty: the ROM's)
     std::string last_signature;
+    std::atomic<bool> reload_requested = false;   // rush2::car_mods::reload
     bool initialized = false;
     int frames = 0;
 
     using rush2::mod_files::ModFile;
     using rush2::mod_files::enabled_mods;
     using rush2::mod_files::read_mod_file;
+
+    // While a ZipBatch lives on a thread, read_mod_file and zip_of there open each mod's .rtz once: a zip's central
+    // directory is read and sorted on every open, and a plan reads dozens of files (one open per file read took most
+    // of the 270 ms the boot spent on car mods with five mods).
+    thread_local std::map<std::filesystem::path, std::unique_ptr<rush2::upscale::ZipReader>>* open_zips = nullptr;
+    struct ZipBatch {
+        std::map<std::filesystem::path, std::unique_ptr<rush2::upscale::ZipReader>> zips;
+        ZipBatch() { open_zips = &zips; }
+        ~ZipBatch() { open_zips = nullptr; }
+    };
+
+    // The mod's .rtz, opened once in the thread's batch (is_open false for a folder mod).
+    rush2::upscale::ZipReader& zip_of(const std::filesystem::path& path) {
+        std::unique_ptr<rush2::upscale::ZipReader>& z = (*open_zips)[path];
+        if (!z) z = std::make_unique<rush2::upscale::ZipReader>(path);
+        return *z;
+    }
+
+    // ---- plan --------------------------------------------------------------------------------------------------
+    // What apply installs, read and converted from the enabled mods' files with no game memory, so a background thread
+    // (rush2::car_mods::prepare, src/prewarm.cpp) can make it ahead of the boot or after the mods change, and the game
+    // thread only installs it.
+    struct NewCarPlan {
+        int n = 0;                      // its mod car slot
+        std::string id, mod_id, key;    // key: mod id, car id and the hash of its files
+        uint64_t hash = 0;
+        rush2::car2049::ModCar spec;
+        std::shared_ptr<Model> model;
+        std::vector<uint8_t> car;
+        std::vector<StandIn> stand_ins;
+    };
+    struct ReplacementPlan {
+        enum State { none, failed, ok } state = none;  // no mod has the car, one has it but it can't be converted, converted
+        std::string mod_id;
+        uint64_t hash = 0;
+        std::shared_ptr<Model> model;
+        std::vector<uint8_t> car;
+        std::vector<StandIn> stand_ins;
+    };
+    struct Plan {
+        std::string key;                // plan_key of the mods it was made from
+        std::string model_signature;
+        std::map<std::string, ModelMod> models;
+        std::string livery_signature;
+        std::map<int, std::vector<ModelMod>> liveries;
+        std::array<int, types_all> livery_counts{};
+        std::vector<NewCarPlan> new_cars;
+        int slots_used = 0;             // mod car slots the new cars fill (some may have failed to convert after)
+        std::array<ReplacementPlan, types> replacements;
+    };
 
     // The car from glbs (a new car's color schemes, in order; one for a replaced car), its parts named `prefix`: its
     // container (cached as `cache_name`) and stand-ins (scuffed by `seed`). sheen: also Rush 2's sheen layers made from
@@ -1534,7 +1603,7 @@ namespace {
             if (seen.insert(name).second) out.push_back({ name, path, mod });
         };
         for (size_t i = 0; i < mods.size(); i++) {
-            rush2::upscale::ZipReader zip(mods[i].path);
+            rush2::upscale::ZipReader& zip = zip_of(mods[i].path);
             if (zip.is_open()) {
                 for (const std::string& n : zip.names()) add(n, i);
                 continue;
@@ -1551,8 +1620,8 @@ namespace {
         return out;
     }
 
-    // Loads the model mods of the enabled mods; true when they changed (the patcher is installed by apply).
-    bool apply_models(uint8_t* rdram, const std::vector<ModFile>& mods) {
+    // The model mods of the enabled mods, into the plan.
+    void load_models(const std::vector<ModFile>& mods, Plan& plan) {
         std::vector<ModelFile> files = model_files(mods);
         std::string signature;
         for (const ModelFile& f : files) {
@@ -1560,9 +1629,8 @@ namespace {
             auto time = std::filesystem::last_write_time(mods[f.mod].path, ec);
             signature += mods[f.mod].mod_id + ":" + f.path + ":" + std::to_string(ec ? 0 : static_cast<long long>(time.time_since_epoch().count())) + ";";
         }
-        if (signature == model_signature) return false;
-        model_signature = signature;
-        std::map<std::string, ModelMod> loaded;
+        plan.model_signature = signature;
+        std::map<std::string, ModelMod>& loaded = plan.models;
         for (const ModelFile& f : files) {
             std::vector<uint8_t> glb;
             std::string error;
@@ -1575,9 +1643,6 @@ namespace {
             }
             loaded.emplace(f.name, std::move(m));
         }
-        model_mods = std::move(loaded);
-        printf("[modelmod] %zu model replacements\n", model_mods.size());
-        return true;
     }
 
     // The stand-ins of every car and model applied, for rush2::derive.
@@ -1648,8 +1713,8 @@ namespace {
         rush2::derive::set_mod_textures("cars", std::move(textures));
     }
 
-    // The enabled mods' rush2/liveries/<ID>.json, in mod order and then by ID; true when they changed.
-    bool apply_liveries(const std::vector<ModFile>& mods) {
+    // The enabled mods' rush2/liveries/<ID>.json, in mod order and then by ID, into the plan.
+    void load_liveries(const std::vector<ModFile>& mods, Plan& plan) {
         std::string signature;
         std::vector<std::pair<size_t, std::string>> files; // mod, path
         const std::string prefix = "rush2/liveries/";
@@ -1660,7 +1725,7 @@ namespace {
                 std::string file = path.substr(prefix.size());
                 if (file.find('/') == std::string::npos && upper(file.substr(file.size() - 5)) == ".JSON") found.push_back(path);
             };
-            rush2::upscale::ZipReader zip(mods[i].path);
+            rush2::upscale::ZipReader& zip = zip_of(mods[i].path);
             if (zip.is_open()) {
                 for (const std::string& n : zip.names()) add(n);
             }
@@ -1681,10 +1746,9 @@ namespace {
                 signature += mods[i].mod_id + ":" + f + ":" + std::to_string(ec ? 0 : static_cast<long long>(time.time_since_epoch().count())) + ";";
             }
         }
-        if (signature == livery_signature) return false;
-        livery_signature = signature;
-        std::map<int, std::vector<ModelMod>> loaded;
-        int counts[types_all] = {};
+        plan.livery_signature = signature;
+        std::map<int, std::vector<ModelMod>>& loaded = plan.liveries;
+        std::array<int, types_all>& counts = plan.livery_counts;
         for (const auto& [mod, path] : files) {
             const ModFile& m = mods[mod];
             std::vector<uint8_t> text;
@@ -1743,22 +1807,6 @@ namespace {
                 counts[type]++;
             }
         }
-        liveries = std::move(loaded);
-        for (int t = 0; t < types_all; t++) livery_counts[t] = counts[t];
-        // The bodies are made again as the cars load with the new liveries.
-        {
-            std::lock_guard lock{ style_mutex };
-            shown.clear();
-        }
-        {
-            std::lock_guard lock{ livery_tables_mutex };
-            livery_bodies.clear();
-            rush2::car2049::clear_livery_bodies();
-        }
-        size_t total = 0;
-        for (const auto& [index, list] : liveries) total += list.size();
-        printf("[livery] %zu liveries for %zu cars\n", total, liveries.size());
-        return true;
     }
 
     // ---- new cars -------------------------------------------------------------------------------------------------
@@ -1781,7 +1829,7 @@ namespace {
                 if (file.find('/') != std::string::npos || upper(file.substr(file.size() - 5)) != ".JSON") return;
                 ids.push_back(file.substr(0, file.size() - 5));
             };
-            rush2::upscale::ZipReader zip(mods[i].path);
+            rush2::upscale::ZipReader& zip = zip_of(mods[i].path);
             if (zip.is_open()) {
                 for (const std::string& n : zip.names()) add(n);
             }
@@ -2022,10 +2070,9 @@ namespace {
         box[3] = 3.0f;
     }
 
-    // Fills or clears the mod car slots from the enabled mods. Returns whether a slot changed.
-    bool apply_new_cars(uint8_t* rdram, const std::vector<ModFile>& mods) {
+    // The new cars of the enabled mods, each in the mod car slot it fills, into the plan.
+    void load_new_cars(const std::vector<ModFile>& mods, Plan& plan) {
         std::vector<NewCarFile> files = new_car_files(mods);
-        bool changed = false;
         int slot = 0;
         for (const NewCarFile& f : files) {
             if (slot >= new_car_slots) {
@@ -2065,75 +2112,41 @@ namespace {
                 continue;
             }
             int n = slot++;
-            uint64_t h = rush2::track_cache::hash(text.data(), text.size(), 0);
-            for (const auto& g : glbs) h = rush2::track_cache::hash(g.data(), g.size(), h);
-            for (const auto& g : hood_glbs) h = rush2::track_cache::hash(g.data(), g.size(), h ^ 0x400Dull);
-            std::string key = mods[f.mod].mod_id + "/" + f.id + "/" + std::to_string(h);
-            if (applied_new_key[n] == key) continue;
-            std::shared_ptr<Model> model;
-            std::vector<uint8_t> car;
-            std::vector<StandIn> stand_ins;
-            std::string prefix = "NC" + std::to_string(n + 1);
-            if (!convert(prefix, "newcar_" + std::to_string(n + 1), uint32_t(64 + n), glbs, model, car, stand_ins,
-                         error, true, hood_glbs)) {
+            NewCarPlan c;
+            c.n = n;
+            c.id = f.id;
+            c.mod_id = mods[f.mod].mod_id;
+            c.hash = rush2::track_cache::hash(text.data(), text.size(), 0);
+            for (const auto& g : glbs) c.hash = rush2::track_cache::hash(g.data(), g.size(), c.hash);
+            for (const auto& g : hood_glbs) c.hash = rush2::track_cache::hash(g.data(), g.size(), c.hash ^ 0x400Dull);
+            c.key = c.mod_id + "/" + f.id + "/" + std::to_string(c.hash);
+            if (!convert("NC" + std::to_string(n + 1), "newcar_" + std::to_string(n + 1), uint32_t(64 + n), glbs, c.model,
+                         c.car, c.stand_ins, error, true, hood_glbs)) {
                 fprintf(stderr, "[newcar] %s in %s: %s\n", f.id.c_str(), mods[f.mod].mod_id.c_str(), error.c_str());
                 slot--;
                 continue;
             }
             if (!spec.has_box) {
-                box_from_model(*model, spec.box);
+                box_from_model(*c.model, spec.box);
                 spec.has_box = true;
-            }
-            std::map<uint32_t, std::vector<uint8_t>> scuffed;
-            size_t triangles = 0;
-            for (const Part& p : model->parts) triangles += p.tris.size() / 3;
-            for (const StandIn& s : stand_ins) {
-                if (s.scuffed != s.texels) scuffed[s.offset] = s.scuffed; // unpainted: nothing to scuff
             }
             // The paints its textures take (texels 0 and 1 of a stand-in only name the ramps for rush2::derive), so the
             // car select shows no MAIN or ACCENT COLOR row that would change nothing.
             spec.paint_main = spec.paint_accent = false;
-            for (const StandIn& s : stand_ins) {
+            for (const StandIn& s : c.stand_ins) {
                 for (size_t i = 2; i < s.texels.size(); i++) {
                     spec.paint_main |= s.texels[i] >= main_first && s.texels[i] <= main_last;
                     spec.paint_accent |= s.texels[i] >= accent_first && s.texels[i] <= accent_last;
                 }
             }
-            size_t car_bytes = car.size();
-            rush2::car2049::set_mod_car(rdram, n, std::move(car), prefix, scuffed, spec);
-            printf("[newcar] %s (%s) from %s as type %d: %zu triangles, %zu textures, %d scheme(s), %zu KB, based on %s\n",
-                   spec.name.c_str(), f.id.c_str(), mods[f.mod].mod_id.c_str(), rush2::car_types::first_mod + n,
-                   triangles, stand_ins.size(), spec.schemes, car_bytes / 1024, prefixes[spec.base]);
-            applied_new_key[n] = key;
-            applied_new[n].mod_id = mods[f.mod].mod_id;
-            applied_new[n].glb_hash = h;
-            applied_new[n].stand_ins = std::move(stand_ins);
-            applied_new[n].model = model;
-            changed = true;
+            c.spec = spec;
+            plan.new_cars.push_back(std::move(c));
         }
-        for (int n = slot; n < new_car_slots; n++) {
-            if (applied_new_key[n].empty()) continue;
-            rush2::car2049::clear_mod_car(rdram, n);
-            printf("[newcar] mod car slot %d emptied\n", n + 1);
-            applied_new_key[n].clear();
-            applied_new[n] = Applied{};
-            changed = true;
-        }
-        return changed;
+        plan.slots_used = slot;
     }
 
-    void apply(uint8_t* rdram) {
-        std::string signature;
-        std::vector<ModFile> mods = enabled_mods(signature);
-        last_signature = signature;
-        bool patched = apply_models(rdram, mods);
-        patched = apply_liveries(mods) || patched;
-        if (patched) {
-            rush2::assets::set_patcher(rdram, model_mods.empty() && liveries.empty() ? rush2::assets::Patcher()
-                                                                                       : rush2::assets::Patcher(patch_container));
-        }
-        bool changed = patched;
-        changed = apply_new_cars(rdram, mods) || changed;
+    // Each Rush 2 car's replacement (rush2/cars/<prefix>.glb, the first mod in order that has it), into the plan.
+    void load_replacements(const std::vector<ModFile>& mods, Plan& plan) {
         for (int t = 0; t < types; t++) {
             std::string name = std::string("rush2/cars/") + prefixes[t] + ".glb";
             std::vector<uint8_t> glb;
@@ -2144,8 +2157,160 @@ namespace {
                     break;
                 }
             }
+            ReplacementPlan& r = plan.replacements[t];
+            if (from == nullptr) continue;
+            std::vector<uint8_t> hood;
+            read_mod_file(*from, std::string("rush2/cars/") + prefixes[t] + "_HOOD.glb", hood);
+            r.mod_id = from->mod_id;
+            r.hash = rush2::track_cache::hash(glb.data(), glb.size());
+            if (!hood.empty()) r.hash = rush2::track_cache::hash(hood.data(), hood.size(), r.hash ^ 0x400Dull);
+            std::string error;
+            if (!convert(prefixes[t], std::string("carmod_") + prefixes[t], uint32_t(t), { glb }, r.model, r.car,
+                         r.stand_ins, error, true, { hood })) {
+                fprintf(stderr, "[carmod] %s in %s: %s\n", name.c_str(), from->mod_id.c_str(), error.c_str());
+                r.state = ReplacementPlan::failed;
+                continue;
+            }
+            r.state = ReplacementPlan::ok;
+        }
+    }
+
+    // The plan's key: the enabled mods (ids, on or off, files) and when each mod's file or folder last changed.
+    std::string plan_key(const std::vector<ModFile>& mods, const std::string& signature) {
+        std::string key = signature;
+        for (const ModFile& m : mods) {
+            std::error_code ec;
+            auto time = std::filesystem::last_write_time(m.path, ec);
+            key += std::to_string(ec ? 0 : time.time_since_epoch().count()) + ";";
+        }
+        return key;
+    }
+
+    Plan make_plan(const std::vector<ModFile>& mods, const std::string& key) {
+        ZipBatch batch;
+        Plan plan;
+        plan.key = key;
+        load_models(mods, plan);
+        load_liveries(mods, plan);
+        load_new_cars(mods, plan);
+        load_replacements(mods, plan);
+        return plan;
+    }
+
+    // The plan handed from the background (rush2::car_mods::prepare) to apply: `planning` while one is made, by the
+    // background or by apply itself, so the two never make the same plan at once.
+    std::mutex plan_mutex;
+    std::condition_variable plan_done;
+    bool planning = false;
+    std::optional<Plan> ready;
+
+    // The plan for these mods: the background's if it made it (waiting while one is being made), else made now.
+    Plan obtain_plan(const std::vector<ModFile>& mods, const std::string& key) {
+        {
+            std::unique_lock lock{ plan_mutex };
+            plan_done.wait(lock, [] { return !planning; });
+            if (ready && ready->key == key) {
+                Plan plan = std::move(*ready);
+                ready.reset();
+                return plan;
+            }
+            planning = true;
+        }
+        Plan plan = make_plan(mods, key);
+        std::lock_guard lock{ plan_mutex };
+        planning = false;
+        plan_done.notify_all();
+        return plan;
+    }
+
+    // Makes the plan for the enabled mods as they are now and leaves it for apply, unless one is being made or is
+    // waiting already for them.
+    void prepare_plan() {
+        if (!load_car_palette()) return;
+        std::string signature;
+        std::vector<ModFile> mods = enabled_mods(signature);
+        std::string key = plan_key(mods, signature);
+        {
+            std::lock_guard lock{ plan_mutex };
+            if (planning || (ready && ready->key == key)) return;
+            planning = true;
+        }
+        Plan plan = make_plan(mods, key);
+        std::lock_guard lock{ plan_mutex };
+        ready = std::move(plan);
+        planning = false;
+        plan_done.notify_all();
+    }
+
+    // Installs a plan: the model mods' and liveries' patcher, the new cars in their slots and each car's replacement,
+    // skipping what is installed already from the same files.
+    void install(uint8_t* rdram, Plan& plan) {
+        bool patched = false;
+        if (plan.model_signature != model_signature) {
+            model_signature = plan.model_signature;
+            model_mods = std::move(plan.models);
+            printf("[modelmod] %zu model replacements\n", model_mods.size());
+            patched = true;
+        }
+        if (plan.livery_signature != livery_signature) {
+            livery_signature = plan.livery_signature;
+            liveries = std::move(plan.liveries);
+            for (int t = 0; t < types_all; t++) livery_counts[t] = plan.livery_counts[t];
+            // The bodies are made again as the cars load with the new liveries.
+            {
+                std::lock_guard lock{ style_mutex };
+                shown.clear();
+            }
+            {
+                std::lock_guard lock{ livery_tables_mutex };
+                livery_bodies.clear();
+                rush2::car2049::clear_livery_bodies();
+            }
+            size_t total = 0;
+            for (const auto& [index, list] : liveries) total += list.size();
+            printf("[livery] %zu liveries for %zu cars\n", total, liveries.size());
+            patched = true;
+        }
+        if (patched) {
+            rush2::assets::set_patcher(rdram, model_mods.empty() && liveries.empty() ? rush2::assets::Patcher()
+                                                                                       : rush2::assets::Patcher(patch_container));
+        }
+        bool changed = patched;
+        for (NewCarPlan& c : plan.new_cars) {
+            int n = c.n;
+            if (applied_new_key[n] == c.key) continue;
+            std::map<uint32_t, std::vector<uint8_t>> scuffed;
+            size_t triangles = 0;
+            for (const Part& p : c.model->parts) triangles += p.tris.size() / 3;
+            for (const StandIn& s : c.stand_ins) {
+                if (s.scuffed != s.texels) scuffed[s.offset] = s.scuffed; // unpainted: nothing to scuff
+            }
+            size_t car_bytes = c.car.size();
+            rush2::car2049::set_mod_car(rdram, n, std::move(c.car), "NC" + std::to_string(n + 1), scuffed, c.spec);
+            printf("[newcar] %s (%s) from %s as type %d: %zu triangles, %zu textures, %d scheme(s), %zu KB, based on %s\n",
+                   c.spec.name.c_str(), c.id.c_str(), c.mod_id.c_str(), rush2::car_types::first_mod + n,
+                   triangles, c.stand_ins.size(), c.spec.schemes, car_bytes / 1024, prefixes[c.spec.base]);
+            applied_new_key[n] = c.key;
+            online_checks[n] = online_check(c.key);
+            applied_new[n].mod_id = c.mod_id;
+            applied_new[n].glb_hash = c.hash;
+            applied_new[n].stand_ins = std::move(c.stand_ins);
+            applied_new[n].model = c.model;
+            changed = true;
+        }
+        for (int n = plan.slots_used; n < new_car_slots; n++) {
+            if (applied_new_key[n].empty()) continue;
+            rush2::car2049::clear_mod_car(rdram, n);
+            printf("[newcar] mod car slot %d emptied\n", n + 1);
+            applied_new_key[n].clear();
+            online_checks[n] = 0;
+            applied_new[n] = Applied{};
+            changed = true;
+        }
+        for (int t = 0; t < types; t++) {
+            ReplacementPlan& r = plan.replacements[t];
             Applied& a = applied[t];
-            if (from == nullptr) {
+            if (r.state == ReplacementPlan::none) {
                 if (a.model) {
                     rush2::car2049::clear_body_car(rdram, t, own[t]);
                     printf("[carmod] %s: back to its own car\n", prefixes[t]);
@@ -2154,20 +2319,10 @@ namespace {
                 }
                 continue;
             }
-            std::vector<uint8_t> hood;
-            read_mod_file(*from, std::string("rush2/cars/") + prefixes[t] + "_HOOD.glb", hood);
-            uint64_t h = rush2::track_cache::hash(glb.data(), glb.size());
-            if (!hood.empty()) h = rush2::track_cache::hash(hood.data(), hood.size(), h ^ 0x400Dull);
-            if (a.model && a.glb_hash == h && a.mod_id == from->mod_id) continue;
-            std::shared_ptr<Model> model;
-            std::vector<uint8_t> car;
-            std::vector<StandIn> stand_ins;
-            std::string error;
-            if (!convert(prefixes[t], std::string("carmod_") + prefixes[t], uint32_t(t), { glb }, model, car, stand_ins,
-                         error, true, { hood })) {
-                fprintf(stderr, "[carmod] %s in %s: %s\n", name.c_str(), from->mod_id.c_str(), error.c_str());
-                continue;
-            }
+            if (r.state == ReplacementPlan::failed || (a.model && a.glb_hash == r.hash && a.mod_id == r.mod_id)) continue;
+            std::shared_ptr<Model> model = r.model;
+            std::vector<uint8_t> car = std::move(r.car);
+            std::vector<StandIn> stand_ins = std::move(r.stand_ins);
             if (!has_own[t]) {
                 std::vector<rush2::assets::Span> spans;
                 own[t].clear();
@@ -2181,10 +2336,10 @@ namespace {
                 if (s.scuffed != s.texels) scuffed[s.offset] = s.scuffed; // unpainted: nothing to scuff
             }
             rush2::car2049::set_body_car(rdram, t, std::move(car), prefixes[t], scuffed);
-            printf("[carmod] %s from %s: %zu triangles, %zu textures\n", prefixes[t], from->mod_id.c_str(), triangles,
+            printf("[carmod] %s from %s: %zu triangles, %zu textures\n", prefixes[t], r.mod_id.c_str(), triangles,
                    stand_ins.size());
-            a.mod_id = from->mod_id;
-            a.glb_hash = h;
+            a.mod_id = r.mod_id;
+            a.glb_hash = r.hash;
             a.stand_ins = std::move(stand_ins);
             a.model = model;
             changed = true;
@@ -2192,19 +2347,40 @@ namespace {
         if (changed) publish_textures();
         fflush(stdout);
     }
+
+    // At boot: the plan the background made for these mods (or made now), installed.
+    void apply(uint8_t* rdram) {
+        std::string signature;
+        std::vector<ModFile> mods = enabled_mods(signature);
+        last_signature = signature;
+        Plan plan = obtain_plan(mods, plan_key(mods, signature));
+        install(rdram, plan);
+    }
+}
+
+void rush2::car_mods::prepare() {
+    prepare_plan();
 }
 
 std::vector<rush2::mod_files::ModFile> rush2::mod_files::enabled_mods(std::string& signature) {
     std::vector<ModFile> out;
     for (const recomp::mods::ModDetails& mod : recomp::mods::get_all_mod_details("rush2")) {
         bool on = recomp::mods::is_mod_enabled(mod.mod_id);
-        signature += mod.mod_id + (on ? "+" : "-") + ";";
-        if (on) out.push_back({ mod.mod_id, recomp::mods::get_mod_filename(mod.mod_id) });
+        // The mod's file too: a mod reinstalled as an .rtz in place of its folder (src/arcade2049) keeps its id.
+        std::filesystem::path file = recomp::mods::get_mod_filename(mod.mod_id);
+        signature += mod.mod_id + (on ? "+" : "-") + rush2::upscale::path_utf8(file) + ";";
+        if (on) out.push_back({ mod.mod_id, file });
     }
     return out;
 }
 
 bool rush2::mod_files::read_mod_file(const ModFile& mod, const std::string& name, std::vector<uint8_t>& out) {
+    if (open_zips != nullptr) {
+        rush2::upscale::ZipReader& zip = zip_of(mod.path);
+        if (zip.is_open()) return zip.read(name, out);
+        out = rush2::upscale::read_file(mod.path / std::filesystem::u8path(name));
+        return !out.empty();
+    }
     rush2::upscale::ZipReader zip(mod.path);
     if (zip.is_open()) return zip.read(name, out);
     out = rush2::upscale::read_file(mod.path / std::filesystem::u8path(name));
@@ -2212,7 +2388,7 @@ bool rush2::mod_files::read_mod_file(const ModFile& mod, const std::string& name
 }
 
 void rush2::car_mods::init(uint8_t* rdram) {
-    initialized = load_car_palette(rdram);
+    initialized = load_car_palette();
     if (!initialized) {
         fprintf(stderr, "[carmod] CARPALETTE not found: car mods are off\n");
         return;
@@ -2225,7 +2401,41 @@ void rush2::car_mods::check(uint8_t* rdram) {
     frames = 0;
     int32_t state = MEM_W(0, (int32_t)game_state);
     if (state < 0 || state > 1) return; // only in the menus: no car is loaded then
+    // Mods turned on or off (or reinstalled) since: their plan is made on a background thread and installed by a later
+    // check once it is ready, so the menus never wait on the mods' files.
+    static bool want = false;
     std::string signature;
-    enabled_mods(signature);
-    if (signature != last_signature) apply(rdram);
+    std::vector<ModFile> mods = enabled_mods(signature);
+    if (signature != last_signature || reload_requested.exchange(false)) {
+        want = true;
+        std::thread([] { prepare_plan(); }).detach();
+    }
+    if (!want) return;
+    std::string key = plan_key(mods, signature);
+    std::optional<Plan> plan;
+    {
+        std::lock_guard lock{ plan_mutex };
+        if (planning) return;
+        if (ready && ready->key == key) {
+            plan = std::move(ready);
+            ready.reset();
+        }
+    }
+    if (!plan) {
+        std::thread([] { prepare_plan(); }).detach();   // the mods changed again while it was made
+        return;
+    }
+    want = false;
+    last_signature = signature;
+    install(rdram, *plan);
+}
+
+void rush2::car_mods::reload() {
+    reload_requested = true;
+}
+
+std::array<uint32_t, rush2::car_types::count_mod> rush2::car_mods::online_car_checks() {
+    std::array<uint32_t, rush2::car_types::count_mod> out{};
+    for (int n = 0; n < new_car_slots; n++) out[n] = online_checks[n].load();
+    return out;
 }

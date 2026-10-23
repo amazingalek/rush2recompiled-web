@@ -10,7 +10,8 @@
 // from a top. The game puts it between its framebuffers (base about 0x80170CC0) and 0x803DA800, about 2.3 MB, and
 // lowers the top to 0x803AA800 while the menu overlay is resident there. Rush 2049's tracks are up to 0.6 MB bigger
 // than Rush 2's, and the track select's dioramas of them are real miniatures of their geometry (about 3.75 MB), so the
-// heap is moved to 0x80400000-0x80AE0000: past the 4 MB of the original memory map, below the 2D display lists at
+// heap is moved to 0x80420000-0x80AE0000: past the 4 MB of the original memory map and the scene node table moved to
+// 0x80400000 (include/scene_nodes.h; 3 MB of the heap was still free in the arcade Metro's race), below the 2D display lists at
 // 0x80AE0000 (src/hud.cpp) and the interpolation buffers at 0x80B00000, and within the RSP's 24-bit addresses. us.toml patches func_8009FB40 and func_800A62C0 to reset the
 // top to 0x80AE0000 instead of 0x803AA800/0x803DA800; the overlay no longer overlaps the
 // heap, so loading it doesn't need to lower the top.
@@ -48,7 +49,7 @@ namespace {
     constexpr uint32_t heap_base = 0x8010C44C;
     constexpr uint32_t heap_mark = 0x8010C444;
     constexpr uint32_t heap_top = 0x8010C470;
-    constexpr uint32_t new_heap_base = 0x80400000;
+    constexpr uint32_t new_heap_base = 0x80420000; // 0x80400000-0x80420000: the scene node table (include/scene_nodes.h)
     constexpr uint32_t new_heap_top = 0x80AE0000; // 0x80AE0000-0x80B00000: the 2D display lists (src/hud.cpp)
 
     struct Replacement {
@@ -174,6 +175,31 @@ bool rush2::assets::read_original(uint8_t* rdram, int index, std::vector<uint8_t
         rom = it != replaced.end() ? it->second.rom : (uint32_t)MEM_W(0, (int32_t)(asset_offsets + index * 4));
     }
     return read_rom_asset(index, rom, out);
+}
+
+uint32_t rush2::assets::rom_offset(int index) {
+    // The game inflates its main segment (code and data, raw deflate at ROM 0xAFD0C0) to 0x800539E0 at boot
+    // (tools/extract.py); the asset table 0x800C185C is in it. Inflated once.
+    constexpr uint32_t main_rom = 0xAFD0C0, main_vram = 0x800539E0, table_vram = 0x800C185C;
+    constexpr int table_entries = 0x71;
+    static std::mutex main_mutex;
+    static std::vector<uint8_t> table;
+    if (index < 0 || index >= table_entries) return 0;
+    std::lock_guard lock{ main_mutex };
+    if (table.empty()) {
+        auto rom = recomp::get_rom();
+        std::vector<uint8_t> main;
+        if (rom.size() <= main_rom || !inflate_raw(rom.data() + main_rom, rom.size() - main_rom, main)) return 0;
+        size_t at = table_vram - main_vram;
+        if (main.size() < at + table_entries * 4) return 0;
+        table.assign(main.begin() + at, main.begin() + at + table_entries * 4);
+    }
+    const uint8_t* p = &table[size_t(index) * 4];
+    return (uint32_t(p[0]) << 24) | (uint32_t(p[1]) << 16) | (uint32_t(p[2]) << 8) | p[3];
+}
+
+bool rush2::assets::rom_original(int index, std::vector<uint8_t>& out) {
+    return read_rom_asset(index, rom_offset(index), out);
 }
 
 bool rush2::assets::read_current(int index, std::vector<uint8_t>& out, std::vector<Span>& spans) {

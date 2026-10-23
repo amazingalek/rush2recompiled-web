@@ -158,6 +158,8 @@ void rush2_track49_sky_players(uint8_t* rdram, recomp_context* ctx);
 void rush2_track49_sky_height(uint8_t* rdram, recomp_context* ctx);
 void rush2_track49_select_init(uint8_t* rdram, recomp_context* ctx);
 void rush2_track49_select_count(uint8_t* rdram, recomp_context* ctx);
+void rush2_track49_carousel_order(uint8_t* rdram, recomp_context* ctx);
+void rush2_track49_select_step(uint8_t* rdram, recomp_context* ctx);
 void rush2_track49_select_model(uint8_t* rdram, recomp_context* ctx);
 void rush2_track49_select_pose(uint8_t* rdram, recomp_context* ctx);
 int rush2_track49_select_available(uint8_t* rdram, recomp_context* ctx);
@@ -172,6 +174,7 @@ void rush2_car49_logo(uint8_t* rdram, recomp_context* ctx);
 void rush2_car49_paint(uint8_t* rdram, recomp_context* ctx);
 void rush2_car49_drone(uint8_t* rdram, recomp_context* ctx);
 void rush2_car49_dent(uint8_t* rdram, recomp_context* ctx);
+bool rush2_calspeed_brake_lights(uint8_t* rdram, recomp_context* ctx);
 void rush2_livery_mirror_begin(uint8_t* rdram, recomp_context* ctx);
 void rush2_livery_mirror_end(uint8_t* rdram, recomp_context* ctx);
 void rush2_car49_setup_desc(uint8_t* rdram, recomp_context* ctx);
@@ -194,6 +197,7 @@ void rush2_car49_select_get(uint8_t* rdram, recomp_context* ctx);
 void rush2_car49_select_cursor(uint8_t* rdram, recomp_context* ctx);
 void rush2_car49_select_first_frame(uint8_t* rdram, recomp_context* ctx);
 void rush2_car49_asset(uint8_t* rdram, recomp_context* ctx, uint64_t* reg);
+void rush2_car49_asset_size(uint8_t* rdram, recomp_context* ctx, uint64_t* reg);
 
 // The car select's engine rev (src/engine_preview.cpp).
 void rush2_engine_preview_car_select(uint8_t* rdram, recomp_context* ctx);
@@ -258,7 +262,6 @@ void rush2_track49_stunt_option_t8(uint8_t* rdram, recomp_context* ctx);
 void rush2_battle_hide_stunt_panel(uint8_t* rdram, recomp_context* ctx);
 void rush2_battle_time_left_cheat(uint8_t* rdram, recomp_context* ctx);
 // func_8007C27C entry (a view's visibility, before the view is drawn): the battle HUD's 3D models of that view.
-void rush2_controls_menu_first_row(uint8_t* rdram, recomp_context* ctx);
 void rush2_battle_view(uint8_t* rdram, recomp_context* ctx);
 void rush2_battle_ram(uint8_t* rdram, recomp_context* ctx);
 void rush2_battle_race_steer(uint8_t* rdram, recomp_context* ctx);
@@ -334,6 +337,9 @@ void rush2_track49_movers_probe(uint8_t* rdram, recomp_context* ctx);
 void rush2_track49_movers_pads(uint8_t* rdram, recomp_context* ctx);
 // Rush 2049's collision lookups on its converted courses (src/rush2049/track2049_collision.cpp).
 void rush2_track49_collision_load(uint8_t* rdram, recomp_context* ctx);
+int rush2_collision_leaf_read_wide(uint8_t* rdram, recomp_context* ctx);
+void rush2_collision_leaf_list(recomp_context* ctx, gpr* reg, uint32_t stack_offset, int query);
+uint32_t rush2_collision_leaf_list_at(int query);
 void rush2_track49_collision_split(uint8_t* rdram, recomp_context* ctx);
 void rush2_track49_collision_cell(uint8_t* rdram, recomp_context* ctx);
 void rush2_track49_collision_cell_basis(uint8_t* rdram, recomp_context* ctx);
@@ -390,6 +396,9 @@ void rush2_controls_menu_text_players(uint8_t* rdram, recomp_context* ctx);
 void rush2_controls_menu_title(uint8_t* rdram, recomp_context* ctx);
 void rush2_players4_paused(uint8_t* rdram, recomp_context* ctx);
 void rush2_wings_menu_labels(uint8_t* rdram, recomp_context* ctx);
+void rush2_controls_menu_box(uint8_t* rdram, recomp_context* ctx);
+void rush2_controls_menu_title_y(uint8_t* rdram, recomp_context* ctx);
+void rush2_controls_menu_first_row(uint8_t* rdram, recomp_context* ctx);
 void rush2_wings_menu_label_row(uint8_t* rdram, recomp_context* ctx);
 
 // California Speed tracks: cars under the course and the road hold (src/calspeed/calspeed_rom.cpp).
@@ -403,6 +412,21 @@ void rush2_calspeed_demo_start(uint8_t* rdram, recomp_context* ctx);
 void rush2_calspeed_respawn_advance(uint8_t* rdram, recomp_context* ctx);
 void rush2_calspeed_respawn_place(uint8_t* rdram, recomp_context* ctx);
 void rush2_calspeed_wheel_support(uint8_t* rdram, recomp_context* ctx);
+// California Speed's walls and missed wheels (src/calspeed/calspeed_walls.cpp) and physics (calspeed_physics.cpp),
+// with the CS Physics option.
+int rush2_calspeed_wall_collision(uint8_t* rdram, recomp_context* ctx);
+void rush2_calspeed_ground_contact_enter(uint8_t* rdram, recomp_context* ctx);
+void rush2_calspeed_ground_contact_leave(uint8_t* rdram, recomp_context* ctx);
+void rush2_csphys_init_begin(uint8_t* rdram, recomp_context* ctx);
+void rush2_csphys_init_end(uint8_t* rdram, recomp_context* ctx);
+void rush2_csphys_probe(uint8_t* rdram, recomp_context* ctx);
+void rush2_csphys_wheel_forces(uint8_t* rdram, recomp_context* ctx);
+void rush2_csphys_torque(uint8_t* rdram, recomp_context* ctx);
+void rush2_csphys_orient_begin(uint8_t* rdram, recomp_context* ctx);
+void rush2_csphys_orient_end(uint8_t* rdram, recomp_context* ctx);
+int rush2_csphys_velocities(uint8_t* rdram, recomp_context* ctx);
+int rush2_csphys_shift(uint8_t* rdram, recomp_context* ctx);
+void rush2_csphys_wreck_log(uint8_t* rdram, recomp_context* ctx);
 // Directional rumble (src/rumble.cpp): a car's contact with a wall of the given world normal.
 void rush2_rumble_wall_contact(uint8_t* rdram, uint32_t car, const float* normal);
 
@@ -532,6 +556,11 @@ int rush2_online_arrow_view(uint8_t* rdram, int view);
 int rush2_online_hud_views(uint8_t* rdram, int views);
 void rush2_online_hud_time_digits(uint8_t* rdram, int player);
 uint32_t rush2_online_view_record(uint8_t* rdram, int view, uint32_t record);
+
+// Chase Camera and LOOK BACK (src/camera.cpp).
+void rush2_attract_camera_view(uint8_t* rdram, recomp_context* ctx);
+void rush2_attract_camera_cycle(uint8_t* rdram, recomp_context* ctx);
+void rush2_look_back(uint8_t* rdram, recomp_context* ctx);
 int rush2_online_engine_start(uint8_t* rdram, recomp_context* ctx);
 uint32_t rush2_online_engine_car(uint8_t* rdram, int slot, uint32_t physics_car);
 // func_803B7018 at 0x803B7110: the circuit menu set 0x800D3E40 to the profile's circuit block ($t8); a machine

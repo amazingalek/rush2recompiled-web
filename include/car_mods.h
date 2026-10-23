@@ -1,10 +1,13 @@
 #ifndef __CAR_MODS_H__
 #define __CAR_MODS_H__
 
+#include <array>
 #include <cstdint>
 #include <filesystem>
 #include <string>
 #include <vector>
+
+#include "car_types.h"
 
 // Car model mods (src/car_mods.cpp, docs/car_mods.md): a mod that holds rush2/cars/<car>.glb (<car> a Rush 2 car's part
 // prefix: PICKUP, INTEG, VETTE, ...) replaces that car with the mesh, any number of triangles, drawn as one body that
@@ -13,10 +16,21 @@
 // rush2/new_cars/<ID>.glb with <ID>.json adds a car to the car select instead (mod car types 57-72,
 // docs/car_mods.md#new-cars).
 namespace rush2::car_mods {
-    // At boot, after the car tables and assets are set up (rush2_heap_init).
+    // At boot, after the car tables and assets are set up (rush2_heap_init): installs what prepare made for the enabled
+    // mods (waiting for it if it is being made), or reads and converts their files itself when it has nothing.
     void init(uint8_t* rdram);
-    // Once per frame: applies mods turned on or off since, while the game is in the menus.
+    // Reads and converts the enabled mods' car files (models, liveries, new cars, replaced cars) for init or check to
+    // install, with no game memory. Any thread: src/prewarm.cpp runs it at launch.
+    void prepare();
+    // Once per frame: applies mods turned on or off since, while the game is in the menus. Their files are read and
+    // converted on a background thread; the change is installed by a later frame once that is done.
     void check(uint8_t* rdram);
+    // A mod's files changed under the same id (src/arcade2049 reinstalled one): check reads every mod again.
+    void reload();
+
+    // Online races (docs/online.md#mod-cars): each mod car slot's car as a hash of its mod, car id and files (0 an empty
+    // slot). Two machines with the same value have the same car, whatever slot it is in. Any thread.
+    std::array<uint32_t, rush2::car_types::count_mod> online_car_checks();
 
     // Liveries (docs/car_mods.md#liveries): a mod's rush2/liveries/<ID>.json gives an existing car (a Rush 2 or Rush
     // 2049 car) more looks, each a whole mesh drawn as authored, picked with the car select's STYLE row. STYLE 1 is the

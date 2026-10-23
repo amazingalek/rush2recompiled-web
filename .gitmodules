@@ -21,3 +21,11 @@
 [submodule "lib/N64Recomp-browser"]
 	path = lib/N64Recomp-browser
 	url = https://github.com/n64hub/N64Recomp-browser
+[submodule "lib/Clipper2"]
+	path = lib/Clipper2
+	url = https://github.com/AngusJohnson/Clipper2
+	ignore = dirty
+[submodule "lib/earcut"]
+	path = lib/earcut
+	url = https://github.com/mapbox/earcut.hpp
+	ignore = dirty

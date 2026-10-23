@@ -41,7 +41,7 @@
 #include "rush2_hooks.h"
 #include "collision_polys.h"
 #include "calspeed.h"
-#include "track_mod_runtime.h"
+#include "track2049.h"
 
 namespace {
     // Rush 2's collision file pointers (collision_file_load_800814B0, docs/rush2049_research/collision.md).
@@ -75,6 +75,23 @@ namespace {
     };
     Table table;
 
+    // A ledge is a floor standing above the road: a sidewalk's or platform's top, its plane well above the spot the
+    // wheel last rested on. A ramp rising from the road starts at the road's height, so its plane, carried back to that
+    // spot, is at or under it; but a car driving onto it fast puts its wheel more than ledge_step (below) into it in one
+    // step (San Francisco's start ramps, California's crest ramp, at California Speed's 150-250 ft/s), and the ledge
+    // rule held the wheel at ledge_rise: the suspension barely pushed, the ramp rose through the car and stood it on
+    // end. So a floor whose plane is no more than ramp_rise above the wheel's last resting spot is the road going on
+    // and keeps its full depth; the ledge rule is for the others. (Neighbors by shared vertices can't tell them apart:
+    // California Speed's road polygons are 1/32 ft apart at their cracks, and platform tops taper to the road at their
+    // ends, so they touch it.)
+    // support: per car and wheel, the wheel's point on its surface at its last probe that was not held as a ledge.
+    struct Rest {
+        float p[3];
+    };
+    std::unordered_map<uint32_t, Rest> support;
+    constexpr float ramp_rise = 0.5f;
+    bool held_as_ledge = false;           // the current probe's height was clamped by the ledge rule
+
     const bool enabled = [] {
         const char* v = getenv("RUSH2_SMOOTH_COLLISION");
         return v == nullptr || strcmp(v, "0") != 0;
@@ -88,11 +105,9 @@ namespace {
     // The fold angle: the raced custom track's smooth_fold, else 20 degrees; RUSH2_SMOOTH_FOLD overrides both.
     float fold_degrees(uint8_t* rdram) {
         if (const char* v = getenv("RUSH2_SMOOTH_FOLD")) return (float)atof(v);
-        rush2::track_mod::Settings s;
-        if (!rush2::calspeed::racing(rdram) && rush2::track_mod::race_track() >= 0 && rush2::track_mod::race_settings(s)) {
-            return s.smooth_fold;
-        }
-        return 20.0f;
+        float fold = 20.0f;
+        if (!rush2::calspeed::racing(rdram)) rush2::track2049::mod_smooth_collision(rdram, &fold);
+        return fold;
     }
 
     float f32(uint8_t* rdram, uint32_t at) {
@@ -194,6 +209,7 @@ namespace {
                 at[position_key(w[k])].push_back(Use{ i, { s.face[0], s.face[1], s.face[2] } });
             }
         }
+        support.clear();
         int smoothed = 0, sharp = 0;
         for (int i = 0; i < n; i++) {
             Smooth& s = table.smooth[i];
@@ -230,10 +246,10 @@ namespace {
 
     bool wanted(uint8_t* rdram) {
         if (!enabled) return false;
+        // California Speed's tracks, with either physics (src/calspeed/calspeed_physics.cpp).
         if (rush2::calspeed::racing(rdram)) return true;
-        if (rush2::track_mod::race_track() < 0) return false;
-        rush2::track_mod::Settings s;
-        return !rush2::track_mod::race_settings(s) || s.smooth_collision;   // the track's opt-out
+        // A custom track's: its track.toml smooth_collision (the author's opt-out).
+        return rush2::track2049::mod_smooth_collision(rdram);
     }
 
     // Cracks and ledges. California Speed's floors (and converted custom tracks) have hairline gaps between neighboring
@@ -247,8 +263,23 @@ namespace {
     constexpr float gap_tol = 1.0f;       // ft outside a footprint, in the polygon's plane
     constexpr float ledge_step = 0.75f;   // a found surface this far above the wheel's point gives way to one it is on
     constexpr float ledge_rise = 0.1f;    // ... and with none to give way to, the wheel climbs it this much per probe
-    constexpr int32_t sp_list = 0xA4;     // the leaf's polygon indices (u16); their count is noted by the leaf hook
+    // The leaf's polygon indices (u16), their count noted by the leaf hook: the probe's list, moved off its stack (sp+0xA4)
+    // to spare RDRAM by rush2_collision_leaf_list (query 1) so a leaf can hold 255.
     int leaf_count = 0;                   // the current probe's leaf polygon count (0 when it found no leaf)
+
+    uint32_t support_key(uint8_t* rdram, uint32_t sp) {
+        return (uint32_t)MEM_W(sp_car, (int32_t)sp) + (uint32_t)MEM_W(0x14C, (int32_t)sp);
+    }
+    // The found polygon's plane is no more than ramp_rise above the wheel's last resting spot: a ramp, not a ledge.
+    bool joined_to_support(uint8_t* rdram, uint32_t sp, uint32_t poly) {
+        auto it = support.find(support_key(rdram, sp));
+        if (it == support.end()) return false;
+        float w[16][3], m[9];
+        if (world_vertices(rdram, poly, w, m) < 3) return false;
+        const float* r = it->second.p;
+        float above = m[3] * (r[0] - w[0][0]) + m[4] * (r[1] - w[0][1]) + m[5] * (r[2] - w[0][2]);   // the spot over the plane
+        return above > -ramp_rise;
+    }
 
     // A ledge with nothing under it to keep (a sidewalk's or platform's top the wheel's point has fully entered): the
     // height is clamped so the wheel climbs it at ledge_rise per probe (a 1.9 ft platform over about a car length at
@@ -259,9 +290,12 @@ namespace {
     bool falling(uint8_t* rdram, uint32_t sp) {
         return f32(rdram, (uint32_t)MEM_W(sp_car, (int32_t)sp) + 0x38) < falling_speed;
     }
-    void ledge_clamp(uint8_t* rdram, recomp_context* ctx) {
+    void ledge_clamp(uint8_t* rdram, recomp_context* ctx, bool joined) {
         float h = f32(rdram, (uint32_t)ctx->r17 + 4);
-        if (h < -ledge_step && !falling(rdram, (uint32_t)ctx->r29)) put_f32(rdram, (uint32_t)ctx->r17 + 4, -ledge_rise);
+        if (h < -ledge_step && !joined && !falling(rdram, (uint32_t)ctx->r29)) {
+            put_f32(rdram, (uint32_t)ctx->r17 + 4, -ledge_rise);
+            held_as_ledge = true;
+        }
     }
 
     // Distance from (lx, lz) to a polygon's footprint in its local plane, 0 inside.
@@ -303,7 +337,7 @@ namespace {
         float tl[3] = {}, tm[9] = {};
         int tindex = 0;
         for (int i = 0; i < leaf_count; i++) {
-            int index = MEM_HU(sp_list + 2 * i, (int32_t)sp);
+            int index = MEM_HU(2 * i, (int32_t)rush2_collision_leaf_list_at(1));
             uint32_t poly = polys + poly_size * (uint32_t)index;
             uint32_t flags = MEM_HU(0, (int32_t)poly);
             if ((flags & 0xF) >= 4) continue;             // walls and the like: floors only
@@ -344,6 +378,27 @@ namespace {
         }
         return taken;
     }
+
+    // A spline road polygon (flag 0x1000) holds the wheel on the segment's cubic surface (collision_seg_surface_8006BDA8,
+    // California Speed's 0x800AEE54 the same), which meets the polygon at its corners and bows away between them. The
+    // road drawn is the flat polygons, and on California Speed's coarse spline triangles the cubic sags up to 1.4 ft
+    // under them where the road dips (San Francisco's x 2300-2550, z 1000-1980 and its walled loop, polygons
+    // 7120-7288), so the car sank into the road it showed. The wheel is held on the higher of the two: the height to
+    // the flat face, measured along the spline's normal (the probe's frame row 1), when the face is above the cubic.
+    // California Speed only: a custom track's ROAD_SPLINES road may be drawn finer than its polygons, along the cubic.
+    void spline_on_face(uint8_t* rdram, recomp_context* ctx, uint32_t poly) {
+        float w[16][3], m[9];
+        if (world_vertices(rdram, poly, w, m) < 3) return;
+        uint32_t pointp = (uint32_t)MEM_W(sp_point, (int32_t)ctx->r29), frame = (uint32_t)MEM_W(sp_frame, (int32_t)ctx->r29);
+        float face = 0.0f, dot = 0.0f;
+        for (int a = 0; a < 3; a++) {
+            face += m[3 + a] * (f32(rdram, pointp + 4 * (uint32_t)a) - w[0][a]);
+            dot += m[3 + a] * f32(rdram, frame + 12 + 4 * (uint32_t)a);
+        }
+        if (dot < 0.5f) return;
+        float h = f32(rdram, (uint32_t)ctx->r17 + 4);
+        if (face / dot < h) put_f32(rdram, (uint32_t)ctx->r17 + 4, face / dot);
+    }
 }
 
 // collision_poly_extract_8006F704 at 0x8006F748 (entry, count 0) and 0x8006F860 (the leaf decoded, $t1 = its polygon
@@ -362,9 +417,8 @@ extern "C" bool rush2_smooth_collision_gap(uint8_t* rdram, recomp_context* ctx) 
     return fill_gap(rdram, ctx, false) != 0;
 }
 
-// collision_poly_extract_8006F704 at 0x8006FA70: the found polygon's surface is in place (flat, spline or arc). On a
-// California Speed or custom track, a flat floor polygon's frame and height are replaced by the smooth surface's.
-extern "C" void rush2_smooth_collision_surface(uint8_t* rdram, recomp_context* ctx) {
+// The smooth surface for the found polygon (rush2_smooth_collision_surface).
+static void smooth_surface(uint8_t* rdram, recomp_context* ctx) {
     uint32_t sp = (uint32_t)ctx->r29;
     uint32_t poly = (uint32_t)MEM_W(sp_poly, (int32_t)sp);
     uint32_t polys = (uint32_t)MEM_W(0, (int32_t)poly_table_ptr), verts = (uint32_t)MEM_W(0, (int32_t)vert_table_ptr);
@@ -376,9 +430,21 @@ extern "C" void rush2_smooth_collision_surface(uint8_t* rdram, recomp_context* c
                (int)MEM_W(0x14C, (int32_t)sp), f32(rdram, (uint32_t)ctx->r17 + 4));
         fflush(stdout);
     }
-    if (!wanted(rdram)) return;
     if (polys == 0 || poly < polys) return;
-    if (uint32_t nearer = fill_gap(rdram, ctx, true)) poly = nearer;   // a ledge gives way to the road under it
+    float fold_cos = (float)std::cos(fold_degrees(rdram) * 3.14159265358979 / 180.0);
+    if (table.polys != polys || table.verts != verts || table.fold_cos != fold_cos) build(rdram, fold_cos);
+    // A floor rising from where the wheel last rested is the road going on (a ramp): no ledge rule for it.
+    bool joined = f32(rdram, (uint32_t)ctx->r17 + 4) < -ledge_step && joined_to_support(rdram, sp, poly);
+    if (joined && log_probes && (uint32_t)MEM_W(sp_car, (int32_t)sp) == player_car) {
+        uint32_t pointp = (uint32_t)MEM_W(sp_point, (int32_t)sp);
+        printf("[smooth] ramp wheel %d: poly %u h %.2f at (%.1f %.1f %.1f)\n", (int)MEM_W(0x14C, (int32_t)sp),
+               (poly - polys) / poly_size, f32(rdram, (uint32_t)ctx->r17 + 4), f32(rdram, pointp), f32(rdram, pointp + 4),
+               f32(rdram, pointp + 8));
+        fflush(stdout);
+    }
+    if (!joined) {
+        if (uint32_t nearer = fill_gap(rdram, ctx, true)) poly = nearer;   // a ledge gives way to the road under it
+    }
     if (log_probes && (uint32_t)MEM_W(sp_car, (int32_t)sp) == player_car) {
         float h0 = f32(rdram, (uint32_t)ctx->r17 + 4);
         if (h0 < -1.0f || h0 > 2.0f) {
@@ -390,16 +456,15 @@ extern "C" void rush2_smooth_collision_surface(uint8_t* rdram, recomp_context* c
             fflush(stdout);
         }
     }
-    float fold_cos = (float)std::cos(fold_degrees(rdram) * 3.14159265358979 / 180.0);
-    if (table.polys != polys || table.verts != verts || table.fold_cos != fold_cos) build(rdram, fold_cos);
     uint32_t index = (poly - polys) / poly_size;
     if (index >= table.smooth.size()) {
-        ledge_clamp(rdram, ctx);
+        ledge_clamp(rdram, ctx, joined);
         return;
     }
     const Smooth& s = table.smooth[index];
     if (s.count == 0) {
-        ledge_clamp(rdram, ctx);   // a spline or arc polygon
+        if ((MEM_HU(0, (int32_t)poly) & flag_spline) && rush2::calspeed::racing(rdram)) spline_on_face(rdram, ctx, poly);
+        ledge_clamp(rdram, ctx, joined);   // a spline or arc polygon
         return;
     }
     const Corner* c = &table.corners[s.first];
@@ -440,7 +505,7 @@ extern "C" void rush2_smooth_collision_surface(uint8_t* rdram, recomp_context* c
     for (int a = 0; a < 3; a++) bw[a] = std::max(0.0f, bw[a]);
     float sum = bw[0] + bw[1] + bw[2];
     if (sum <= 0.0f) {
-        ledge_clamp(rdram, ctx);
+        ledge_clamp(rdram, ctx, joined);
         return;
     }
     for (int a = 0; a < 3; a++) bw[a] /= sum;
@@ -451,7 +516,7 @@ extern "C" void rush2_smooth_collision_surface(uint8_t* rdram, recomp_context* c
     }
     normalize(normal);
     if (normal[0] * s.face[0] + normal[1] * s.face[1] + normal[2] * s.face[2] < 0.5f) {   // nothing sensible
-        ledge_clamp(rdram, ctx);
+        ledge_clamp(rdram, ctx, joined);
         return;
     }
 
@@ -476,7 +541,27 @@ extern "C" void rush2_smooth_collision_surface(uint8_t* rdram, recomp_context* c
     // The height: the wheel's distance to the flat face along the smooth normal.
     float h = (p[0] - q[0]) * normal[0] + (p[1] - q[1]) * normal[1] + (p[2] - q[2]) * normal[2];
     // A ledge is climbed, not jumped onto (a landing keeps its depth).
-    put_f32(rdram, (uint32_t)ctx->r17 + 4, h < -ledge_step && !falling(rdram, sp) ? -ledge_rise : h);
+    if (h < -ledge_step && !joined && !falling(rdram, sp)) {
+        h = -ledge_rise;
+        held_as_ledge = true;
+    }
+    put_f32(rdram, (uint32_t)ctx->r17 + 4, h);
+}
+
+// collision_poly_extract_8006F704 at 0x8006FA70: the found polygon's surface is in place (flat, spline or arc). On a
+// California Speed or custom track, a flat floor polygon's frame and height are replaced by the smooth surface's, and
+// the wheel's point on the surface it ends on becomes its resting spot unless it was held as a ledge.
+extern "C" void rush2_smooth_collision_surface(uint8_t* rdram, recomp_context* ctx) {
+    if (!wanted(rdram)) return;
+    held_as_ledge = false;
+    smooth_surface(rdram, ctx);
+    uint32_t sp = (uint32_t)ctx->r29;
+    uint32_t poly = (uint32_t)MEM_W(sp_poly, (int32_t)sp), polys = (uint32_t)MEM_W(0, (int32_t)poly_table_ptr);
+    if (held_as_ledge || polys == 0 || poly < polys) return;
+    uint32_t pointp = (uint32_t)MEM_W(sp_point, (int32_t)sp), frame = (uint32_t)MEM_W(sp_frame, (int32_t)sp);
+    float h = f32(rdram, (uint32_t)ctx->r17 + 4);
+    Rest& rest = support[support_key(rdram, sp)];
+    for (int a = 0; a < 3; a++) rest.p[a] = f32(rdram, pointp + 4 * (uint32_t)a) - h * f32(rdram, frame + 12 + 4 * (uint32_t)a);
 }
 
 // Debug (RUSH2_SMOOTH_LOG=2): car_ground_contact_800703EC at 0x8007057C, right after a wheel's probe: $s1 = the car,

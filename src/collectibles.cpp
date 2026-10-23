@@ -50,8 +50,11 @@
 #include "librecomp/addresses.hpp"
 #include "util/file.h"
 
+#include "arcade2049.h"
+#include "arcade_checkpoints.h"
 #include "data_files.h"
 #include "rush2_hooks.h"
+#include "rush2.h"
 #include "audio2049.h"
 #include "battle_render.h"
 #include "collectibles.h"
@@ -316,7 +319,7 @@ namespace {
                 return "";
             }
             uint32_t record = (uint32_t)MEM_W(0, (int32_t)(slot + 0x24));
-            if (record < 0x80000000 || record >= 0x80800000 || (MEM_BU(0, (int32_t)(record + rec_flags)) & 1) == 0) {
+            if (!rush2::in_game_ram(record) || (MEM_BU(0, (int32_t)(record + rec_flags)) & 1) == 0) {
                 return "";
             }
             return read_name(rdram, record + rec_name, name_size);
@@ -326,7 +329,7 @@ namespace {
             return "";
         }
         uint32_t record = (uint32_t)MEM_W(0, (int32_t)(slot + 0x24));
-        if (record < 0x80000000 || record >= 0x80800000) {
+        if (!rush2::in_game_ram(record)) {
             return "";
         }
         return read_name(rdram, record + rec_name, name_size);
@@ -495,6 +498,7 @@ bool rush2::collectibles::purchase(const std::string& name, const std::string& i
 // func_800B0228 at 0x800B02B4, the top of the game thread's main loop (every frame): copies Rush 2's key masks for
 // the Progress tab. A race player's record (player slot + 0x24) is read too, in case it is newer than the pak image's.
 extern "C" void rush2_collect_frame(uint8_t* rdram, recomp_context* ctx) {
+    rush2::arcade2049::checkpoints_frame(rdram, ctx);   // the Arcade Checkpoints option's banners
     Rush2Snapshot snap;
     auto masks_at = [&](uint32_t record) {
         Rush2Masks m;
@@ -518,8 +522,7 @@ extern "C" void rush2_collect_frame(uint8_t* rdram, recomp_context* ctx) {
         uint32_t slot = player_slots + (uint32_t)player * player_slot_size;
         uint8_t profile_slot = MEM_BU(0, (int32_t)(slot + 1));
         uint32_t record = (uint32_t)MEM_W(0, (int32_t)(slot + 0x24));
-        if ((int16_t)MEM_H(0, (int32_t)(profile_of_slot + profile_slot * 2)) == -1 || record < 0x80000000 ||
-            record >= 0x80800000) {
+        if ((int16_t)MEM_H(0, (int32_t)(profile_of_slot + profile_slot * 2)) == -1 || !rush2::in_game_ram(record)) {
             continue;
         }
         std::string name = read_name(rdram, record + rec_name, name_size);
@@ -605,6 +608,13 @@ extern "C" void rush2_collect_number(uint8_t* rdram, recomp_context* ctx) {
 // Start of func_8005F00C ($a0 = key bit): returns ($v0) whether every racer has taken the key. On an added track the
 // answer comes from this file's masks.
 extern "C" int rush2_collect_taken(uint8_t* rdram, recomp_context* ctx) {
+    // Online each machine knows only its own players' profiles (the others' records are copies), so the answer
+    // differed by machine and a key could be out on one only, where touching it changed the synced player record:
+    // every key is out online, on every track, and taking it still counts for this machine's players.
+    if (rush2::online::game::in_race()) {
+        ctx->r2 = 0;
+        return 1;
+    }
     int c = hosted_course(rdram);
     if (c < 0) {
         return 0;

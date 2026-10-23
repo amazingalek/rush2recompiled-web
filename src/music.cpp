@@ -16,7 +16,8 @@
 // game, when it is switched off), Shuffle (a random song of the game) or Shuffle All (a random song of any
 // game in Shuffle All). SF Rush and California Speed offer only Original and Shuffle All: their own choice already is
 // a random song of the game. A game's In Shuffle All switch keeps its songs out of every Shuffle All (its own tracks'
-// Original and Shuffle still play them).
+// Original and Shuffle still play them). A custom track counts as a Rush 2 track; one with no song of its own
+// ([audio] music) has as its Original a random song of any game, of every song switched on.
 // Shuffles skip the song played last. A song of a game whose ROM or audio isn't available is skipped; with nothing
 // left the game picks as it would by itself. A Rush 2 or SF Rush song replaces the sequence Rush 2 chose (at
 // 0x8008C46C); a Rush 2049 song is queued on the 2049 player and the call turned into the "music off" case, whose
@@ -352,12 +353,13 @@ namespace {
         return -1;
     }
 
-    // A random playable song (of game g, or of any game in Shuffle All when all is set), skipping the last one when
-    // there's another.
-    int pick(bool all, Game g) {
+    // A random playable song (of game g, or of any game in Shuffle All when all is set, or of any game at all when
+    // any is set), skipping the last one when there's another.
+    int pick(bool all, Game g, bool any = false) {
         std::vector<int> pool;
         for (int i = 0; i < song_count; i++) {
-            bool in = all ? in_shuffle_all[(int)songs[i].game].load(std::memory_order_relaxed) : songs[i].game == g;
+            bool in = any ? true
+                    : all ? in_shuffle_all[(int)songs[i].game].load(std::memory_order_relaxed) : songs[i].game == g;
             if (in && playable(i)) {
                 pool.push_back(i);
             }
@@ -403,6 +405,10 @@ namespace {
         else if (host && rush2::calspeed::race_track() > 0) {
             g = Game::CalSpeed;
             original = pick(false, Game::CalSpeed);
+        }
+        else if (rush2::track2049::mod_random_song(rdram)) {
+            // A custom track without its own song ([audio] music): any song the player switched on, never its host's.
+            original = pick(false, g, true);
         }
         else if (t >= 0 && t < 12) {
             original = find_song(Game::Rush2, (int16_t)MEM_H(0, (int32_t)(track_songs + t * 2)));
@@ -698,43 +704,49 @@ namespace {
             ContextId context = get_current_context();
             set_as_navigation_container(NavigationType::Vertical);
 
+            // Placed rather than flexed down to the row of columns: RmlUi lays out nested flex boxes many times over,
+            // and with them this page took tens of milliseconds to lay out on every description change
+            // (tools/rml_layout_bench).
+            constexpr float description_height = 92.0f;
             body->get_right()->set_display(Display::None);
             Element* left = body->get_left();
-            left->set_display(Display::Flex);
-            left->set_flex_direction(FlexDirection::Column);
+            left->set_display(Display::Block);
+            left->set_position(Position::Relative);
             left->set_height(100.0f, Unit::Percent);
-            left->set_padding(16.0f);
-            left->set_gap(8.0f);
 
             // The columns with an arrow on each side.
             Element* strip = context.create_element<Element>(left, 0, "div", false);
-            strip->set_display(Display::Flex);
-            strip->set_flex_direction(FlexDirection::Row);
-            strip->set_width(100.0f, Unit::Percent);
-            strip->set_flex_grow(1.0f);
-            strip->set_flex_shrink(1.0f);
-            strip->set_min_height(0.0f);
-            strip->set_gap(8.0f);
+            strip->set_position(Position::Absolute);
+            strip->set_top(16.0f);
+            strip->set_left(16.0f);
+            strip->set_right(16.0f);
+            strip->set_bottom(description_height + 24.0f);
 
             arrows[0] = add_arrow(strip, "icons/CaretLeft.svg", -1);
             grid = context.create_element<Element>(strip, 0, "div", false);
+            grid->set_position(Position::Absolute);
+            grid->set_top(0.0f);
+            grid->set_bottom(0.0f);
+            grid->set_left(arrow_room);
+            grid->set_right(arrow_room);
             grid->set_display(Display::Flex);
             grid->set_flex_direction(FlexDirection::Row);
             grid->set_align_items(AlignItems::FlexStart);
             grid->set_gap(column_gap);
-            grid->set_flex_grow(1.0f);
-            grid->set_flex_basis(0.0f);
             grid->set_overflow_x(Overflow::Auto);    // Auto, not Hidden: rows can only scroll themselves into view in a scrolling box.
             grid->set_overflow_y(Overflow::Auto);
             grid->set_as_navigation_container(NavigationType::Horizontal);
             arrows[1] = add_arrow(strip, "icons/CaretRight.svg", 1);
 
             description = context.create_element<Element>(left, 0, "p", true);
+            description->set_position(Position::Absolute);
+            description->set_left(16.0f);
+            description->set_right(16.0f);
+            description->set_bottom(16.0f);
             description->set_typography(theme::Typography::Body);
             description->set_line_height(28.0f);
             description->set_padding_top(8.0f);
-            description->set_height(92.0f);
-            description->set_flex_shrink(0.0f);
+            description->set_height(description_height);
             description->set_color(theme::color::TextDim);
             description->set_border_top_width(1.0f);
             description->set_border_top_color(theme::color::Border);
@@ -767,6 +779,7 @@ namespace {
 
     private:
         static constexpr float column_gap = 24.0f;
+        static constexpr float arrow_room = 48.0f;   // Each side of the columns, for its arrow (a small icon button).
 
         struct Row {
             Element* row;
@@ -821,7 +834,7 @@ namespace {
             bool on = (state & 2) != 0;
             bool disc_now = (state & 4) != 0;
             Header& h = headers[(int)g];
-            h.column->set_display(available ? Display::Flex : Display::None);
+            h.column->set_display(available ? Display::Block : Display::None);
             h.shown = available;
             for (Row& r : rows) {
                 if (game_of(r.id) != g) {
@@ -846,11 +859,17 @@ namespace {
         // d-pad scrolls the columns by moving through them.
         IconButton* add_arrow(Element* strip, const char* icon, int direction) {
             ContextId context = get_current_context();
+            // Vertically centered at its side of the strip.
             Element* holder = context.create_element<Element>(strip, 0, "div", false);
-            holder->set_display(Display::Flex);
-            holder->set_flex_direction(FlexDirection::Column);
-            holder->set_justify_content(JustifyContent::Center);
-            holder->set_flex_shrink(0.0f);
+            holder->set_position(Position::Absolute);
+            holder->set_top(50.0f, Unit::Percent);
+            holder->set_translate_2D(0.0f, -50.0f, Unit::Percent);
+            if (direction < 0) {
+                holder->set_left(0.0f);
+            }
+            else {
+                holder->set_right(0.0f);
+            }
             IconButton* arrow = context.create_element<IconButton>(holder, icon, ButtonStyle::Secondary, IconButtonSize::Small);
             arrow->set_focusable(false);
             arrow->set_visibility(Visibility::Hidden);    // Until update_arrows finds a column cut off on its side.
@@ -928,9 +947,9 @@ namespace {
 
         Element* add_column(float width) {
             ContextId context = get_current_context();
+            // A block, not a flex column: only the row of columns is flexed.
             Element* column = context.create_element<Element>(grid, 0, "div", false);
-            column->set_display(Display::Flex);
-            column->set_flex_direction(FlexDirection::Column);
+            column->set_display(Display::Block);
             column->set_flex_grow(1.0f);
             column->set_flex_shrink(0.0f);
             column->set_flex_basis(width, Unit::Dp);

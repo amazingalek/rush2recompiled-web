@@ -20,6 +20,9 @@ namespace rush2::track_mod {
 
     // The enabled mods' tracks, in mod order (rescanned when the enabled mods change).
     std::vector<Entry> tracks();
+    // A mod's file was replaced under the same id and name (src/arcade2049 rebuilt it): the next tracks() reads the
+    // mods again, which the enabled mods and their file names alone don't show.
+    void rescan();
 
     // The custom track (index into tracks()) raced in the host slot, or -1. RUSH2_TEST_MOD_TRACK=<n> races track n
     // whenever the host slot (HAWAII) is raced, for testing without a track select entry.
@@ -32,6 +35,10 @@ namespace rush2::track_mod {
     // Track `index`'s type (a RaceType) as of the last scan (the track select's), or race_race when there is no such
     // track.
     int type_of(int index);
+    // Whether track `index` is a point-to-point race (track.toml point_to_point) / a run-in circuit (run_in), as of
+    // the last scan.
+    bool point_to_point(int index);
+    bool run_in(int index);
     // The RaceType of a track with these settings (its track.toml type).
     int type_of(const Settings& settings);
     // The track prefix a custom track of these settings is converted with: its host slot's (STUNT1 for an arena).
@@ -56,9 +63,15 @@ namespace rush2::track_mod {
     // the first race of it doesn't convert again). False when the track can't be converted: its report says why.
     bool menu_art(int index, MenuArt& out);
 
-    // Starts a background thread that converts the enabled mods' tracks into the disk cache whenever the enabled mods
-    // change, so the track select doesn't convert them when it opens. The first call starts it; later calls do nothing.
-    void prepare_in_background();
+    // Converts the enabled mods' tracks into the disk cache (those not there yet) and keeps their menu art and file
+    // hashes in memory, so the track select and the race read none of the mods' files. Any thread: src/prewarm.cpp runs
+    // it at launch and again whenever signature() changes.
+    void prepare();
+    // Changes when the enabled mods (or their files' paths) do.
+    std::string signature();
+    // Reads track `index`'s cache entries into memory now, for the race about to load it (src/prewarm.cpp, from the
+    // car select). Does nothing for a track prepare hasn't read.
+    void preload(int index);
 
     // Has the textures of the tracks load and menu_art have seen (the enabled ones) drawn full size in place of their
     // stand-ins (rush2::derive::set_mod_textures, source "tracks"). Does nothing when that set hasn't changed. load

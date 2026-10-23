@@ -1003,7 +1003,7 @@ ref = "docs/functions/rush2_globals.md#rush-2-global-variables"
 vram = 0x80023064
 name = "start_game_row"
 type = "u16"
-desc = "Menu state halfword written by many menu screens; read by options, start game, name entry. (low confidence) | The Start Game menu's row (func_803B12C8: One Race, Circuit, Practice, Ghost Race, Stunt, ...); online joiners take the host's."
+desc = "The front end's current menu row, shared by its screens: going to a deeper screen pushes it onto the row stack (depth 0x80023066, rows 0x80023068) and zeroes it. The Start Game menu's row (func_803B12C8: One Race, Circuit, Practice, Ghost Race, Stunt, ...), which it keeps on its first frame (it only clears the stack depth) and reads A/START that same frame; online joiners take the host's."
 area = "menu"
 status = "verified"
 ref = "docs/online.md#the-lobby"
@@ -1012,10 +1012,10 @@ ref = "docs/online.md#the-lobby"
 vram = 0x80023066
 name = "menu_state_u16_b"
 type = "u16"
-desc = "Menu state halfword written/read by many menu screens and race_reset_hud_and_globals. (low confidence)"
+desc = "Depth of the front end's menu row stack (rows at 0x80023068, s16 each): a screen going deeper pushes start_game_row 0x80023064; Start Game's first frame clears it. Also written by race_reset_hud_and_globals."
 area = "menu"
-status = "inferred"
-ref = "docs/functions/rush2_globals.md#rush-2-global-variables"
+status = "verified"
+ref = "docs/online.md#the-lobby"
 
 [[var]]
 vram = 0x80023094
@@ -4729,7 +4729,7 @@ ref = "docs/functions/rush2_globals.md#rush-2-global-variables"
 vram = 0x800D0190
 name = "race_setup_byte"
 type = "u8"
-desc = "Race setup byte set by circuit menu/settings, read by HUD, minimap, mirror and model loading."
+desc = "Mirror mode: non-zero when the race is mirrored. Render-time only: the view skips its X negation, mirror_state_update (func_800776DC, reads it at 0x80077704) swaps every model list's triangle winding, steering is negated and the minimap flipped; physics and paths stay unmirrored, so the car's left and right are the screen's right and left (src/rumble.cpp flips its sides to match)."
 area = "race"
 status = "inferred"
 ref = "docs/functions/rush2_globals.md#rush-2-global-variables"
@@ -6895,15 +6895,6 @@ status = "inferred"
 ref = "docs/functions/rush2_globals.md#rush-2-global-variables"
 
 [[var]]
-vram = 0x800D79D0
-name = "view_car_pose"
-type = "struct { u8 pad[0x24]; f32 pos[3]; u8 pad2[0x10]; }[4]"
-desc = "Per view, 0x40 bytes: +0x24 the followed car's position as cam_update_dispatch_8009D02C places its body (raised by 0x800CFD84); the ARROW update (func_80059B9C) measures its distance from it."
-area = "render"
-status = "inferred"
-ref = "docs/functions/rush2_globals.md#rush-2-global-variables"
-
-[[var]]
 vram = 0x800D7E30
 name = "hud_laps_left_state"
 type = "u32"
@@ -7453,6 +7444,15 @@ status = "verified"
 ref = "docs/npc_cars.md#drone-car-table"
 
 [[var]]
+vram = 0x800D9E90
+name = "scene_node_table"
+type = "u8[0xDAC0]"
+desc = "Scene nodes, 0x38 each (+0 flags, +4 -> matrix[9] + position[3]); 1,000 fit before 0x800E7950. Moved by us.toml to 0x80400000 (2,340 nodes, include/scene_nodes.h): unused in the recomp."
+area = "render"
+status = "verified"
+ref = "docs/custom_tracks.md#for-developers"
+
+[[var]]
 vram = 0x800D9E94
 name = "node_pose_ptrs"
 type = "void*[]"
@@ -7654,7 +7654,7 @@ ref = "docs/functions/rush2_globals.md#rush-2-global-variables"
 vram = 0x800E79D0
 name = "view_cameras"
 type = "u8[4][0x40]"
-desc = "Per view camera, 0x40 bytes: +0 rotation rows (-right, up, forward), +0x24 position. In the track select view 0 sits at (0, 20, 45) pitched 24 degrees down (docs/rush2049_research/menus.md 7.5)."
+desc = "Per view camera, 0x40 bytes: +0 rotation rows (-right, up, forward), +0x24 position, +0x30 ground polygon cache and +0x34 ground-checked position (chase modes 2 and 3). cam_update_dispatch_8009D02C writes it each frame (first the followed car's position raised by 0x800CFD84, then the mode's camera); view setup, visibility, sky, sound and the ARROW size (func_80059B9C) read it; LOOK BACK turns it around (docs/camera.md). In the track select view 0 sits at (0, 20, 45) pitched 24 degrees down (docs/rush2049_research/menus.md 7.5)."
 area = "render"
 status = "inferred"
 ref = "docs/rush2049_research/menus.md#75-in-the-port-the-track-select-preview"
@@ -8014,7 +8014,7 @@ ref = "docs/functions/rush2_globals.md#rush-2-global-variables"
 vram = 0x800E7BB0
 name = "race_attract_mode"
 type = "u8"
-desc = "Byte set by attract run and race reset; read by cameras, placement, car preload and race setup (attract/demo flag)."
+desc = "Byte set by attract run and race reset; read by cameras, placement, car preload and race setup (attract/demo flag). | Set to 1 with race_game_mode_800FAE6C when the attract demo starts (0x800AB9BC) and cleared by race_reset_hud_and_globals_8009FD68 (0x8009FDB0), so in the attract demo race cam_set_chase_mode_8009B480 gives the high 12 / 30 chase camera."
 area = "race"
 status = "inferred"
 ref = "docs/functions/rush2_globals.md#rush-2-global-variables"
@@ -8236,11 +8236,29 @@ status = "inferred"
 ref = "docs/functions/rush2_globals.md#rush-2-global-variables"
 
 [[var]]
+vram = 0x800E7C78
+name = "view_billboard_basis"
+type = "f32[16]"
+desc = "Yaw-only 4x4 rotation for camera-facing cards, written per view by view_billboard_basis_8007BF2C (from view_fog_setup) from the look-at matrix 0x800E7CC8: rows (-b, 0, a), (0, 1, 0), (-a, 0, -b) with (a, b) its +0x8, +0x28 normalized; taken by columns (Mtx row r = its column r, gfx_build_node_matrix_cols_8007B290) it shows a model's -z side to the camera. Read by scene_walk for nodes with flag 0x8000 and by src/interpolation.cpp for the California Speed billboard trees (segment 0x0D)."
+area = "render"
+status = "inferred"
+ref = "docs/functions/rush2_globals.md#rush-2-global-variables"
+
+[[var]]
 vram = 0x800E7CB8
 name = "stunt_scoring_out"
 type = "u32"
 desc = "Word written by car_stunt_scoring_update, never read (low confidence)."
 area = "car"
+status = "inferred"
+ref = "docs/functions/rush2_globals.md#rush-2-global-variables"
+
+[[var]]
+vram = 0x800E7CC8
+name = "view_lookat_matrix"
+type = "f32[16]"
+desc = "The current view's camera look-at matrix (4x4, row stride 0x10); +0x8 and +0x28 (column 2's x and z) are the horizontal direction view_billboard_basis_8007BF2C turns cards to."
+area = "render"
 status = "inferred"
 ref = "docs/functions/rush2_globals.md#rush-2-global-variables"
 
@@ -9903,8 +9921,8 @@ ref = "docs/functions/rush2_globals.md#rush-2-global-variables"
 [[var]]
 vram = 0x8010BCE8
 name = "race_path_time_param"
-type = "u16"
-desc = "Halfword set by path load and race_time_from_lanes, read by race start timer and total time compute (low confidence)."
+type = "s16"
+desc = "Path header copy +0 (header at 0x8010BCE8, checkpoints from +0xC): the race's start time in seconds, set by path load and the time from the AI lanes (func_80093048 at 0x80093298, where src/rush2049/track2049.cpp path_race_time puts custom and 2049 tracks' times and the BATTLE row adds half again). Online play syncs the whole header copy (src/online/online_game.cpp race_globals)."
 area = "race"
 status = "inferred"
 ref = "docs/functions/rush2_globals.md#rush-2-global-variables"
@@ -13576,7 +13594,7 @@ ref = "docs/functions/rush2_globals.md#rush-2-global-variables"
 vram = 0x80119848
 name = "options_setting_b"
 type = "u8"
-desc = "Mirror mode: non-zero when the race is mirrored. The model lists' triangle winding is swapped to match (func_800776DC) and the conditional display list op tests it (geometry.md 4.1 condition 3/4)."
+desc = "Backward: non-zero when the race runs backward. Selects the backward AI path (+12), record slot and FINISHB, and sets the model loader's conditional display list bits (model_container_load 0x80077D34: 0x08 forward, 0x10 backward; geometry.md 4.1 condition 3/4). Not mirror mode, which is 0x800D0190."
 area = "menu"
 status = "inferred"
 ref = "docs/functions/rush2_globals.md#rush-2-global-variables"

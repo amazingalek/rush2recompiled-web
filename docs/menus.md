@@ -29,7 +29,7 @@ runs a screen through its jump table.
 | Screen | What |
 | --- | --- |
 | 0 | Start Game (the race-type menu, below) |
-| 1 | Select Player (the profile list; A picks one, then the track select). The list is JUST PLAY, CREATE PLAYER, then the saved players, with the cursor on the first saved player, so test runs press up twice: `8:START,11:A,12.5:DU,13.2:DU,14:A` reaches the track select as JUST PLAY. |
+| 1 | Select Player (the profile list; A picks one, then the track select). The list is JUST PLAY, CREATE PLAYER, then the saved players, with the cursor on the first saved player, so test runs press up twice: `8:START,11:A,12.5:DU,13.2:DU,14:A` reaches the track select as JUST PLAY. With no saved players (a fresh RUSH2_DATA_DIR) the cursor is on CREATE PLAYER: one up. A circuit then opens the circuit menu (CONTINUE CIRCUIT, ENTER CODE, NEW CIRCUIT, CIRCUIT REVIEW) with the cursor on ENTER CODE when no circuit is in progress, so a sim run starts a new circuit with `14:START,18:DD,19:A,22:DU,23:A,26:DD,27:A` and is on race 1's track select by 31 s. |
 | 0xD | Controller Pak manager: never shown, any switch to it is redirected (docs/game_fixes.md#no-controller-pak-manager) |
 | 0xE | Boot logos (then the title) |
 | 0x10 | Title screen (START goes on to Start Game) |
@@ -67,9 +67,18 @@ row's index, never a fixed number.
 
 - Track select (state 1): the carousel's shown entry s16 0x803D05B4, entry count s16 0x803D05AE; the option rows'
   cursor s32 0x803D05BC, top row on screen 0x803D05C4, row count 0x803D05CC. A confirms the track and goes on to the
-  car select. `RUSH2_TEST_TRACK=ID` opens it on a track.
+  car select. `RUSH2_TEST_TRACK=ID` opens it on a track. The save's game filter can hide that track (the screen then
+  opens on the first track it shows): `RUSH2_TEST_NO_FILTER=1` ignores the filter for the run without touching the
+  save. TRACK left / right walks the carousel, which lists the tracks in display order (custom tracks can sit after
+  another game's, docs/custom_tracks.md#where-it-is-listed). `RUSH2_TEST_ARCADE_INSTALL=1` runs the Games tab's Rush
+  2049 Arcade Build and Install at launch (docs/arcade2049.md#building-it-in-the-game).
 - Car select (state 2): A on the last row picks the car; with every player done the race starts. B goes back to the
-  track select.
+  track select. Rows on an N64 2049 car (RUSH2_TEST_CAR=24, the 8-Ball): CAR, STYLE, TRANSMISSION, MAIN, ACCENT,
+  TERTIARY COLOR, RIMS, HORN, ENGINE (8 DD), TORQUE, SUSPENSION, TIRES (11 DD), WINGS, DURABILITY; the rows follow the
+  car and its STYLE, so changing STYLE on the way down moves the rest. Space DD presses 1 s apart: presses 0.5 s apart
+  are partly dropped. `tools/test_race.py menus --config cheats.unlock_all_parts=true --env RUSH2_TEST_TRACK=0 --env
+  RUSH2_TEST_CAR=24 --script "8:START,11:A,13.5:A,17:A,..." --shots ...` reaches it at 17 s as JUST PLAY in its own
+  data folder.
 
 ### Game filter
 
@@ -108,15 +117,36 @@ How a select is rebuilt after a change, as the game rebuilds it between visits:
   the menus read only enabled ports' presses (menu buttons 0x8011962A pressed, 0x80125A68 repeat). Online the
   records have no port, so leaving the race turns the menus' ports back on (docs/online.md#race-end).
 
+## Controller Setup screen
+
+menu_screen_controller_setup_800AD7E4 runs it, menu_controller_setup_rows_text_800B6134 prints its text; src/controls_menu.cpp
+runs and draws it. Its rows are the game's nine, then LOOK BACK (Gameplay option Look Back), WINGS (Games option Wings)
+and FIRE / DROP WEAPON (Rush 2049 tracks available): 9 to 13, latched when the screen opens.
+
+- Reaching it: main menu `START`, `DU` (SETUP, the last row), `A`, `DD`, `A`, about 4 s after the front end is up
+  (`tools/test_race.py menus --script "13:START:0.3,16:DU:0.3,17.5:A:0.3,19:DD:0.3,20:A:0.3"`, up at 22 s); pause menu
+  `START`, `DD`, `DD`, `A` once the race runs (`tools/test_race.py 0 --cars 7,7 --script
+  "20:START:0.3,21.5:DD:0.3,22.5:DD:0.3,23.5:A:0.3"`, up at 25 s). `--games wings=false --games rush2049_tracks=false`
+  and `--config general.look_back=false` give the shorter lists.
+- Layout (`layout()`): in the pause menu each player's box (hud_multi_widget_menu_setup_80093B38, the game's y 20-220,
+  hooked at 0x800AD910 / 0x800AD948) is sized to the rows and centered: title 6 below its top (hook at 0x800B6470), the
+  first row 16 under the title, the footer one spacing under the last row, the box's bottom 6 under the footer; the
+  spacing is the game's 17 or less so the box fits the 2D clip (y 10-230). In the main menu the frame images are fixed
+  (header y 10-42, footer plates y 212-229, their bars through the middle): the rows and footer are centered between
+  them, 17 apart or less. Rows under 15 apart draw the button icons 12 pixels tall instead of 14.
+
 ## Starting a race without the menus
 
 A test that only needs a race shouldn't script the menus at all: `RUSH2_TEST_RACE=<track select id or custom track
 folder>` (src/test_race.cpp) sets the race up on the first frame the title screen is up and starts it, so the race is
 loading about 5 s after launch (through the menus it took about 25 s). `tools/test_race.py TRACK --cars T,T` runs one
 hidden and silent from a data folder of its own and reports when it loaded, each player's car type and how far it
-drove; read its docstring for the options.
+drove; read its docstring for the options. `tools/test_race.py menus --script S` runs the same sandbox with no race set
+up, for a script through the real menus (it starts as JUST PLAY: the folder has no saved players).
 
-- `RUSH2_TEST_RACE_CARS=T[,T...]`: one car type per player, 1 to 4 players (split screen). Without it one player, in
+- `RUSH2_TEST_RACE_CARS=T[,T...]`: one car type per player, 1 to 4 players (split screen). View p follows car p
+  (`view_cars` 0x80240380, as online sets them): left unset, view 0 kept another car and split screen's first view
+  watched it from far off. Without it one player, in
   `RUSH2_TEST_CAR`'s car or the Pickup (0). `RUSH2_TEST_RACE_LAPS`, `RUSH2_TEST_RACE_DRONES`: the track select's LAPS
   and DRONES (0x800D5760 +0 and +1, raw counts); otherwise the saved ones. `RUSH2_TEST_RACE_BATTLE=1`: the race
   select's BATTLE row on (not saved; docs/rush2049_research/battle.md section 7.2). `RUSH2_TEST_MANUAL`, `RUSH2_TEST_DEATHS`
@@ -141,7 +171,9 @@ front end as after any race.
 `--input-script "<seconds>:<button>[:<hold seconds>],..."` presses N64 buttons (A B Z START DU DD DL DR L R CU CD CL
 CR; SL SR the stick) at times counted from that game's own launch. A press lasts 0.15 s unless given; use 0.3 s or
 more for the pause menu. The scripted presses skip the controller path (port claim, bindings): to test that, use
-`RUSH2_TEST_VPAD` (src/input.cpp).
+`RUSH2_TEST_VPAD` (src/input.cpp; SL SR SU SD are its left stick). It also works in `tools/test_race.py` runs, which
+otherwise ignore controllers, but a stick never claims a port, so press a button first (`2:LS,3:SU:10`). Bindings for
+the run go in with `--config 'players.bindings={"players":[{"controller":{"gas":{"axis":"-lefty"}}}]}'`.
 
 A recipe that reaches an online race through every menu (tools/online_test.py, the joiner launched 42 s after the
 host; `RUSH2_ONLINE_PORT` keeps it off a lobby already open on this machine):
@@ -158,12 +190,13 @@ boot logos.
 
 ## Launcher on a first boot
 
-`tools/first_boot_test.py OUT_DIR` runs the whole check (picker, cancel, a wrong file's error box, the ROM, Start Game).
+`tools/first_boot_test.py OUT_DIR` runs the whole check (picker, cancel, a wrong file's error box, the ROM, then the game).
 To test the launcher's Locate ROM (the first-boot screen) without touching the player's data, run in a simulation's own
 data folder with the ROM import skipped: `RUSH2_SIM=1 RUSH2_SIM_TURBO=0 RUSH2_SIM_SHOW=1 RUSH2_TEST_FIRST_BOOT=1
 RUSH2_DATA_DIR=<empty tmp folder>`. The launcher shows Locate ROM focused, so a posted ENTER opens the file picker.
 On Windows the picker and the error boxes are `#32770` windows owned by the game window (the picker titled `Open`);
 set its `Edit` child's text to a path and post IDOK to pick, IDCANCEL to cancel. Picking the ROM stores it in that
-folder and the row turns to Start Game. Posted mouse clicks don't reach the UI, and ENTER doesn't press the Games
+folder and the launcher goes straight on to the launch build pass and the game (`launcher_update` checks the stored
+ROMs again once the file is there; the launcher never offers Start Game, docs/prewarm.md#what-is-built). Posted mouse clicks don't reach the UI, and ENTER doesn't press the Games
 tab's Select ROM buttons; the launcher route is the one that works. The picker logs `[file picker]` lines
 (lib/RecompFrontend/recompui/src/util/file.cpp).

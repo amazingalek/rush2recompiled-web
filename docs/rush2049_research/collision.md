@@ -101,6 +101,10 @@ Custom tracks can carry segments (docs/custom_tracks.md, "Spline road"); the arc
 | +0xC | u16 child[4] |
 
 - **Quadrant:** q = (x ≥ midX) + 2·(z < midZ) (`func_8006CD60`, `func_800AC9BC`).
+- **Outside the root:** `func_8006CE28` climbs parents until the cell is inside a node's box (min inclusive, max
+  exclusive) and returns 0 when even the root's box doesn't hold it, so a point outside the root gets no floor and no
+  walls. The descent splits on each node's box but never checks it: a node's edge quadrants take the points of its
+  parent's quadrant past its box.
 - **Child mask:**
   - Bit q set → child[q] is a node index. Index 0 = null quadrant (no collision).
   - Bit q clear → child[q] is a byte offset into LEAF (0 = empty).
@@ -132,7 +136,7 @@ Rush 2's four (`func_8006CF00`, `func_8006F704`, `func_8006FC94`, `func_8008BDC0
 
 **Port** (src/rush2049/track2049_collision.cpp, hooks in us.toml):
 - The converter keeps 2049's tree unchanged and tags the file: root NODE +2 (unread by both games) = 0x80 | the leaf
-  section size's bits 16–22, and the mask keeps bit 4 + q where a leaf offset passes 16 bits. The header's u16 leaf size
+  section size's bits 16–20, and the mask keeps bit 4 + q where a leaf offset passes 16 bits. The header's u16 leaf size
   holds the low 16 bits.
 - On a tagged file only (Rush 2's, SF Rush's and custom tracks keep Rush 2's walk):
   - `func_800814B0` at 0x80081550: the leaf section size gets its upper bits back, so the vertex lists are found.
@@ -145,9 +149,38 @@ Rush 2's four (`func_8006CF00`, `func_8006F704`, `func_8006FC94`, `func_8008BDC0
   tick and logs the difference. Track 6: 956 894 probes, 727 floors found only with 2049's walk, none lost. Track 3
   (17-bit offsets): 444 found, 6 that 2049's leaf answers with a surface nearer in height (its leaf lists the floor:
   checked offline).
+- Root byte +2 bits: 0x80 the 2049 form, with the leaf size's bits 16-20 in bits 0-4 (2 MB; until 2026-10-19 bits
+  16-22 in 0-6, no file used past bit 0); 0x40 California Speed's extended scenery; 0x20 wide leaf entries (above).
+- California Speed's tracks with their extended scenery (docs/calspeed_research.md#extended-scenery) tag the root
+  with bit 6 instead (0x40) and keep Rush 2's walk; on such a file the same fetches read a node mask bit 4 + q as "the
+  child is an index into the far-leaf table" (u32 leaf offsets after the vertex lists).
+- **0x80 | 0x40, port only:** a custom track whose leaves pass 128 KB (the arcade Presidio), beyond the tagged form's
+  17-bit offsets, sets both bits. A leaf child's 16-bit field is then an index k into u32 leaf offsets stored backward
+  at the end of the leaf section (entry k at end − 4(k + 1)); the converter indexes every leaf child of such a file.
+  `leaf_offset` in `src/rush2049/track2049_collision.cpp` reads it (the leaf section pointer at 0x8011187C, the u16
+  size at header +8 with the tag's bits 16-20); `rush2::collision::far_leaf_tag`, `collision.py` `TAG_FAR`.
 - Leaves stay at most 29 polygons (file 139), inside the queries' u16[36] stack buffers (`func_8006FC94` has 40).
-- Custom tracks (`src/track_mod/track_mod_convert.cpp`) cap leaves at 36 for the same buffers; up to 255 crashed the
-  stock Alcatraz export in `func_8006FC94`'s query (docs/custom_tracks.md).
+- Custom tracks (`src/track_mod/track_mod_convert.cpp`) capped leaves at 36 for the same buffers until 2026-10-20 (up
+  to 255 crashed the stock Alcatraz export in `func_8006FC94`'s query); the buffers are now moved (below) and leaves go
+  to 255, the u8 count's limit.
+
+### Leaf list buffers (port only) **[V]**
+The four queries copy a leaf into a list on their own stack: `collision_query_8006CF00` u16[36] at sp+0x94,
+`func_8006F704` u16[36] at sp+0xA4, `car_wall_collision_query_8006FC94` u16[40] at sp+0xF4, `func_8008BDC0` u16[36]
+at sp+0x108. Nothing checks the count. Hooks in us.toml (`rush2_collision_leaf_list(ctx, reg, offset, query)`, before
+each query's call to `collision_leaf_read_8006CCEC` and before the loop that reads the list back) point the register
+holding the list at a 0x200-byte list per query in RDRAM at 0x80E1EA00 + query·0x200 (`rush2::collision::leaf_lists`,
+0x80E1EA00-0x80E1F200), only while it still equals sp + offset:
+
+| Query | Copy hook (register) | Read hook (register) |
+|---|---|---|
+| 0 `func_8006CF00` | 0x8006D000 ($a1) | 0x8006D034 ($a3) |
+| 1 `func_8006F704` | 0x8006F828 ($a1) | 0x8006F874 ($v1) |
+| 2 `func_8006FC94` | 0x8006FD9C ($a1) | 0x8006FDDC ($fp) |
+| 3 `func_8008BDC0` | 0x8008BFA0 ($a1) | 0x8008BFE0 ($s5, a loop label) |
+
+The ghost-car leaf filters read the moved lists through `rush2_collision_leaf_list_at(query)`. Every track, stock
+included, takes the moved lists; the stock ones never pass 34 polygons, so a stock race reads the same polygons.
 
 ### POLY, 0x18 bytes **[V layout]**
 
@@ -183,7 +216,19 @@ Rush 2's four (`func_8006CF00`, `func_8006F704`, `func_8006FC94`, `func_8008BDC0
 ### LEAF lists **[V]**
 - **Encoding:** u8 count, then u16 entries (bits 15–13 = extra run, 12–0 = first poly index), so at most 8191
   polygons.
-- **Readers:** `func_8006CCEC` (Rush 2) and `func_800ADCE0` (2049) are instruction-identical.
+- **Readers:** `func_8006CCEC` (Rush 2) and `func_800ADCE0` (2049) are instruction-identical. Rush 2's
+  (`collision_leaf_read_8006CCEC`) takes $a0 = the count (the caller reads the byte), $a1 = the query's u16 list,
+  $a2 = the entries, $t0 = the polygon to put first (the car's last one): that one is stored from the front, the rest
+  from the back of the list's `count` slots.
+- **Wide entries (port only):** a custom track past 8,191 polygons (`src/track_mod/track_mod_convert.cpp`) writes each
+  entry as a plain u16 polygon number, no runs, and sets bit 5 (0x20) of the root NODE's byte +2
+  (`rush2::collision::wide_leaf_tag`). A hook at the reader's entry (`rush2_collision_leaf_read_wide`,
+  `src/rush2049/track2049_collision.cpp`) reads them, keeping the same order and registers; every other file takes
+  Rush 2's code. Polygon numbers past 8,191 are safe elsewhere: the header count, the queries' lists and the vertex
+  lists are all read unsigned (`collision_file_load_800814B0` lhu, `collision_poly_point_test_8006C670` byte pairs).
+  The limit is then the header's u16 vertex count. `collision.py` `decode_leaf(wide=True)` and the parse follow the
+  bit. A vertex number from 0xC000 is safe as a polygon's first vertex-list entry (read as u16 before any run
+  marker), which is all the custom converter writes.
 - **Layout:** byte 0 of the section is a pad, so offset 0 can mean "empty". Lists are unique and stored in node order.
 
 ### MOVER, 0x20 bytes, 2049 only: moving collision **[V]**

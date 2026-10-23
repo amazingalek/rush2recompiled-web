@@ -13,8 +13,9 @@
 // showed if it is still offered; the car select keeps each player's car, as it opens on the record's car.
 //
 // The filter applies where the prompt can show: not on a circuit's track select (its TRACK row is greyed), an online
-// lobby's selects (each machine shows the host's track), the ghost race's car select (its ghost panel takes the C
-// buttons), or the unlock system's shop. A filter that would leave a select empty is ignored there.
+// joiner's track select (it offers the host's select's tracks, so the host's filter applies there:
+// rush2::track2049::set_online_offered), the online lobby's car select, the ghost race's car select (its ghost panel
+// takes the C buttons), or the unlock system's shop. A filter that would leave a select empty is ignored there.
 
 // As in src/rush2049/wings.cpp: librecomp's nlohmann::json first.
 #include "../lib/N64ModernRuntime/thirdparty/json/json.hpp"
@@ -24,6 +25,7 @@
 #include <atomic>
 #include <bit>
 #include <chrono>
+#include <cstdlib>
 #include <string>
 #include <vector>
 
@@ -304,7 +306,9 @@ void rush2::game_filter::apply(bool on) {
 }
 
 bool rush2::game_filter::enabled() {
-    return option_on.load();
+    // Test aid: RUSH2_TEST_NO_FILTER=1 shows every game, whatever the save's filter (test runs never change the save).
+    static const bool test_off = [] { const char* v = std::getenv("RUSH2_TEST_NO_FILTER"); return v && *v == '1'; }();
+    return option_on.load() && !test_off;
 }
 
 Game rush2::game_filter::track_game(int t) {

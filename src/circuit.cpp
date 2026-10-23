@@ -14,13 +14,13 @@
 // The places of each race are kept in 3 bits a race (11 bytes a car), room for 29; the standings loops already stop at
 // the races finished. Rush 2's circuit codes (func_800B2BCC) still hold 28-race circuits.
 //
-// The courses a circuit picks from are chosen per track (Rush 2's 0-6, Rush 2049's 12-17, SF Rush's 18-24, California
-// Speed's 64-79); the
+// The courses a circuit picks from are chosen per track (Rush 2's 0-6, CRASH 8 and PIPE 9, Rush 2049's 12-17, SF Rush's
+// 18-24, California Speed's 64-79; CRASH and PIPE start off, as Rush 2's circuits never have them); the
 // generator hook (rush2_track49_circuit, src/rush2049/track2049_menu.cpp) draws from the chosen ones that are
 // available. A circuit keeps the length and courses it started with: the start (end of func_800B2A58) records them
 // against its seed in the saves file's "circuits" section. A circuit with no record (started before this setting
-// existed, or entered as a code) is 28 races over every course but California Speed's (added later: a circuit in
-// progress keeps its races).
+// existed, or entered as a code) is 28 races over every course but California Speed's, CRASH and PIPE (added later: a
+// circuit in progress keeps its races).
 //
 // Custom tracks (src/track_mod/, track select ids 38-63) are chosen by their folder, since their ids follow the enabled
 // mods: the choices keep the folders turned off (so a newly installed track is in), and a circuit records the folders it
@@ -78,17 +78,27 @@ namespace {
         int first;
         int count;
     };
+    // Rush 2's: tracks 0-6, CRASH (8) and PIPE (9); HALFPIPE (7) is a stunt bowl, never a course.
+    constexpr int halfpipe_track = 7;
+    constexpr int crash_track = 8;
+    constexpr int pipe_track = 9;
     constexpr Game games[] = {
-        { "Rush 2", 0, 7 },
+        { "Rush 2", 0, 10 },
         { "Rush 2049", rush2::track2049::first_menu_id, rush2::track2049::track_count },
         { "SF Rush", rush2::track1::first_menu_id, rush2::track1::track_count },
         { "California Speed", rush2::calspeed::first_menu_id, rush2::calspeed::track_count },
     };
     // Rush 2's full track names (0x800C4C40).
-    const char* const rush2_names[7] = { "Las Vegas", "Lower Manhattan", "Honolulu", "Upper Manhattan", "Alcatraz",
-                                         "Los Angeles", "Seattle" };
+    const char* const rush2_names[10] = { "Las Vegas", "Lower Manhattan", "Honolulu", "Upper Manhattan", "Alcatraz",
+                                          "Los Angeles", "Seattle", "Halfpipe", "Crash", "Pipe" };
+
+    // Courses a circuit leaves out until they're turned on.
+    bool off_by_default(int t) {
+        return t == crash_track || t == pipe_track;
+    }
 
     bool is_course(int t) {
+        if (t == halfpipe_track) return false;
         for (const Game& g : games) {
             if (t >= g.first && t < g.first + g.count) return true;
         }
@@ -96,7 +106,7 @@ namespace {
     }
 
     std::string course_name(int t) {
-        if (t < 7) return rush2_names[t];
+        if (t < 10) return rush2_names[t];
         if (t < rush2::track1::first_menu_id) return rush2::track2049::track_names[t - rush2::track2049::first_menu_id];
         if (t >= rush2::calspeed::first_menu_id) return rush2::calspeed::track_names[t - rush2::calspeed::first_menu_id];
         return rush2::track1::track_names[t - rush2::track1::first_menu_id];
@@ -119,10 +129,12 @@ namespace {
     };
 
     // What a circuit was started with, and the car player 1 raced each race in (by race index).
-    // A circuit with no record: every course a circuit could pick before California Speed's were added.
+    // A circuit with no record: every course a circuit could pick before California Speed's, CRASH and PIPE were added.
     std::bitset<course_ids> before_calspeed() {
         std::bitset<course_ids> b;
-        for (int t = 0; t < rush2::calspeed::first_menu_id; t++) b.set(size_t(t));
+        for (int t = 0; t < rush2::calspeed::first_menu_id; t++) {
+            if (!off_by_default(t)) b.set(size_t(t));
+        }
         return b;
     }
 
@@ -132,6 +144,7 @@ namespace {
         std::bitset<course_ids> courses = before_calspeed();  // bit t: track t
         std::set<std::string> mods;    // custom tracks by folder
         std::map<int, Car> cars;
+        int battle = -1;    // the race select's BATTLE row for this circuit, -1 not set yet (rush2::circuit::race_battle)
     };
 
     constexpr const char* saves_section = "circuits";
@@ -174,6 +187,7 @@ namespace {
                                                 c[5].get<int>(), c[6].get<int>() };
                 }
             }
+            if (e.contains("battle") && e["battle"].is_number_integer()) s.battle = e["battle"].get<int>() != 0 ? 1 : 0;
             setups.push_back(s);
         }
     }
@@ -190,9 +204,11 @@ namespace {
             for (const auto& [race, c] : s.cars) {
                 cars.push_back({ race, c.type, c.main, c.accent, c.stripe, c.stripe_color, c.rim });
             }
-            list.push_back({ { "seed", s.seed }, { "races", s.length }, { "courses", courses },
-                             { "mods", nlohmann::json(std::vector<std::string>(s.mods.begin(), s.mods.end())) },
-                             { "cars", cars } });
+            nlohmann::json e = { { "seed", s.seed }, { "races", s.length }, { "courses", courses },
+                                 { "mods", nlohmann::json(std::vector<std::string>(s.mods.begin(), s.mods.end())) },
+                                 { "cars", cars } };
+            if (s.battle >= 0) e["battle"] = s.battle;   // older records have none: set at the next track select
+            list.push_back(e);
         }
         rush2::data_files::write(rush2::data_files::File::Saves, saves_section,
             nlohmann::json{ { "version", 1 }, { "list", list } }.dump());
@@ -210,6 +226,20 @@ namespace {
             if (s.seed == seed) found = s;
         }
         return found;
+    }
+
+    // The current circuit's record to change (the circuit block must be set), added when it has none: such a circuit
+    // (older, or from a code) is Rush 2's, 28 races over every course. Hold setups_mutex.
+    Setup& setup_of(uint8_t* rdram) {
+        uint32_t block = (uint32_t)MEM_W(0, (int32_t)circuit_block);
+        uint32_t seed = (uint32_t)MEM_W(block_seed, (int32_t)block);
+        load_setups();
+        for (Setup& s : setups) {
+            if (s.seed == seed) return s;
+        }
+        setups.push_back(Setup{ seed });
+        while (setups.size() > setups_kept) setups.pop_front();
+        return setups.back();
     }
 
     int finished(uint8_t* rdram) {
@@ -271,9 +301,9 @@ bool rush2::circuit::course_chosen(uint8_t* rdram, int t) {
 void rush2::circuit::init_config() {
     circuit_config.add_number_option(length_id, "Circuit Length", "", 1, stock_length, 1, 0, false, stock_length, true);
     for (int t = 0; t < course_ids; t++) {
-        next_courses[t].store(true);
+        next_courses[t].store(!off_by_default(t));
         if (is_course(t)) {
-            circuit_config.add_bool_option(option_id(t), course_name(t), "", true, true);
+            circuit_config.add_bool_option(option_id(t), course_name(t), "", !off_by_default(t), true);
         }
     }
     circuit_config.add_string_option(mods_off_id, "Custom Tracks Left Out", "", "", true);
@@ -365,6 +395,8 @@ extern "C" void rush2_circuit_races_left(uint8_t* rdram, recomp_context* ctx) {
 // no step) and the flag the option text and arrows grey from (0x803AC554-0x803AC594 -> 0x803D0608 = 0). With the option
 // on, both take the track's own tests for DIFFICULTY and DEATHS on any circuit race, a step starts from the circuit's
 // values (the menu's may have changed since, in a single race) and DIFFICULTY's is written to the block.
+// The race select's added BATTLE row (option 11, src/rush2049/track2049_menu.cpp) is the circuit's like DEATHS: kept in
+// the circuit's record (rush2::circuit::race_battle), open on the first race and, with the option on, on every race.
 extern "C" void pak_mark_dirty_8005F338(uint8_t* rdram, recomp_context* ctx);     // $a0 address, $a1 length, $t1 = 0
 
 namespace {
@@ -377,14 +409,29 @@ namespace {
     constexpr uint32_t option_rows = 0x803D05D8;      // s32 [rows]: option id per row
     constexpr int option_difficulty = 7;
     constexpr int option_deaths = 10;
+    constexpr int option_battle = 11;                 // added: the race select's BATTLE row
+    constexpr uint32_t circuit_race = 0x800D3DF0;     // s8: the circuit race's index (> 0 greys DEATHS)
 
     std::atomic<bool> more_settings = false;
 
+    int cursor_option(uint8_t* rdram) {
+        int row = (int32_t)MEM_W(0, (int32_t)option_cursor);
+        return (int32_t)MEM_W(0, (int32_t)(option_rows + row * 4));
+    }
+
     bool more_settings_option(uint8_t* rdram) {
         if (!more_settings.load()) return false;
-        int row = (int32_t)MEM_W(0, (int32_t)option_cursor);
-        int option = (int32_t)MEM_W(0, (int32_t)(option_rows + row * 4));
+        int option = cursor_option(rdram);
         return option == option_difficulty || option == option_deaths;
+    }
+
+    // Whether the cursor's option skips the circuit's greying (its step is the track select's own): BATTLE as the game
+    // tests DEATHS, open on the first race, and on every race with More Circuit Settings.
+    bool open_in_circuit(uint8_t* rdram) {
+        if (cursor_option(rdram) == option_battle) {
+            return more_settings.load() || (int8_t)MEM_B(0, (int32_t)circuit_race) <= 0;
+        }
+        return more_settings_option(rdram);
     }
 
     bool in_circuit(uint8_t* rdram) {
@@ -396,14 +443,32 @@ void rush2::circuit::set_more_settings(bool enabled) {
     more_settings.store(enabled);
 }
 
+// A circuit another machine hosts online takes the host's BATTLE with its settings (src/online/online_lobby.cpp).
+int rush2::circuit::race_battle(uint8_t* rdram) {
+    if (!in_circuit(rdram) || rush2::online::game::circuit_length() > 0) return -1;
+    std::lock_guard lock{ setups_mutex };
+    return setup_of(rdram).battle;
+}
+
+bool rush2::circuit::set_race_battle(uint8_t* rdram, bool on) {
+    if (!in_circuit(rdram) || rush2::online::game::circuit_length() > 0) return false;
+    std::lock_guard lock{ setups_mutex };
+    Setup& s = setup_of(rdram);
+    if (s.battle != (on ? 1 : 0)) {
+        s.battle = on ? 1 : 0;
+        save_setups();
+    }
+    return true;
+}
+
 // func_803ABE0C at 0x803ABF3C: $a0 = whether this is a circuit, about to take the circuit's greying.
 extern "C" void rush2_circuit_more_input(uint8_t* rdram, recomp_context* ctx) {
-    if (ctx->r4 != 0 && more_settings_option(rdram)) ctx->r4 = 0;
+    if (ctx->r4 != 0 && open_in_circuit(rdram)) ctx->r4 = 0;
 }
 
 // func_803ABE0C at 0x803AC558: $v0 = whether this is not a circuit, about to take the circuit's greyed flag.
 extern "C" void rush2_circuit_more_grey(uint8_t* rdram, recomp_context* ctx) {
-    if (ctx->r2 == 0 && more_settings_option(rdram)) ctx->r2 = 1;
+    if (ctx->r2 == 0 && open_in_circuit(rdram)) ctx->r2 = 1;
 }
 
 // func_803ABE0C at 0x803AC064, about to step the cursor's option: DIFFICULTY and DEATHS step from the circuit's.
@@ -539,20 +604,8 @@ extern "C" void rush2_circuit_race_car(uint8_t* rdram, recomp_context* ctx) {
     c.stripe_color = MEM_BU(5, (int32_t)entry);
     if (c.type >= car_types) return;
     c.rim = MEM_BU(0, (int32_t)(rim_table + car_types + c.type));
-    uint32_t seed = (uint32_t)MEM_W(block_seed, (int32_t)block);
     std::lock_guard lock{ setups_mutex };
-    load_setups();
-    Setup* found = nullptr;
-    for (Setup& s : setups) {
-        if (s.seed == seed) found = &s;
-    }
-    if (found == nullptr) {
-        // A circuit with no record (older, or from a code) is Rush 2's: 28 races over every course.
-        setups.push_back(Setup{ seed });
-        while (setups.size() > setups_kept) setups.pop_front();
-        found = &setups.back();
-    }
-    found->cars[race] = c;
+    setup_of(rdram).cars[race] = c;
     save_setups();
     printf("[circuit] Race %d: car %d, paint %d/%d, stripe %d/%d, rims %d\n", race + 1, c.type, c.main, c.accent,
            c.stripe, c.stripe_color, c.rim + 1);
@@ -670,6 +723,7 @@ namespace {
     const char* const courses_description =
         "Picks the courses circuits are made from. The toggles at the top turn all of a game's courses, or all the "
         "modded courses, on or off. "
+        "Crash and Pipe start off. "
         "A course that isn't unlocked yet is skipped, and with none on, every course is used. "
         "Applies to the next circuit you start; a circuit in progress keeps its own courses.";
 
@@ -682,7 +736,7 @@ namespace {
 
     bool all_on(const Game& g) {
         for (int t = g.first; t < g.first + g.count; t++) {
-            if (!next_courses[t].load()) return false;
+            if (is_course(t) && !next_courses[t].load()) return false;
         }
         return true;
     }
@@ -732,12 +786,17 @@ namespace {
     // courses last.
     class Section : public Element {
     public:
-        Section(ResourceId rid, Element* parent, const rush2::circuit::TextShower& text_shower)
-            : Element(rid, parent, Events(EventType::Update), "div", false) {
+        Section(ResourceId rid, Element* parent, const rush2::circuit::TextShower& text_shower,
+                std::shared_ptr<rush2::ui::ExpandPanel> panel)
+            : Element(rid, parent, Events(EventType::Update), "div", false), panel(std::move(panel)) {
             ContextId context = get_current_context();
             set_display(Display::Flex);
             set_flex_direction(FlexDirection::Column);
-            set_padding(12.0f);
+            // Lined up with the option rows above it (OptionsPage's column layout).
+            set_padding_top(4.0f);
+            set_padding_bottom(4.0f);
+            set_padding_left(4.0f);
+            set_padding_right(4.0f);
             set_gap(8.0f);
             set_width(100.0f, Unit::Percent);
             set_as_navigation_container(NavigationType::Vertical);
@@ -780,13 +839,25 @@ namespace {
             Label* title = context.create_element<Label>(head, "Circuit Courses", theme::Typography::LabelMD);
             title->set_flex_grow(1.0f);
             button = context.create_element<Button>(head, expanded ? "Hide" : "Show", ButtonStyle::Secondary);
+            button->set_min_width(136.0f);  // Show and Hide the same width, so the row doesn't shift.
             button->set_flex_shrink(0.0f);
             button->add_pressed_callback([this]() {
                 expanded = !expanded;
+                if (expanded && this->panel) {
+                    this->panel->open(panel_index);
+                }
                 queue_update();
             });
+            if (this->panel) {
+                panel_index = this->panel->add([this]() {
+                    if (expanded) {
+                        expanded = false;
+                        queue_update();
+                    }
+                });
+            }
 
-            body = context.create_element<Element>(this, 0, "div", false);
+            body = context.create_element<Element>(this->panel ? this->panel->area : this, 0, "div", false);
             body->set_display(Display::Flex);
             body->set_flex_direction(FlexDirection::Column);
             body->set_gap(6.0f);
@@ -808,6 +879,8 @@ namespace {
         Button* button = nullptr;
         Element* body = nullptr;
         bool built = false;
+        std::shared_ptr<rush2::ui::ExpandPanel> panel;
+        size_t panel_index = 0;
         std::vector<std::pair<int, Toggle*>> game_toggles;  // (index in games, toggle)
         std::vector<std::pair<int, Toggle*>> course_toggles; // (track, toggle)
         std::vector<ModCourse> mods;                         // the custom tracks when built
@@ -843,7 +916,9 @@ namespace {
                 Toggle* toggle = add_toggle_line(all, std::string("All ") + games[g].name + " Courses", true,
                                                  all_on(games[g]));
                 toggle->add_checked_callback([this, g](bool on) {
-                    for (int t = games[g].first; t < games[g].first + games[g].count; t++) set_course(t, on);
+                    for (int t = games[g].first; t < games[g].first + games[g].count; t++) {
+                        if (is_course(t)) set_course(t, on);
+                    }
                     circuit_config.save_config();
                     refresh();
                 });
@@ -868,6 +943,7 @@ namespace {
                 block->set_as_navigation_container(NavigationType::Vertical);
                 context.create_element<Label>(block, games[g].name, theme::Typography::LabelSM);
                 for (int t = games[g].first; t < games[g].first + games[g].count; t++) {
+                    if (!is_course(t)) continue;
                     Toggle* toggle = add_toggle_line(block, course_name(t), false, next_courses[t].load());
                     toggle->add_checked_callback([this, t](bool on) {
                         set_course(t, on);
@@ -901,7 +977,8 @@ namespace {
     };
 }
 
-void rush2::circuit::add_section(recompui::Element* parent, const TextShower& text_shower) {
-    recompui::get_current_context().create_element<Section>(parent, text_shower);
+void rush2::circuit::add_section(recompui::Element* parent, const TextShower& text_shower,
+                                 std::shared_ptr<rush2::ui::ExpandPanel> panel) {
+    recompui::get_current_context().create_element<Section>(parent, text_shower, std::move(panel));
 }
 

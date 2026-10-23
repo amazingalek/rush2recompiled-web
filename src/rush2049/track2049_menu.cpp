@@ -4,7 +4,8 @@
 // through 0-11 and shows a carousel of dioramas built from 12-entry tables. With Rush 2049 tracks available it
 // offers ids 12-17 after them, Rush 2049's stunt arenas as ids 25-28, its obstacle course as id 29 and its battle
 // arenas DM1-DM8 as ids 30-37, with SF Rush (Rush 1) tracks available ids 18-24, then the custom tracks as 38-63 and
-// California Speed's tracks as 64-79 (src/calspeed/):
+// California Speed's tracks as 64-79 (src/calspeed/). The carousel lists them in display order (build_order: custom
+// tracks can be listed after another game's with track.toml [menu] after):
 // - The per-track tables the screen reads (diorama names 0x803C91E0, scales 0x803C9180, cloud heights 0x803C91B0,
 //   logo names 0x803C9668) and its carousel array (0x803D0698, 0x1C bytes per entry) only have room for 12. Copies
 //   with room for 128 entries live in the memory the game heap used before it moved (src/assets.cpp), and us.toml
@@ -41,9 +42,11 @@
 #include <fstream>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <random>
 #include <set>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "recomp.h"
@@ -63,6 +66,7 @@
 #include "track_mod_runtime.h"
 #include "unlocks.h"
 #include "wings.h"
+#include "scene_nodes.h"
 
 using namespace rush2::track2049;
 
@@ -85,6 +89,9 @@ namespace {
     constexpr uint32_t new_cloud_heights = table_data + 0x400;
     constexpr uint32_t new_logo_names = table_data + 0x600;
     constexpr uint32_t new_carousel = table_data + 0x800;          // 128 x 0x1C
+    constexpr uint32_t carousel_entry = 0x1C;
+    constexpr uint32_t carousel_count = 0x803D05AE;                 // s16: its entries
+    constexpr uint32_t carousel_position = 0x803D05B4;              // s16: the entry shown
     constexpr uint32_t new_circuit_instances = table_data + 0x1600; // 80 x s32, the circuit screen's dioramas
     constexpr uint32_t mod_strings = table_data + 0x1800;          // 32 bytes per custom track: its model and logo names
     constexpr uint32_t calspeed_strings = table_data + 0x1C00;     // 32 bytes per Cal Speed track: the same
@@ -201,6 +208,7 @@ namespace {
     std::vector<bool> mod_ok;
     std::vector<rush2::track_mod::MenuArt> mod_arts;
     std::string mod_signature;
+    std::atomic<bool> mods_reload = false;     // rush2::track2049::mods_changed
 
     bool is_mod_track(int t) {
         return t >= mod_menu_id && t < mod_menu_id + mod_capacity;
@@ -235,6 +243,8 @@ namespace {
 
     // The track select the Start Game menu opened (a SelectKind).
     std::atomic<int> select_kind = select_race;
+    // The row kind (StartKind) the Start Game menu last chose, -1 (None) before any: rush2::track2049::chosen_start_kind.
+    std::atomic<int> chosen_kind = -1;
 
     // The option list func_803AB294 built for this visit, before filter_options.
     std::vector<int> stock_options;
@@ -269,6 +279,14 @@ namespace {
                 (id == option_backward || (id == option_laps && rush2::calspeed::point_to_point(t - cs_first)))) {
                 continue;
             }
+            // A point-to-point custom track is raced one way over one lap, as California Speed's; a run-in one forwards.
+            if (is_mod_track(t) && (id == option_backward || id == option_laps) &&
+                rush2::track_mod::point_to_point(t - mod_menu_id)) {
+                continue;
+            }
+            if (is_mod_track(t) && id == option_backward && rush2::track_mod::run_in(t - mod_menu_id)) {
+                continue;
+            }
             MEM_W(0, (int32_t)(option_rows + n++ * 4)) = id;
         }
         MEM_W(0, (int32_t)option_count) = n;
@@ -283,6 +301,15 @@ namespace {
 
     // rush2::track2049::set_all_tracks_open: an online lobby's track select has every track this machine has.
     std::atomic<bool> all_tracks_open = false;
+    // rush2::track2049::set_online_offered: with every track open, only those the host's track select offers (its
+    // unlocks and game filter), so both carousels hold the same entries and step alike. Custom tracks go by whether
+    // the host offers any (each machine numbers its own). A set without a track of the select's kind (the host's last
+    // select was another kind) doesn't apply. offered_rebuild: the set changed while the screen was up.
+    // Guarded by menu_mutex.
+    bool online_offered_on = false;
+    std::array<bool, menu_tracks> online_offered{};
+    std::array<bool, 3> offered_kinds{};    // by SelectKind: the set has a track of that kind
+    bool offered_rebuild = false;
 
     // Whether the track select would offer track t (0-79) without the game filter: func_803AB01C's unlocks, the added
     // tracks, and the stunt and battle filter.
@@ -294,6 +321,9 @@ namespace {
         else if (t == 10) unlocked = rush2::unlocks::track_open(rdram, t, MEM_BU(0, (int32_t)atari_unlocked) != 0);
         else if (t == stunt_host_slot) unlocked = true;
         else unlocked = entry_available(t) && rush2::unlocks::track_open(rdram, t);
+        if (all_tracks_open && online_offered_on && offered_kinds[select_kind.load()] && !online_offered[t]) {
+            unlocked = false;
+        }
         return unlocked && kind_of(t) == select_kind.load();
     }
 
@@ -314,7 +344,7 @@ namespace {
     }
 
     // Notes which games' tracks the select offers and whether the filter applies to it: not to a circuit's (its TRACK
-    // row is greyed) or an online lobby's (it shows the host's track).
+    // row is greyed) or an online joiner's (it offers the host's select's tracks, filtered by the host's filter).
     void update_filter(uint8_t* rdram) {
         using namespace rush2::game_filter;
         screen_built(Screen::Tracks);
@@ -342,6 +372,7 @@ namespace {
     int selection = -1;            // Added track (id - 12) last chosen on the track select, or -1.
     int stunt_selection = -1;      // Track (11 or 25-29) last chosen on the stunt track select, or -1.
     int battle_selection = -1;     // Track (30-37) last chosen on the battle track select, or -1.
+    bool race_battle_selection = false;    // The BATTLE row out of a circuit (a circuit keeps its own: rush2::circuit).
     bool selection_loaded = false;
     std::vector<uint8_t> menu_container;
     std::shared_ptr<const rush2::rom2049::Source> menu_container_rom; // 2049 ROM the container was built with.
@@ -355,6 +386,21 @@ namespace {
     bool menu_has_mods = false;
     bool menu_has_cs = false;
     std::string menu_container_mods;      // mod_signature the container was built with
+
+    // Asset 3 with the 2049, Rush 1, custom and Cal Speed tracks' dioramas and logos, and what it holds.
+    struct MenuBuild {
+        std::shared_ptr<const rush2::rom2049::Source> rom;
+        std::shared_ptr<const std::vector<uint8_t>> rom1, rom_cs;
+        std::string mods;     // mod_signature
+        std::vector<uint8_t> container;
+        bool has_2049 = false, has_rush1 = false, has_mods = false, has_cs = false;
+    };
+
+    // The container the background builds made for the track select's next visit (prepare_menu_container), and a
+    // count of the custom tracks' file reloads, so a build from art read before one is dropped.
+    std::mutex prebuilt_mutex;
+    std::optional<MenuBuild> prebuilt;
+    int menu_reloads = 0;
 
     // The save file's section (include/data_files.h): { "selected": n, "stunt": n, "battle": n, "points": n,
     // "minutes": n, "race_battle": 0/1 }. "race_battle" is the race select's BATTLE row (rush2::battle::race_battle), off without it.
@@ -396,7 +442,18 @@ namespace {
             minutes = legacy == 3 ? rush2::battle::default_minutes : legacy;
         }
         rush2::battle::set_time_limit_minutes(minutes);
-        rush2::battle::set_race_battle(read("\"race_battle\"") == 1);
+        race_battle_selection = read("\"race_battle\"") == 1;
+        rush2::battle::set_race_battle(race_battle_selection);
+    }
+
+    // The BATTLE row's value as the track select opens: a circuit's own, which it takes from the row out of a circuit
+    // when it has none yet (it started, or was recorded before circuits kept one).
+    void apply_race_battle(uint8_t* rdram) {
+        bool on = race_battle_selection;
+        int circuit = rush2::circuit::race_battle(rdram);
+        if (circuit >= 0) on = circuit != 0;
+        else rush2::circuit::set_race_battle(rdram, on);
+        rush2::battle::set_race_battle(on);
     }
 
     void write_selection() {
@@ -405,7 +462,7 @@ namespace {
             ", \"battle\": " + std::to_string(battle_selection) +
             ", \"points\": " + std::to_string(rush2::battle::points_to_win()) +
             ", \"minutes\": " + std::to_string(rush2::battle::time_limit_minutes()) +
-            ", \"race_battle\": " + std::to_string(rush2::battle::race_battle() ? 1 : 0) + " }");
+            ", \"race_battle\": " + std::to_string(race_battle_selection ? 1 : 0) + " }");
     }
 
     void save_selection(int value) {
@@ -532,13 +589,90 @@ namespace {
         }
     }
 
+    // The order the track select lists its entries in: every id 0-79 once. Ids stay what saves and races use; only the
+    // carousel follows this order (rush2_track49_select_count, _carousel_order, _step). Custom tracks with a track.toml
+    // [menu] after are moved behind the last entry of that game on their own select (race, stunt or battle), or behind
+    // the custom track of that folder; several behind one anchor keep the mod order. The others stay at 38-63.
+    std::vector<int> display_order;
+
+    bool anchor_game(const std::string& name, rush2::game_filter::Game& out) {
+        using rush2::game_filter::Game;
+        if (name == "rush2") out = Game::Rush2;
+        else if (name == "sfrush") out = Game::SFRush;
+        else if (name == "rush2049") out = Game::Rush2049;
+        else if (name == "calspeed") out = Game::CalSpeed;
+        else return false;
+        return true;
+    }
+
+    void build_order(const std::vector<rush2::track_mod::Entry>& entries) {
+        display_order.clear();
+        for (int t = 0; t < menu_tracks; t++) display_order.push_back(t);
+        size_t n = std::min(entries.size(), size_t(mod_capacity));
+        std::vector<bool> placed(n);
+        for (size_t i = 0; i < n; i++) placed[i] = entries[i].settings.menu_after.empty();
+        std::map<int, int> behind;      // anchor -> the custom track last put behind it
+        auto place = [&](int self, int anchor) {
+            display_order.erase(std::find(display_order.begin(), display_order.end(), self));
+            int after = behind.count(anchor) ? behind[anchor] : anchor;
+            display_order.insert(std::find(display_order.begin(), display_order.end(), after) + 1, self);
+            behind[anchor] = self;
+        };
+        // An anchor on another custom track waits for that one to be placed (a loop of them stays put).
+        for (size_t pass = 0; pass <= n; pass++) {
+            for (size_t i = 0; i < n; i++) {
+                if (placed[i]) continue;
+                const std::string& after = entries[i].settings.menu_after;
+                int self = mod_menu_id + int(i);
+                rush2::game_filter::Game game;
+                int anchor = -1;
+                if (anchor_game(after, game)) {
+                    for (int t : display_order) {
+                        if (!is_mod_track(t) && rush2::game_filter::track_game(t) == game && kind_of(t) == kind_of(self)) {
+                            anchor = t;
+                        }
+                    }
+                }
+                else {
+                    size_t j = 0;
+                    while (j < n && entries[j].folder != after) j++;
+                    if (j < n && j != i && !placed[j]) continue;
+                    if (j < n && j != i) anchor = mod_menu_id + int(j);
+                }
+                placed[i] = true;
+                if (anchor < 0) {
+                    printf("[trackmod] %s: [menu] after = \"%s\" names no game (rush2, sfrush, rush2049, calspeed) or "
+                           "custom track; it stays at the end\n", entries[i].folder.c_str(), after.c_str());
+                    continue;
+                }
+                place(self, anchor);
+            }
+        }
+    }
+
+    // The tracks the carousel shows, in display order.
+    std::vector<int> shown_tracks(uint8_t* rdram) {
+        std::vector<int> shown;
+        for (int t : display_order) {
+            if (track_selectable(rdram, t)) shown.push_back(t);
+        }
+        return shown;
+    }
+
     // The enabled mods' custom tracks: converted (or read from the cache) when the enabled mods change, for their track
     // select art. A track that doesn't convert isn't offered; its report (<config>/track_reports) says why.
     void refresh_mods() {
         std::vector<rush2::track_mod::Entry> entries = rush2::track_mod::tracks();
         std::string signature;
-        for (const auto& e : entries) signature += e.mod_id + "/" + e.folder + ";";
-        if (signature == mod_signature) return;
+        for (const auto& e : entries) signature += e.mod_id + "/" + e.folder + ">" + e.settings.menu_after + ";";
+        bool reload = mods_reload.exchange(false);
+        if (signature == mod_signature && !display_order.empty() && !reload) return;
+        if (reload) {
+            menu_container_built = false;   // the art is built again from the new files
+            std::lock_guard lock{ prebuilt_mutex };
+            prebuilt.reset();
+            menu_reloads++;
+        }
         mod_signature = signature;
         mod_ok.clear();
         mod_arts.clear();
@@ -546,6 +680,7 @@ namespace {
         for (size_t i = 0; i < entries.size() && i < size_t(mod_capacity); i++) {
             mod_types.push_back(rush2::track_mod::type_of(entries[i].settings));
         }
+        build_order(entries);
         if (entries.size() > size_t(mod_capacity)) {
             printf("[trackmod] The track select has room for %d custom tracks; %zu are left out\n", mod_capacity,
                    entries.size() - size_t(mod_capacity));
@@ -566,6 +701,62 @@ namespace {
         rush2::track_mod::publish_textures();   // the dioramas' (and tracks') full-size textures
     }
 
+    // Builds it from the ROMs and the custom tracks' art (any thread: Rush 2's own asset 3 comes from the ROM).
+    MenuBuild build_menu(std::shared_ptr<const rush2::rom2049::Source> rom, std::shared_ptr<const std::vector<uint8_t>> rom1,
+                         std::shared_ptr<const std::vector<uint8_t>> rom_cs, const std::string& mods_signature,
+                         const std::vector<bool>& ok, const std::vector<rush2::track_mod::MenuArt>& arts) {
+        MenuBuild b{ rom, rom1, rom_cs, mods_signature };
+        std::vector<uint8_t> asset3, with_2049, with_rush1;
+        if (!rush2::assets::rom_original(3, asset3)) {
+            printf("[2049] Failed to read the track select art\n");
+            return b;
+        }
+        if (rom != nullptr && !build_menu_container(asset3, *rom, with_2049)) {
+            printf("[2049] Failed to build the track select art\n");
+            with_2049.clear();
+        }
+        b.has_2049 = !with_2049.empty();
+        const std::vector<uint8_t>& base = with_2049.empty() ? asset3 : with_2049;
+        if (rom1 != nullptr && rush2::track1::extend_menu_container(base, *rom1, with_rush1)) {
+            b.has_rush1 = true;
+        }
+        const std::vector<uint8_t>& base2 = b.has_rush1 ? with_rush1 : base;
+        std::vector<MenuModel> models;
+        std::vector<MenuLogo> logos;
+        for (size_t i = 0; i < ok.size() && i < arts.size(); i++) {
+            if (!ok[i]) continue;
+            const rush2::track_mod::MenuArt& art = arts[i];
+            MenuModel model{ rush2::track_mod::diorama_model_name(int(i)), art.diorama, art.diorama_list,
+                             art.diorama_pointers, std::max(art.diorama_radius, 1.0f) };
+            if (model.blob.empty()) model.blob = { 0xDF, 0, 0, 0, 0, 0, 0, 0 };   // draws nothing
+            models.push_back(std::move(model));
+            logos.push_back({ rush2::track_mod::logo_texture_name(int(i)), art.logo, art.logo_palette });
+        }
+        bool with_mods = !models.empty();
+        if (rom_cs != nullptr) {
+            std::vector<MenuModel> cs_models;
+            std::vector<MenuLogo> cs_logos;
+            if (rush2::calspeed::menu_art(*rom_cs, cs_models, cs_logos)) {
+                models.insert(models.end(), cs_models.begin(), cs_models.end());
+                logos.insert(logos.end(), cs_logos.begin(), cs_logos.end());
+            }
+        }
+        if (!models.empty() || !logos.empty()) {
+            if (extend_menu_container(base2, models, logos, b.container)) {
+                b.has_mods = with_mods;
+                b.has_cs = rom_cs != nullptr;
+            }
+            else {
+                printf("[trackmod] Couldn't add the custom and Cal Speed tracks' track select art\n");
+                b.container.clear();
+            }
+        }
+        if (b.container.empty() && (b.has_2049 || b.has_rush1)) {
+            b.container = base2;
+        }
+        return b;
+    }
+
     // Asset 3 with the 2049, Rush 1, custom and Cal Speed tracks' dioramas and logos, rebuilt when a ROM, option or mod
     // changes.
     void serve_menu_container(uint8_t* rdram) {
@@ -584,62 +775,28 @@ namespace {
             return;
         }
         if (!same) {
-            menu_container.clear();
             menu_container_rom = rom;
             menu_container_rom1 = rom1;
             menu_container_rom_cs = rom_cs;
             menu_container_mods = mod_signature;
             menu_container_built = true;
-            menu_has_2049 = menu_has_rush1 = menu_has_mods = menu_has_cs = false;
-            std::vector<uint8_t> asset3, with_2049, with_rush1;
-            if (!rush2::assets::read_original(rdram, 3, asset3)) {
-                printf("[2049] Failed to read the track select art\n");
-            }
-            else {
-                if (rom != nullptr && !build_menu_container(asset3, *rom, with_2049)) {
-                    printf("[2049] Failed to build the track select art\n");
-                    with_2049.clear();
-                }
-                menu_has_2049 = !with_2049.empty();
-                const std::vector<uint8_t>& base = with_2049.empty() ? asset3 : with_2049;
-                if (rom1 != nullptr && rush2::track1::extend_menu_container(base, *rom1, with_rush1)) {
-                    menu_has_rush1 = true;
-                }
-                const std::vector<uint8_t>& base2 = menu_has_rush1 ? with_rush1 : base;
-                std::vector<MenuModel> models;
-                std::vector<MenuLogo> logos;
-                for (size_t i = 0; i < mod_ok.size(); i++) {
-                    if (!mod_ok[i]) continue;
-                    const rush2::track_mod::MenuArt& art = mod_arts[i];
-                    MenuModel model{ rush2::track_mod::diorama_model_name(int(i)), art.diorama, art.diorama_list,
-                                     art.diorama_pointers, std::max(art.diorama_radius, 1.0f) };
-                    if (model.blob.empty()) model.blob = { 0xDF, 0, 0, 0, 0, 0, 0, 0 };   // draws nothing
-                    models.push_back(std::move(model));
-                    logos.push_back({ rush2::track_mod::logo_texture_name(int(i)), art.logo, art.logo_palette });
-                }
-                bool with_mods = !models.empty();
-                if (rom_cs != nullptr) {
-                    std::vector<MenuModel> cs_models;
-                    std::vector<MenuLogo> cs_logos;
-                    if (rush2::calspeed::menu_art(*rom_cs, cs_models, cs_logos)) {
-                        models.insert(models.end(), cs_models.begin(), cs_models.end());
-                        logos.insert(logos.end(), cs_logos.begin(), cs_logos.end());
-                    }
-                }
-                if (!models.empty() || !logos.empty()) {
-                    if (extend_menu_container(base2, models, logos, menu_container)) {
-                        menu_has_mods = with_mods;
-                        menu_has_cs = rom_cs != nullptr;
-                    }
-                    else {
-                        printf("[trackmod] Couldn't add the custom and Cal Speed tracks' track select art\n");
-                        menu_container.clear();
-                    }
-                }
-                if (menu_container.empty() && (menu_has_2049 || menu_has_rush1)) {
-                    menu_container = base2;
+            // Built ahead by the background builds (prepare_menu_container) when nothing changed since; built here
+            // only after a change they haven't caught up with.
+            std::optional<MenuBuild> ready;
+            {
+                std::lock_guard lock{ prebuilt_mutex };
+                if (prebuilt && prebuilt->rom == rom && prebuilt->rom1 == rom1 && prebuilt->rom_cs == rom_cs &&
+                    prebuilt->mods == mod_signature) {
+                    ready = std::move(prebuilt);
+                    prebuilt.reset();
                 }
             }
+            MenuBuild build = ready ? std::move(*ready) : build_menu(rom, rom1, rom_cs, mod_signature, mod_ok, mod_arts);
+            menu_container = std::move(build.container);
+            menu_has_2049 = build.has_2049;
+            menu_has_rush1 = build.has_rush1;
+            menu_has_mods = build.has_mods;
+            menu_has_cs = build.has_cs;
         }
         if (menu_container.empty()) {
             rush2::assets::restore(rdram, 3);
@@ -769,6 +926,38 @@ bool rush2::track2049::catalog_menu_container(std::vector<uint8_t>& out) {
     return !out.empty();
 }
 
+void rush2::track2049::prepare_menu_container() {
+    auto rom = available() ? rush2::wings::get_rom() : nullptr;
+    auto rom1 = rush2::track1::available() ? rush2::track1::get_rom() : nullptr;
+    auto rom_cs = rush2::calspeed::available() ? rush2::calspeed::get_rom() : nullptr;
+    std::vector<bool> ok;
+    std::vector<rush2::track_mod::MenuArt> arts;
+    std::string signature;
+    int reloads;
+    {
+        std::lock_guard lock{ menu_mutex };
+        refresh_mods();
+        bool same = menu_container_built && menu_container_rom == rom && menu_container_rom1 == rom1 &&
+                    menu_container_rom_cs == rom_cs && menu_container_mods == mod_signature;
+        if (same) return;       // the game has this one
+        ok = mod_ok;
+        arts = mod_arts;
+        signature = mod_signature;
+        std::lock_guard pre_lock{ prebuilt_mutex };
+        reloads = menu_reloads;
+    }
+    {
+        std::lock_guard lock{ prebuilt_mutex };
+        if (prebuilt && prebuilt->rom == rom && prebuilt->rom1 == rom1 && prebuilt->rom_cs == rom_cs &&
+            prebuilt->mods == signature) {
+            return;
+        }
+    }
+    MenuBuild b = build_menu(rom, rom1, rom_cs, signature, ok, arts);
+    std::lock_guard lock{ prebuilt_mutex };
+    if (reloads == menu_reloads) prebuilt = std::move(b);
+}
+
 void rush2::track2049::prepare_menu_art(uint8_t* rdram) {
     std::lock_guard lock{ menu_mutex };
     refresh_mods();
@@ -791,6 +980,7 @@ extern "C" void rush2_track49_select_init(uint8_t* rdram, recomp_context* ctx) {
     std::lock_guard lock{ menu_mutex };
     refresh_mods();     // the custom tracks' types, which say which select a saved choice belongs to
     load_selection();
+    apply_race_battle(rdram);
     set_race_track(0);
     rush2::track1::set_race_track(0);
     set_stunt_arena(0);
@@ -802,6 +992,7 @@ extern "C" void rush2_track49_select_init(uint8_t* rdram, recomp_context* ctx) {
     serve_menu_container(rdram);
     write_tables(rdram);
     update_filter(rdram);
+    offered_rebuild = false;
     int t = -1;
     if (select_kind == select_stunt) {
         // The game's choice (from the save record's nibble) is a race track, which this select doesn't offer.
@@ -852,7 +1043,13 @@ extern "C" void rush2_track49_select_init(uint8_t* rdram, recomp_context* ctx) {
 // its end); the next frame builds it again, on the track that was shown.
 extern "C" void trackselect_init_draw_803AB294(uint8_t* rdram, recomp_context* ctx);
 extern "C" int rush2_track49_filter_frame(uint8_t* rdram, recomp_context* ctx) {
-    if (!rush2::game_filter::frame(rdram, ctx, rush2::game_filter::Screen::Tracks, filter_present)) {
+    // An online joiner's carousel holds the host's offered tracks (set_online_offered): a change rebuilds it the same way.
+    bool offered_changed;
+    {
+        std::lock_guard lock{ menu_mutex };
+        offered_changed = std::exchange(offered_rebuild, false);
+    }
+    if (!offered_changed && !rush2::game_filter::frame(rdram, ctx, rush2::game_filter::Screen::Tracks, filter_present)) {
         return 0;
     }
     filter_keep_track = (int8_t)MEM_B(0, (int32_t)track_id);
@@ -872,12 +1069,49 @@ extern "C" void rush2_track49_filter_text(uint8_t* rdram, recomp_context* ctx) {
 
 // func_803AB294 at 0x803AB6C8: $t7 = the number of carousel entries (10 + unlocked PIPE and ATARI), which must be
 // the number of tracks the build loop finds selectable.
+// The position loop before it has set the carousel position (s16 0x803D05B4) to the track's place in id order; it
+// becomes its place in display order (build_order).
 extern "C" void rush2_track49_select_count(uint8_t* rdram, recomp_context* ctx) {
-    int count = 0;
-    for (int t = 0; t < menu_tracks; t++) {
-        if (track_selectable(rdram, t)) count++;
+    std::lock_guard lock{ menu_mutex };
+    std::vector<int> shown = shown_tracks(rdram);
+    ctx->r15 = int(shown.size());
+    auto at = std::find(shown.begin(), shown.end(), (int8_t)MEM_B(0, (int32_t)track_id));
+    if (at != shown.end()) MEM_H(0, (int32_t)carousel_position) = int16_t(at - shown.begin());
+}
+
+// func_803AB294 at 0x803AB878, the carousel built: its entries hold the tracks in id order, each entry's place (+0x4 -
+// +0x17) from its index. The tracks (+0x0) and their model instances (+0x18) are put in display order.
+extern "C" void rush2_track49_carousel_order(uint8_t* rdram, recomp_context* ctx) {
+    std::lock_guard lock{ menu_mutex };
+    std::vector<int> shown = shown_tracks(rdram);
+    int count = std::min<int>(MEM_H(0, (int32_t)carousel_count), int(shown.size()));
+    for (int i = 0; i < count; i++) {
+        uint32_t entry = new_carousel + i * carousel_entry;
+        for (int j = i; j < count; j++) {
+            uint32_t other = new_carousel + j * carousel_entry;
+            if (MEM_BU(0, (int32_t)other) != shown[i]) continue;
+            if (j != i) {
+                uint8_t track = MEM_BU(0, (int32_t)entry);
+                uint32_t node = (uint32_t)MEM_W(0, (int32_t)(entry + 0x18));
+                MEM_B(0, (int32_t)entry) = MEM_BU(0, (int32_t)other);
+                MEM_W(0, (int32_t)(entry + 0x18)) = MEM_W(0, (int32_t)(other + 0x18));
+                MEM_B(0, (int32_t)other) = track;
+                MEM_W(0, (int32_t)(other + 0x18)) = node;
+            }
+            break;
+        }
     }
-    ctx->r15 = count;
+}
+
+// func_803ABE0C at 0x803AC12C: TRACK left / right moved the carousel position by one (wrapped) and the track id to
+// the next selectable id ($a2, at $a3); the track is the one at the new position, in display order.
+extern "C" void rush2_track49_select_step(uint8_t* rdram, recomp_context* ctx) {
+    int count = MEM_H(0, (int32_t)carousel_count);
+    int position = MEM_H(0, (int32_t)carousel_position);
+    if (position < 0 || position >= count || count > menu_tracks) return;
+    uint8_t t = MEM_BU(0, (int32_t)(new_carousel + position * carousel_entry));
+    MEM_B(0, (int32_t)ctx->r7) = t;
+    ctx->r6 = (int8_t)t;
 }
 
 // Rush 2049's own preview for the 2049 entries (docs/rush2049_research/menus.md §7.5): the carousel instances the
@@ -892,7 +1126,7 @@ namespace {
     constexpr uint32_t camera = 0x800E79D0;       // view 0's camera: rows -right, up, forward, then +0x24 position
     constexpr uint32_t view = 0x802401F0;         // view 0's projection (func_80054A50): +0x14 tan(hfov / 2),
                                                   // +0x24 width, +0x2C/+0x30 the screen point straight ahead
-    constexpr uint32_t node_poses = 0x800D9E94;   // per scene node, 56 bytes: -> {matrix[9], position[3]}
+    constexpr uint32_t node_poses = rush2::scene_nodes::table + 4;   // per scene node, 56 bytes: -> {matrix[9], position[3]}
     constexpr uint32_t model_tables = 0x80118D78; // per model slot, 8 bytes: -> its 0x34-byte model records
     constexpr uint32_t model_slots = 0x800D5788;  // u8: loaded model slots
     constexpr uint32_t frame_seconds = 0x80023028;
@@ -1232,7 +1466,7 @@ bool rush2::track2049::menu_track_logo(uint8_t* rdram, int t, std::vector<uint8_
                rush2::calspeed::build_race_logo(logo, *rom, t - cs_first, out);
     }
     if (is_mod_track(t)) {
-        // The custom track's own logo; a race shows the host's (track_mod has no race logo).
+        // The custom track's own logo, as its race shows it (mod_race_logo).
         rush2::track_mod::MenuArt art;
         {
             std::lock_guard lock{ menu_mutex };
@@ -1243,6 +1477,20 @@ bool rush2::track2049::menu_track_logo(uint8_t* rdram, int t, std::vector<uint8_
         return set_race_logo(logo, art.logo, art.logo_palette, out);
     }
     return false;
+}
+
+// Called by the race load under track_mutex, so it doesn't take menu_mutex (the select's init holds that one while it
+// takes track_mutex); the track was just converted, so menu_art has its art without reading files. Without its art the
+// logo is left clear (as a track without a [menu] logo has it), never the host's.
+bool rush2::track2049::mod_race_logo(uint8_t* rdram, int index, int container, std::vector<uint8_t>& out) {
+    std::vector<uint8_t> logo;
+    if (index < 0 || !rush2::assets::read_original(rdram, container, logo)) return false;
+    rush2::track_mod::MenuArt art;
+    if (!rush2::track_mod::menu_art(index, art) || art.logo.size() != 128 * 32 || art.logo_palette.size() != 512) {
+        art.logo.assign(128 * 32, 255);     // index 255 clear
+        art.logo_palette.assign(512, 0);
+    }
+    return set_race_logo(logo, art.logo, art.logo_palette, out);
 }
 
 namespace {
@@ -1327,8 +1575,8 @@ extern "C" void rush2_track49_circuit_screen(uint8_t* rdram, recomp_context* ctx
 }
 
 // func_800A7DCC after it generated a circuit's races (tracks 0-6). With added tracks available, or only some courses
-// chosen for the circuit (src/circuit.cpp), the tracks are picked again from the chosen ones among Rush 2's 7 and the
-// added tracks, custom tracks included (all of them if none is chosen), with Rush 2's rules: no track twice in a row, at most 4 times in all,
+// chosen for the circuit (src/circuit.cpp), the tracks are picked again from the chosen ones among Rush 2's 7, CRASH and
+// PIPE (8 and 9, once unlocked; Rush 2's circuits never have them) and the added tracks, custom tracks included (all of them if none is chosen), with Rush 2's rules: no track twice in a row, at most 4 times in all,
 // and no track in the same direction twice.
 extern "C" void rush2_track49_circuit(uint8_t* rdram, recomp_context* ctx) {
     {
@@ -1337,6 +1585,8 @@ extern "C" void rush2_track49_circuit(uint8_t* rdram, recomp_context* ctx) {
     }
     std::vector<int> all, pool;
     for (int t = 0; t < circuit_stock_tracks; t++) all.push_back(t);
+    all.push_back(8);   // CRASH
+    if (rush2::unlocks::track_open(rdram, 9, MEM_BU(0, (int32_t)pipe_unlocked) != 0)) all.push_back(9);
     for (int t = first_menu_id; t < circuit_tracks; t++) {
         if (entry_available(t) && !is_stunt_course(t) && rush2::unlocks::track_open(rdram, t)) all.push_back(t);
     }
@@ -1374,6 +1624,15 @@ extern "C" void rush2_track49_circuit(uint8_t* rdram, recomp_context* ctx) {
         previous = t;
         MEM_B(0, (int32_t)race) = uint8_t(t);
         MEM_B(0, (int32_t)(race + 1)) = uint8_t(dir);
+    }
+    // The races, once per circuit (the generator runs on every visit to the circuit screen).
+    static std::string logged;
+    std::string races;
+    for (int i = 0; i <= last; i++) races += " " + std::to_string(MEM_B(0, (int32_t)(circuit_races + i * 4)));
+    if (races != logged) {
+        logged = races;
+        printf("[circuit] Tracks:%s\n", races.c_str());
+        std::fflush(stdout);
     }
 }
 
@@ -1592,15 +1851,19 @@ extern "C" int rush2_track49_battle_value(uint8_t* rdram, recomp_context* ctx) {
 }
 
 // func_803ABE0C at 0x803AC078: $t9 = the cursor row's option, about to be bounded for the left / right jump table;
-// $a1 = the step (-1, 1, or 0 for the default). The BATTLE row toggles (the default is off) and is saved. Returns 1
-// to go on to the case's end (0x803AC410).
+// $a1 = the step (-1, 1, or 0 for the default). The BATTLE row toggles (the default is off) and is saved: in a circuit
+// as the circuit's (rush2::circuit::race_battle; src/circuit.cpp says when a circuit lets it step). Returns 1 to go on
+// to the case's end (0x803AC410).
 extern "C" int rush2_track49_battle_step(uint8_t* rdram, recomp_context* ctx) {
     if ((int32_t)ctx->r25 != option_battle) return 0;
     bool on = (int32_t)ctx->r5 != 0 && !rush2::battle::race_battle();
     if (on != rush2::battle::race_battle()) {
         std::lock_guard lock{ menu_mutex };
         rush2::battle::set_race_battle(on);
-        write_selection();
+        if (!rush2::circuit::set_race_battle(rdram, on)) {
+            race_battle_selection = on;
+            write_selection();
+        }
     }
     return 1;
 }
@@ -1673,6 +1936,7 @@ namespace {
 // UNLOCKS takes RECORDS' (its profile list, which then opens the shop: src/unlocks_shop.cpp). GHOST RACE takes ONE RACE's: the race it starts records player 1 and races the ghost.
 extern "C" void rush2_mode_menu_choose(uint8_t* rdram, recomp_context* ctx) {
     int kind = row_kind((int32_t)ctx->r10);
+    chosen_kind = kind;
     select_kind = kind == row_stunt ? select_stunt : kind == row_battle ? select_battle : select_race;
     rush2::ghost::set_chosen(kind == row_ghost);
     rush2::unlocks::set_shop_chosen(kind == row_unlocks);
@@ -1695,6 +1959,37 @@ int rush2::track2049::start_menu_row(StartKind kind) {
 
 void rush2::track2049::set_all_tracks_open(bool on) {
     all_tracks_open = on;
+}
+
+std::vector<int> rush2::track2049::offered_tracks(uint8_t* rdram) {
+    std::lock_guard lock{ menu_mutex };
+    return shown_tracks(rdram);
+}
+
+void rush2::track2049::set_online_offered(uint8_t* rdram, const std::vector<int>& tracks) {
+    std::array<bool, menu_tracks> offered{};
+    std::array<bool, 3> kinds{};
+    bool any_mod = false;
+    for (int t : tracks) {
+        if (t < 0 || t >= menu_tracks) continue;
+        offered[t] = true;
+        any_mod |= is_mod_track(t);
+    }
+    std::lock_guard lock{ menu_mutex };
+    for (int t = 0; t < menu_tracks; t++) {
+        if (is_mod_track(t)) offered[t] = any_mod;
+        if (offered[t]) kinds[kind_of(t)] = true;
+    }
+    bool on = !tracks.empty();
+    if (on == online_offered_on && (!on || offered == online_offered)) return;
+    online_offered_on = on;
+    online_offered = offered;
+    offered_kinds = kinds;
+    offered_rebuild = offered_rebuild || MEM_W(0, (int32_t)game_state) == 1;
+}
+
+rush2::track2049::StartKind rush2::track2049::chosen_start_kind() {
+    return StartKind(chosen_kind.load());
 }
 
 std::string rush2::track2049::online_track_key(int t) {
@@ -1727,12 +2022,15 @@ std::string rush2::track2049::mod_track_name(int t) {
     return i < entries.size() ? entries[i].settings.name : std::string();
 }
 
+void rush2::track2049::mods_changed() {
+    rush2::track_mod::rescan();   // the mod's track list too: a rebuilt mod keeps its id and file name
+    mods_reload = true;
+}
+
 // The carousel array (new_carousel, 0x1C bytes per entry, +0 the track (u8); func_803AB294 builds it) and its
 // count (s16 0x803D05AE).
 int rush2::track2049::carousel_index(uint8_t* rdram, int t) {
     constexpr uint32_t carousel = new_carousel;
-    constexpr uint32_t carousel_entry = 0x1C;
-    constexpr uint32_t carousel_count = 0x803D05AE;
     int count = std::min<int>(MEM_H(0, (int32_t)carousel_count), menu_tracks);
     for (int i = 0; i < count; i++) {
         if (MEM_BU(0, (int32_t)(carousel + i * carousel_entry)) == t) return i;

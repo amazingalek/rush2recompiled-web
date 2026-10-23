@@ -8,7 +8,7 @@ finishing, wrecks, respawns and stuck spells, with where each happened on the la
 --launch starts build/Rush2Recompiled.exe with that --input-script (environment variables such as RUSH2_TEST_TRACK
 pass through), watches it, and closes that process (by its PID) at the end. --pid watches a game already running and
 leaves it alone. --path takes the race's path file (tools/track_mod_test.bat output, path.bin) so events are placed
-by spine point and lap distance. Writes DIR/samples.jsonl (every car every 0.1 s, 'wall' the seconds since launch) and DIR/events.txt, prints the
+by spine point and lap distance. Writes DIR/samples.jsonl (every car every 0.1 s, 'wall' the seconds since launch), DIR/events.txt and (--launch) DIR/pid.txt, prints the
 summary. Stops early once every computer car has finished or the game exits.
 
 --trace CAR instead logs every change of that car's wreck and drawing fields (TRACE_FIELDS: wrecked +0x648, flags
@@ -21,9 +21,10 @@ tools/track_mod_test.bat, gives their count and names; RDRAM: pointer 0x8010C15C
 position +0x34) every 0.37 s for --seconds of the race and prints the ones whose matrix or position changed, and
 how far: moving objects that should turn or travel but don't show up as never changing.
 --peek ADDR (repeatable, hex) instead prints the u32 at each RDRAM address during the race, smallest and largest seen
-over --seconds (scene_node_table_count 0x800FAE58: how full the scene node table at 0x800D9E90 is).
+over --seconds (scene_node_table_count 0x800FAE58: how full the scene node table at 0x80400000 is (include/scene_nodes.h)); --peek-always
+samples in every game state too (a race that crashes while it loads never reaches the race state).
 --pos (with --trace) adds the car's positions, rounded to a foot: physics +0x224, car state +0 (where a computer car's
-body node is put, cam_update_all_players_8009D9F4) and the body node's own (node +0xF0 of 0x800D9E90, 0x38 each, its
+body node is put, cam_update_all_players_8009D9F4) and the body node's own (node +0xF0 of the table at 0x80400000, 0x38 each, its
 matrix +4, position +0x24; nhid = its hidden flag 0x400), logging a line whenever one moves.
 RDRAM is found by matching the boot code at 0x80000450 from the Rush 2 ROM (tools/rush2049/roms.py; RUSH2_ROM).
 Fields: car state 0x801124A0 + car x 0x354 (position +0, place +0xE9, finished +0xEA, wreck state +0x342, out of
@@ -89,6 +90,9 @@ class Rdram:
                                       ctypes.byref(buf), 1, ctypes.byref(done))
 
 
+SCENE_NODES = 0x80400000   # the scene node table (include/scene_nodes.h; the game's 0x800D9E90 moved there)
+
+
 def word_view(blob, start):
     """Accessors into a block read at vaddr `start`."""
     def w(a): return struct.unpack_from('<I', blob, a - start)[0]
@@ -107,12 +111,14 @@ def sample(rd):
     c = rd.block(CARS, CAR_SIZE * 8)
     g = rd.block(0x8010C0D0, 0x100)
     t = rd.block(0x80117488, 4)
-    if not (s and c and g and t):
+    clock = rd.block(0x8010C204, 4)   # race_time_float: the checkpoint clock (time left)
+    if not (s and c and g and t and clock):
         return None
     _, sf, sb, _ = word_view(s, STATES)
     _, cf, cb, ch = word_view(c, CARS)
     gw, _, gb, _ = word_view(g, 0x8010C0D0)
-    out = {'time': struct.unpack('<f', t)[0], 'state': gw(0x8010C0D0), 'cars': gb(0x8010C15A), 'list': []}
+    out = {'time': struct.unpack('<f', t)[0], 'state': gw(0x8010C0D0), 'cars': gb(0x8010C15A),
+           'clock': round(struct.unpack('<f', clock)[0], 2), 'list': []}
     for k in range(8):
         st, ph = STATES + k * STATE_SIZE, CARS + k * CAR_SIZE
         out['list'].append({'pos': [round(sf(st + i * 4), 1) for i in range(3)], 'place': sb(st + 0xE9),
@@ -183,10 +189,10 @@ def trace(rd, car, seconds, out, proc, wreck_at=None, pos=False):
             cur['ppos'] = xyz(c, 0x224)
             cur['spos'] = xyz(s, 0)
             node = struct.unpack_from('<i', s, 0xF0)[0]
-            m = rd.block(0x800D9E90 + node * 0x38 + 4, 4) if node >= 0 else None
+            m = rd.block(SCENE_NODES + node * 0x38 + 4, 4) if node >= 0 else None
             mat = rd.block(struct.unpack('<I', m)[0] + 0x24, 12) if m and struct.unpack('<I', m)[0] >= 0x80000000 else None
             cur['npos'] = xyz(mat, 0) if mat else '-'
-            nf = rd.block(0x800D9E90 + node * 0x38, 4) if node >= 0 else None
+            nf = rd.block(SCENE_NODES + node * 0x38, 4) if node >= 0 else None
             cur['nhid'] = (struct.unpack('<I', nf)[0] >> 10) & 1 if nf else '-'
         key = {k: v for k, v in cur.items() if k != 's304'}
         if prev is None or key != prev:
@@ -229,12 +235,12 @@ def records(rd, placement_bin, seconds, proc):
                 i, names[i], dm, dp, *snaps[-1][i][9:12]))
 
 
-def peek(rd, addrs, seconds, proc):
-    """Samples u32 words at addrs during the race; prints each one's range."""
+def peek(rd, addrs, seconds, proc, always=False):
+    """Samples u32 words at addrs during the race (always: in every state); prints each one's range."""
     seen, t0 = {a: [] for a in addrs}, time.time()
     while time.time() - t0 < seconds and not (proc and proc.poll() is not None):
         g = rd.block(0x8010C0D0, 4)
-        if g and struct.unpack('<I', g)[0] == 3:
+        if g and (always or struct.unpack('<I', g)[0] == 3):
             for a in addrs:
                 v = rd.block(a, 4)
                 if v:
@@ -255,20 +261,41 @@ def main():
     ap.add_argument('--records', help='placement.bin of the raced custom track: report which records move')
     ap.add_argument('--pos', action='store_true', help="with --trace: also log the car's positions")
     ap.add_argument('--peek', action='append', type=lambda v: int(v, 16), help='print this u32 during the race')
+    ap.add_argument('--peek-always', action='store_true', help='with --peek: sample in every game state, not just racing')
     ap.add_argument('--wreck-at', type=float, help='with --trace: wreck that car this many seconds into the race')
     ap.add_argument('--shots', help='screenshot the window at these seconds after launch (comma separated) into '
                     'DIR/shot_<seconds>.png; a simulation run needs RUSH2_SIM_SHOW=1 to show its window')
     a = ap.parse_args()
     os.makedirs(a.out, exist_ok=True)
     proc = None
+    shots = sorted(float(v) for v in a.shots.split(',')) if a.shots else []
+    if shots:
+        sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'rush1'))
+        import shots as shot_tool
+
+    def take_shots():
+        # The shots that are due, also before the game has started (the launcher's build progress screen).
+        while shots and time.time() - launched >= shots[0]:
+            hwnd = shot_tool.find_window(pid)
+            if hwnd:
+                shot_tool.capture(hwnd, os.path.join(a.out, 'shot_%g.png' % shots[0]))
+            shots.pop(0)
+
+    def wait(seconds):
+        end = time.time() + seconds
+        while time.time() < end:
+            take_shots()
+            time.sleep(0.05)
     if a.launch:
         exe = os.path.join(REPO, 'build', 'Rush2Recompiled.exe')
         log = open(os.path.join(a.out, 'run.log'), 'w')
         proc = subprocess.Popen([exe, '--input-script', a.launch], cwd=os.path.dirname(exe), stdout=log,
                                 stderr=subprocess.STDOUT)
         pid = proc.pid
+        with open(os.path.join(a.out, 'pid.txt'), 'w') as f:   # for tools attaching to this run
+            f.write(str(pid))
         launched = time.time()
-        time.sleep(4)
+        wait(4)
     else:
         pid = a.pid
         launched = time.time()
@@ -277,12 +304,12 @@ def main():
         rd = Rdram(pid, write=a.wreck_at is not None)
         if rd.base:
             break
-        time.sleep(1)
+        wait(1)
     if not rd or not rd.base:
         print('RDRAM not found')
         return 1
     if a.peek:
-        peek(rd, a.peek, a.seconds, proc)
+        peek(rd, a.peek, a.seconds, proc, a.peek_always)
         if proc and proc.poll() is None:
             proc.terminate()
         return 0
@@ -302,11 +329,6 @@ def main():
     events = []
     prev, still_since, started, t0 = None, {}, None, time.time()
     finish_time = {}
-    shots = sorted(float(v) for v in a.shots.split(',')) if a.shots else []
-    if shots:
-        sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'rush1'))
-        import shots as shot_tool
-
     def event(t, car, text, pos):
         line = '%7.1f s  car %d  %s  at %s' % (t, car, text, where(pos))
         events.append(line)
@@ -314,11 +336,7 @@ def main():
     while time.time() - t0 < a.seconds:
         if proc and proc.poll() is not None:
             break
-        while shots and time.time() - launched >= shots[0]:
-            hwnd = shot_tool.find_window(pid)
-            if hwnd:
-                shot_tool.capture(hwnd, os.path.join(a.out, 'shot_%g.png' % shots[0]))
-            shots.pop(0)
+        take_shots()
         cur = sample(rd)
         if cur is None:
             time.sleep(0.1)

@@ -46,6 +46,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <future>
 #include <map>
 #include <mutex>
 #include <random>
@@ -62,6 +63,7 @@
 #include "battle.h"
 #include "collision_polys.h"
 #include "online.h"
+#include "online_sync.h"
 #include "battle_ai.h"
 #include "battle_render.h"
 #include "hud_layout.h"
@@ -72,6 +74,7 @@
 #include "track2049.h"
 #include "track_mod_runtime.h"
 #include "wings.h"
+#include "scene_nodes.h"
 
 extern "C" void hud_widget_alloc_800541F8(uint8_t* rdram, recomp_context* ctx);   // Allocates a 2D widget.
 extern "C" void widgets_create_800604FC(uint8_t* rdram, recomp_context* ctx);   // Builds HUD elements from layout entries.
@@ -104,7 +107,7 @@ namespace {
     constexpr uint32_t num_players = 0x8010C3E2;     // s16
     constexpr uint32_t record_base = 0x8010C15C;     // Pointer to the placement file's first record.
     constexpr uint32_t record_size = 0x64;
-    constexpr uint32_t nodes = 0x800D9E90;           // Scene nodes, 0x38 bytes each.
+    constexpr uint32_t nodes = rush2::scene_nodes::table;           // Scene nodes, 0x38 bytes each.
     constexpr uint32_t node_size = 0x38;
     constexpr uint32_t node_count = 0x800FAE58;
     constexpr uint32_t node_hidden = 0x400;
@@ -492,8 +495,8 @@ namespace {
     // from before it draws, so a model placed by it slides about on the car.
     void body_pose(uint8_t* rdram, int i, float pos[3], float m[9]) {
         int body = (int32_t)MEM_W(0, (int32_t)(body_nodes + (uint32_t)i * body_node_stride));
-        uint32_t transform = body >= 0 && body < 0x400 ? (uint32_t)MEM_W(4, (int32_t)(nodes + (uint32_t)body * node_size)) : 0;
-        if (transform >= 0x80000000u && transform < 0x80800000u) {
+        uint32_t transform = body >= 0 && body < (int)rush2::scene_nodes::capacity ? (uint32_t)MEM_W(4, (int32_t)(nodes + (uint32_t)body * node_size)) : 0;
+        if (rush2::in_game_ram(transform)) {
             for (int k = 0; k < 9; k++) m[k] = read_f(rdram, transform + k * 4);
             for (int k = 0; k < 3; k++) pos[k] = read_f(rdram, transform + 0x24 + k * 4);
             if (std::fabs(dot(m, m) - 1.0f) < 0.2f) return;
@@ -670,6 +673,11 @@ namespace {
     };
     Mesh arena, walls;
     constexpr float grid_cell = 48.0f;
+    // The arena mesh being built on a worker (set_data at the race load: about 100 ms on a big custom track); taken
+    // into `arena` by arena_mesh() once built. arena_solid says whether it has any triangles before that.
+    std::future<Mesh> arena_build;
+    std::mutex arena_build_mutex;
+    bool arena_solid = false;
 
     int64_t grid_key(int x, int z) { return ((int64_t)x << 32) ^ (uint32_t)z; }
 
@@ -695,6 +703,14 @@ namespace {
                 for (int z = z0; z <= z1; z++) triangle_grid[grid_key(x, z)].push_back(index);
             }
         }
+    }
+
+    // The arena's collision, taking it from the worker once built. Shots are the only reader and none fly before the
+    // countdown ends, seconds after the build, so the wait here never happens in play.
+    const Mesh& arena_mesh() {
+        std::lock_guard lock{ arena_build_mutex };
+        if (arena_build.valid()) arena = arena_build.get();
+        return arena;
     }
 
     // The first triangle the segment p0-p1 crosses: its point and unit normal (facing p0).
@@ -921,7 +937,7 @@ namespace {
         // drives like (docs/custom_tracks.md, track_mod_convert.cpp), so a road built of several surfaces is one road.
         int surface = 0;
     };
-    Ground ground_at(uint8_t* rdram, float x, float y, float z) {
+    Ground ground_at(uint8_t* rdram, float x, float y, float z, float* up = nullptr) {
         Ground g;
         if (game_ctx == nullptr) return g;
         recomp_context saved = *game_ctx;
@@ -943,6 +959,10 @@ namespace {
         g.type = flags & 0xF;
         g.material = (flags >> 4) & 0xF;
         g.surface = g.material <= 2 ? g.material : g.type;
+        // The matrix's rows are the polygon's axes, row 1 (+0xC) its up.
+        if (up != nullptr) {
+            for (int k = 0; k < 3; k++) up[k] = read_f(rdram, args + 0x20 + 0xC + k * 4);
+        }
         return g;
     }
 
@@ -1321,7 +1341,7 @@ namespace {
         }
         // The track's collision is this file's only for a converted Rush 2049 track that is the one loaded.
         int slot49 = rush2::track2049::loaded_slot();
-        flat_ground = arena.triangles.empty() || slot49 < 0 || MEM_B(0, (int32_t)track_id) != slot49;
+        flat_ground = !arena_solid || slot49 < 0 || MEM_B(0, (int32_t)track_id) != slot49;
         if (m == Mode::arena) {
             int count = (int)MEM_W(0, (int32_t)node_count);
             std::map<uint32_t, uint32_t> node_of_matrix;
@@ -1843,7 +1863,7 @@ namespace {
 
             int victim = s.weapon == mine ? -1 : car_hit(rdram, s);
             float wall[3], normal[3];
-            bool walled = sweep(arena, s.prev, s.pos, wall, normal);
+            bool walled = sweep(arena_mesh(), s.prev, s.pos, wall, normal);
             if (!walled && flat_ground && (s.weapon == mine || s.weapon == grenade) && s.pos[1] < s.ground && s.prev[1] >= s.pos[1]) {
                 // A track without collision here: level ground at the height of the car that let the shot go.
                 walled = true;
@@ -2348,7 +2368,17 @@ void rush2::battle::set_data(const std::vector<PickupRecord>& pickup_list, const
     pickup_records = pickup_list;
     pool_records = pool_list;
     read_models(converted_geometry);
-    build_collision(arena, solid_triangles);
+    {
+        std::lock_guard build_lock{ arena_build_mutex };
+        if (arena_build.valid()) arena_build.wait();
+        arena = {};
+        arena_solid = solid_triangles.size() >= 9;
+        arena_build = std::async(std::launch::async, [t = solid_triangles] {
+            Mesh mesh;
+            build_collision(mesh, t);
+            return mesh;
+        });
+    }
     // A battle arena (it has pickups): the computer opponents' navigation grid.
     if (!pickup_list.empty()) rush2::battle_ai::set_arena(solid_triangles);
 }
@@ -3259,4 +3289,144 @@ extern "C" void rush2_battle_race_steer(uint8_t* rdram, recomp_context* ctx) {
     write_f(rdram, car + 0x728, nudged);
     static const bool test_log = getenv("R2_BATTLE_TEST") != nullptr && strstr(getenv("R2_BATTLE_TEST"), "steer") != nullptr;
     if (test_log) fprintf(stderr, "[Battle] t=%.2f car %d to pickup %.2f rad (score %.0f) steer %.2f -> %.2f\n", clock_seconds, i, best_angle, best, steer, nudged);
+}
+
+// The middle of the AI lanes where they cross checkpoint c's line: halfway between the outermost crossings along the
+// line (the lanes are often on one line, so not their average). False if no lane crosses it.
+bool rush2::battle::checkpoint_lane_middle(uint8_t* rdram, int c, float out[3]) {
+    if (c < 0 || c >= max_checkpoints) return false;
+    uint32_t cp = checkpoint_records + (uint32_t)c * checkpoint_size;
+    float dir_x = read_f(rdram, cp + 0xC), dir_z = read_f(rdram, cp + 0x14);
+    float lo = 1e30f, hi = -1e30f, lo_p[3] = {}, hi_p[3] = {};
+    for (int l = 0; l < lane_count; l++) {
+        Lane lane = lane_at(rdram, l);
+        float f = lane_crossing(rdram, lane, l, c);
+        if (f < 0.0f) continue;
+        float p[3];
+        lane_point_at(rdram, lane, f, p);
+        float across = p[0] * -dir_z + p[2] * dir_x;
+        if (across < lo) lo = across, std::copy(p, p + 3, lo_p);
+        if (across > hi) hi = across, std::copy(p, p + 3, hi_p);
+    }
+    if (lo > hi) return false;
+    for (int k = 0; k < 3; k++) out[k] = (lo_p[k] + hi_p[k]) * 0.5f;
+    return true;
+}
+
+// Rush 2's ground query (ground_at) from outside a battle tick, with the caller's game context.
+bool rush2::battle::ground_under(uint8_t* rdram, recomp_context* ctx, const float p[3], float& ground_y, float up[3]) {
+    recomp_context* had = game_ctx;
+    game_ctx = ctx;
+    Ground g = ground_at(rdram, p[0], p[1], p[2], up);
+    game_ctx = had;
+    if (g.found) ground_y = g.y;
+    return g.found;
+}
+
+// Online play's checks and resyncs (include/online_sync.h): the battle's fighters, pickups, power-ups, shots and clock,
+// and the renderer slots the cars and shots hold (not the HUD's, one set per view, which differ by machine).
+void rush2::battle::online_sync(rush2::online::sync::Walker& w) {
+    namespace s = rush2::online::sync;
+    std::lock_guard lock{ battle_mutex };
+    for (Fighter& f : fighters) {
+        s::field(w, f.present);
+        s::field(w, f.health);
+        s::field(w, f.kills);
+        s::field(w, f.deaths);
+        s::field(w, f.weapon);
+        s::field(w, f.ammo);
+        s::field(w, f.cooldown);
+        s::field(w, f.aim_yaw);
+        s::field(w, f.aim_pitch);
+        s::field(w, f.invisible);
+        s::field(w, f.shield);
+        s::field(w, f.shield_scale);
+        s::field(w, f.shield_spin);
+        s::field(w, f.was_wrecked);
+        s::field(w, f.buttons);
+        s::field(w, f.regive);
+        s::field(w, f.last_attacker);
+        s::field(w, f.ram_box);
+        s::field(w, f.box_front);
+        s::field(w, f.box_radius);
+    }
+    size_t pickup_count = pickups.size();
+    w.count(pickup_count);
+    for (size_t i = 0; i < pickup_count; i++) {
+        // Set up from the arena: the same on every machine (the setup check), only their state is walked.
+        Pickup scratch;
+        Pickup& p = i < pickups.size() ? pickups[i] : scratch;
+        s::field(w, p.angle);
+        s::field(w, p.taken);
+        s::field(w, p.holds);
+    }
+    s::vector(w, spots, [](s::Walker& w, Spot& p) {
+        s::field(w, p.pickup);
+        s::field(w, p.held);
+        s::field(w, p.last);
+    });
+    for (PowerupManager& m : powerup_managers) {
+        s::field(w, m.timer);
+        s::field(w, m.spot);
+    }
+    s::field(w, powerups_started);
+    s::vector(w, race_pickups, [](s::Walker& w, RacePickup& p) {
+        s::field(w, p.checkpoint);
+        s::field(w, p.halfway);
+        s::field(w, p.place);
+        s::field(w, p.pos);
+        s::field(w, p.kind);
+        s::field(w, p.taken);
+        s::field(w, p.back);
+        s::field(w, p.angle);
+    });
+    s::field(w, race_held);
+    s::field(w, race_go);
+    s::field(w, last_state);
+    s::field(w, over);
+    s::vector(w, shots, [](s::Walker& w, Shot& p) {
+        s::field(w, p.live);
+        s::field(w, p.owner);
+        s::field(w, p.weapon);
+        s::field(w, p.slot);
+        s::field(w, p.pos);
+        s::field(w, p.prev);
+        s::field(w, p.vel);
+        s::field(w, p.m);
+        s::field(w, p.life);
+        s::field(w, p.age);
+        s::field(w, p.radius);
+        s::field(w, p.speed);
+        s::field(w, p.bounced);
+        s::field(w, p.ram_front);
+        s::field(w, p.placed);
+        s::field(w, p.ring);
+        s::field(w, p.ring_clock);
+        s::field(w, p.ring_hits);
+        s::field(w, p.ground);
+        s::field(w, p.start);
+        s::field(w, p.drawn);
+    });
+    s::vector(w, effects, [](s::Walker& w, Effect& p) {
+        s::field(w, p.live);
+        s::field(w, p.slot);
+        s::field(w, p.pos);
+        s::field(w, p.age);
+        s::field(w, p.duration);
+        s::field(w, p.scale0);
+        s::field(w, p.scale1);
+        s::field(w, p.explosion);
+    });
+    s::engine(w, rng);
+    s::field(w, clock_seconds);
+    s::field(w, clock_set);
+    s::field(w, round_points);
+    for (int i = 0; i < slot_count; i++) {
+        bool per_view = (i >= hud_weapon_slot_first && i < shield_slot_first) ||
+            (i >= hud_powerup_slot_first && i < race_pickup_slot_first);
+        if (!per_view) {
+            s::field(w, slots[i].used);
+            s::field(w, slots[i].color);
+        }
+    }
 }

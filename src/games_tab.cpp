@@ -13,6 +13,7 @@
 #include "librecomp/config.hpp"
 
 #include "rush2.h"
+#include "arcade2049.h"
 #include "battle.h"
 #include "options_page.h"
 #include "track1.h"
@@ -78,15 +79,20 @@ namespace {
 
     const std::string description =
         "Adds the tracks, cars and wings of San Francisco Rush 2049 and the tracks of San Francisco Rush and California "
-        "Speed, from their USA N64 ROMs.\n\n"
+        "Speed, from their USA N64 ROMs, and the Rush 2049 arcade game's own track and cars.\n\n"
         "Select each game's ROM or disc once; it is copied into the app folder.";
 
     class GamesPage : public rush2::ui::OptionsPage {
     public:
-        GamesPage(ResourceId rid, Element* parent) : OptionsPage(rid, parent, html(description)) {
+        // In columns: Rush 2049; San Francisco Rush and the Rush 2049 arcade game; California Speed.
+        GamesPage(ResourceId rid, Element* parent) : OptionsPage(rid, parent, html(description), 3) {
             rush2::wings::add_games_section(this, refresh[0]);
             add_option(rush2::wings::games_config(), fire_backward_option_id);
+            next_column();
             rush2::track1::add_games_section(this, refresh[1]);
+            rush2::arcade2049::add_games_section(this, refresh[3]);
+            rush2::arcade2049::add_options(this);
+            next_column();
             rush2::calspeed::add_games_section(this, refresh[2]);
             update_battle_options(battles);
         }
@@ -107,7 +113,7 @@ namespace {
         }
 
     private:
-        std::function<void()> refresh[3];
+        std::function<void()> refresh[4];
         bool battles = rush2::track2049::available();
 
         static std::string html(const std::string& text) {
@@ -124,6 +130,7 @@ void rush2::games::create_tab() {
     rush2::wings::init_config();
     rush2::track1::init_config();
     rush2::calspeed::init_config();
+    rush2::arcade2049::init_config();
     add_battle_options();
     recompui::config::create_tab(tab_name, tab_id,
         [](ContextId context, Element* parent) {

@@ -42,8 +42,16 @@ namespace rush2::track_mod {
 
     // A [movers.<name>] entry: how MOVE_<name> plays its animation.
     struct MoverSettings {
-        std::string mode = "loop";      // loop, pingpong or ride (plays forward while a car is on it, then returns)
+        std::string mode = "loop";      // loop, pingpong, ride (plays forward while a car is on it, then returns),
+                                        // once (forward once, then stays) or door (opens forward, closes back)
         std::string races = "both";     // both, forward or backward: the races it is there in
+        // Events (docs/custom_tracks.md#moving-objects): "time <seconds>", "trigger <name> [lap <n>]", "odd_lap",
+        // "even_lap", "final_lap". start: what starts a loop, pingpong or once (none: the race start); open / close: a
+        // door's.
+        std::vector<std::string> start, open, close;
+        float open_delay = -1.0f;       // door: opens again this many seconds after closing (< 0: stays closed)
+        float close_delay = -1.0f;      // door: closes again this many seconds after opening (< 0: stays open)
+        bool open_at_start = false;     // door: starts open (at its animation's end)
     };
 
     // The stock skies track.toml's sky can name (docs/custom_tracks.md#sky): `clouds` is Rush 2's cloud dome, the
@@ -89,10 +97,23 @@ namespace rush2::track_mod {
         float cloud_scroll = 0.0f, sky_parallax = 0.0f;
         std::string music;
         std::string preview, logo, diorama;                   // [menu] files in the track's folder
+        // [menu] after: where the track select lists the track: behind a game's tracks ("rush2", "sfrush", "rush2049",
+        // "calspeed") or behind another custom track (its folder name). Empty: after the stock and added tracks.
+        std::string menu_after;
         // [track] smooth_collision (default true): the road's tilt blends smoothly across polygon edges
         // (src/smooth_collision.cpp); smooth_fold (degrees, default 20): an edge folding more than this stays sharp.
         bool smooth_collision = true;
         float smooth_fold = 20.0f;
+        // [track] road_hold (default false): California Speed's road hold (src/calspeed/calspeed_rom.cpp
+        // rush2_calspeed_road_hold) keeps cars on the track's crests, while the CS Road Hold option is on.
+        bool road_hold = false;
+        // [track] point_to_point (default false): a race run once from START to FINISH along an open AIPATH_main, as
+        // California Speed's point-to-point courses (one lap, no BACKWARD; docs/custom_tracks.md#point-to-point).
+        bool point_to_point = false;
+        // [track] run_in (default false): a circuit whose race starts at START on a run-in that leads into the loop, as
+        // Rush 2's New York One (laps round the loop from the checkpoint where AIPATH_main's end rejoins it; no
+        // BACKWARD; docs/custom_tracks.md#run-in-circuits).
+        bool run_in = false;
         std::map<std::string, Surface> surfaces;              // by upper-case name
         std::map<std::string, MoverSettings> movers;          // by the name after MOVE_
     };

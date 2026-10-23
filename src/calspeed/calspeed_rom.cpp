@@ -47,9 +47,29 @@ namespace {
     const std::string tracks_option_id = "calspeed_tracks";
     const std::string cars_option_id = "calspeed_cars";
     const std::string drones_option_id = "calspeed_computer_cars";
+    // The old CS Road Hold toggle, kept unshown only to migrate into CS Physics (load_config): off became Full Rush 2.
     const std::string road_hold_option_id = "calspeed_road_hold";
-    // The California Speed Road Hold option: off, its tracks have Rush 2's own gravity only.
+    // Not "calspeed_physics": that key held the 2026-10-19 test option's Rush2/CalSpeed, where Rush2 meant the road hold
+    // (Partial until 2026-10-22); old games.json files may still carry it, and it is ignored.
+    const std::string physics_option_id = "calspeed_physics_mode";
+    enum class PhysicsOption : uint32_t { FullCS = 0, Partial = 1, FullRush2 = 2 };
+    const std::string scenery_option_id = "calspeed_scenery";
+    const std::string billboards_option_id = "calspeed_billboards";
+    // The CS Physics option: Full CS (California Speed's own physics, src/calspeed/calspeed_physics.cpp) and Partial
+    // (the same, a player's car on its Rush 2 values) hold cars to the road; Full Rush 2 has Rush 2's gravity only. The
+    // road hold (Rush 2's physics with California Speed's road hold, Partial until 2026-10-22) runs while the car
+    // isn't on California Speed's physics (rush2_calspeed_road_hold).
     std::atomic_bool road_hold_on = true;
+    void apply_physics_option(PhysicsOption o) {
+        road_hold_on = o != PhysicsOption::FullRush2;
+        using rush2::calspeed::physics::Mode;
+        rush2::calspeed::physics::set_mode(o == PhysicsOption::FullCS ? Mode::CalSpeed :
+                                           o == PhysicsOption::Partial ? Mode::Rushified : Mode::Rush2World);
+    }
+    // The California Speed Extended Scenery option (src/calspeed/calspeed_scenery.cpp).
+    std::atomic_bool scenery_on = true;
+    // The California Speed Billboard Trees option (src/calspeed/calspeed_billboards.cpp).
+    std::atomic_bool billboards_on = true;
     const char* rom_file_name = "calspeed.z64";
 
     constexpr size_t rom_size = 0x1000000;
@@ -120,7 +140,8 @@ namespace {
         // The computer cars' choice is among California Speed's cars.
         bool cars_on = std::get<bool>(config.get_option_value(cars_option_id));
         config.update_option_disabled(drones_option_id, disabled || !cars_on);
-        config.update_option_disabled(road_hold_option_id, disabled);
+        config.update_option_disabled(scenery_option_id, disabled);
+        config.update_option_disabled(billboards_option_id, disabled);
     }
 
     void select_rom() {
@@ -680,6 +701,12 @@ namespace {
                (MEM_BU(0, (int32_t)attract_demo) == 0 || MEM_W(0, (int32_t)game_state) == 6);
     }
 
+    // Where the road hold runs (with the CS Road Hold option on): California Speed's tracks, and custom tracks whose
+    // track.toml asks for it ([track] road_hold = true, docs/custom_tracks.md#road-hold).
+    bool road_hold_track(uint8_t* rdram) {
+        return road_hold_on && (on_calspeed_track(rdram) || rush2::track2049::mod_road_hold(rdram));
+    }
+
     // Hold::Gravity's extra gravity: the road hold's factors (road_hold_push / weight) x the car's gravity (+0x200, the
     // car's frame, turned by car_force_sum), less its part along the road while wheels touch it. In
     // car_physics_forces after car_force_sum, so it is added to the summed force at +0x4.
@@ -905,10 +932,10 @@ namespace {
 }
 
 extern "C" void rush2_calspeed_road_hold(uint8_t* rdram, recomp_context* ctx) {
-    if (!road_hold_on || !on_calspeed_track(rdram)) {
+    uint32_t car = (uint32_t)ctx->r16;
+    if (rush2::calspeed::physics::force_sum(rdram, car) || !road_hold_track(rdram)) {
         return;
     }
-    uint32_t car = (uint32_t)ctx->r16;
     if (hold == Hold::Heavy) {
         heavy_push(rdram, car);
     }
@@ -936,7 +963,7 @@ void rush2::calspeed::init_config() {
     recomp::config::Config& config = rush2::wings::games_config();
     config.add_bool_option(
         tracks_option_id,
-        "California Speed Tracks",
+        "CS Tracks",
         "Adds the sixteen tracks of California Speed to the track select, after the custom tracks. Its point-to-point "
         "courses are raced over one lap. Requires a California Speed (USA) ROM.",
         true
@@ -947,7 +974,7 @@ void rush2::calspeed::init_config() {
         });
     config.add_bool_option(
         cars_option_id,
-        "California Speed Cars",
+        "CS Cars",
         "Adds the twenty-one cars of California Speed to the car select, after the other cars, for players and the "
         "computer cars. Takes effect the next time the car select opens. Requires a California Speed (USA) ROM.",
         true
@@ -959,17 +986,17 @@ void rush2::calspeed::init_config() {
         });
     config.add_enum_option(
         drones_option_id,
-        "California Speed Computer Cars",
-        "Sets where the computer cars drive California Speed cars (with California Speed Cars on). "
+        "CS Drones",
+        "Sets where the computer cars drive California Speed cars (with CS Cars on). "
         "<recomp-color primary>All Tracks</recomp-color> adds California Speed's cars to the computer cars' picks on "
         "every track. "
-        "<recomp-color primary>California Speed Tracks</recomp-color> races only California Speed cars on the "
+        "<recomp-color primary>CS Tracks</recomp-color> races only California Speed cars on the "
         "California Speed tracks. "
         "<recomp-color primary>Off</recomp-color> keeps them out of the computer cars; players can still pick them. "
         "Requires a California Speed (USA) ROM.",
         {
             { rush2::car2049::DroneCars::AllTracks, "AllTracks", "All Tracks" },
-            { rush2::car2049::DroneCars::Rush2049Tracks, "CalSpeedTracks", "California Speed Tracks" },
+            { rush2::car2049::DroneCars::Rush2049Tracks, "CalSpeedTracks", "CS Tracks" },
             { rush2::car2049::DroneCars::Off, "Off", "Off" },
         },
         rush2::car2049::DroneCars::AllTracks
@@ -978,29 +1005,74 @@ void rush2::calspeed::init_config() {
         [](recomp::config::ConfigValueVariant cur_value, recomp::config::ConfigValueVariant, recomp::config::OptionChangeContext) {
             rush2::calspeed::set_drone_cars(static_cast<rush2::car2049::DroneCars>(std::get<uint32_t>(cur_value)));
         });
+    config.add_bool_option(road_hold_option_id, "CS Road Hold", "", true);
+    config.add_enum_option(
+        physics_option_id,
+        "CS Physics",
+        "How cars drive on California Speed's tracks. "
+        "<recomp-color primary>Full CS</recomp-color> drives them as California Speed does, with its own physics; "
+        "a California Speed car handles as in California Speed. "
+        "<recomp-color primary>Partial</recomp-color> uses California Speed's physics too, but your car keeps the "
+        "handling it has in Rush 2, and the computer cars take corners only as fast as your car can. "
+        "<recomp-color primary>Full Rush 2</recomp-color> drives them exactly as Rush 2's own tracks. "
+        "Changes take effect from the next race.",
+        {
+            { PhysicsOption::FullCS, "FullCS", "Full CS" },
+            { PhysicsOption::Partial, "Partial", "Partial" },
+            { PhysicsOption::FullRush2, "FullRush2", "Full Rush 2" },
+        },
+        PhysicsOption::Partial
+    );
+    config.add_option_change_callback(physics_option_id,
+        [](recomp::config::ConfigValueVariant cur_value, recomp::config::ConfigValueVariant, recomp::config::OptionChangeContext) {
+            apply_physics_option(static_cast<PhysicsOption>(std::get<uint32_t>(cur_value)));
+        });
     config.add_bool_option(
-        road_hold_option_id,
-        "California Speed Road Hold",
-        "Keeps cars on California Speed's hills as California Speed does: over a crest every car is held to the road "
-        "instead of flying off it. Flat road, slopes and corners drive as on any other track. Off, its tracks have "
-        "Rush 2's own gravity. Takes effect at once.",
+        scenery_option_id,
+        "CS Extended Scenery",
+        "Fills in where California Speed's tracks stop. Behind the start line the road goes on past a row of "
+        "road-closed barricades and bends out of sight, and the sea reaches the horizon on the coast tracks. Off, the "
+        "tracks are as California Speed built them. Takes effect from the next race.",
         true
     );
-    config.add_option_change_callback(road_hold_option_id,
+    config.add_option_change_callback(scenery_option_id,
         [](recomp::config::ConfigValueVariant cur_value, recomp::config::ConfigValueVariant, recomp::config::OptionChangeContext) {
-            road_hold_on = std::get<bool>(cur_value);
+            scenery_on = std::get<bool>(cur_value);
         });
+    config.add_bool_option(
+        billboards_option_id,
+        "CS Billboard Trees",
+        "Turns California Speed's flat trees to face you, so they look round from every side instead of thinning to a "
+        "line as you pass. Rows of trees, hedges, crossed trees and signs stay as they are. Off, every tree is as "
+        "California Speed drew it. Takes effect from the next race.",
+        true
+    );
+    config.add_option_change_callback(billboards_option_id,
+        [](recomp::config::ConfigValueVariant cur_value, recomp::config::ConfigValueVariant, recomp::config::OptionChangeContext) {
+            billboards_on = std::get<bool>(cur_value);
+        });
+}
+
+bool rush2::calspeed::scenery_enabled() {
+    return scenery_on;
+}
+
+bool rush2::calspeed::billboards_enabled() {
+    return billboards_on;
 }
 
 void rush2::calspeed::add_games_section(rush2::ui::OptionsPage* page, std::function<void()>& refresh) {
     recompui::ContextId context = recompui::get_current_context();
     rush2::ui::OptionsPage::Heading heading = page->add_heading("California Speed", rom_status_text());
     auto* button = context.create_element<recompui::Button>(heading.row, "Select ROM", recompui::ButtonStyle::Secondary);
+    button->set_flex_shrink(0.0f);  // Beside a long title in a narrow column, the title wraps instead.
     button->add_pressed_callback(select_rom);
     page->add_option(rush2::wings::games_config(), tracks_option_id);
     page->add_option(rush2::wings::games_config(), cars_option_id);
     page->add_option(rush2::wings::games_config(), drones_option_id);
-    page->add_option(rush2::wings::games_config(), road_hold_option_id);
+    page->add_option(rush2::wings::games_config(), physics_option_id);
+    page->add_option(rush2::wings::games_config(), scenery_option_id);
+    page->add_option(rush2::wings::games_config(), billboards_option_id);
     refresh = [note = heading.note, shown = rush2::calspeed::rom_available()]() mutable {
         if (rush2::calspeed::rom_available() != shown) {
             shown = !shown;
@@ -1011,7 +1083,18 @@ void rush2::calspeed::add_games_section(rush2::ui::OptionsPage* page, std::funct
 
 // Runs after rush2::wings::load_config(), which loads the option.
 void rush2::calspeed::load_config() {
-    road_hold_on = std::get<bool>(rush2::wings::games_config().get_option_value(road_hold_option_id));
+    // CS Road Hold off (before CS Physics) is Full Rush 2; the old value is then put back to on so it applies once.
+    recomp::config::Config& games = rush2::wings::games_config();
+    if (!std::get<bool>(games.get_option_value(road_hold_option_id))) {
+        if (static_cast<PhysicsOption>(std::get<uint32_t>(games.get_option_value(physics_option_id))) == PhysicsOption::Partial) {
+            games.set_option_value(physics_option_id, uint32_t(PhysicsOption::FullRush2));
+        }
+        games.set_option_value(road_hold_option_id, true);
+        rush2::wings::save_config();
+    }
+    apply_physics_option(static_cast<PhysicsOption>(std::get<uint32_t>(games.get_option_value(physics_option_id))));
+    scenery_on = std::get<bool>(rush2::wings::games_config().get_option_value(scenery_option_id));
+    billboards_on = std::get<bool>(rush2::wings::games_config().get_option_value(billboards_option_id));
     std::vector<uint8_t> data;
     std::filesystem::path path = stored_rom_path();
     if (std::filesystem::exists(path)) {
@@ -1037,7 +1120,7 @@ void rush2::calspeed::load_config() {
 // The ground push is the wheels on the road's part (0.32 each, less past 0.5 compression): lifting by the whole push,
 // a lifted wheel's 1.5 included, made the springs up to 7 times as strong and bounced and rolled the cars.
 extern "C" void rush2_calspeed_wheel_support(uint8_t* rdram, recomp_context* ctx) {
-    if (hold != Hold::Copy || !road_hold_on || !on_calspeed_track(rdram)) {
+    if (rush2::calspeed::physics::tire_grip(rdram, ctx) || hold != Hold::Copy || !road_hold_track(rdram)) {
         return;
     }
     constexpr uint32_t physics_cars = 0x800F5470, physics_car_size = 0x81C;
@@ -1084,6 +1167,11 @@ extern "C" void rush2_calspeed_wheel_support(uint8_t* rdram, recomp_context* ctx
 // Hooked at 0x8006AD10, after the load's product ($f2) and before it is compared with 0 and stored: $a0 = the car,
 // $a1 = the wheel's velocity (+4 = v), $t0 = its wheel struct (car + 0x424 + 0x5C x wheel), the loop's own
 // arguments at 0x78($sp): compression, the other wheel's on its axle, spring, anti-roll, damper when v < 0 and when not.
+// California Speed's physics (src/calspeed/calspeed_physics.cpp) keep the cut for converted cars (players, and Rush 2
+// or 2049 cars the computer drives), their springs and dampers already scaled in their descriptor: without it a 5
+// degree crease on San Francisco's hills at 144 ft/s sent both front tires' load from 690 lb to the cap in one frame
+// and threw the car 3 ft up with its rear off the road, and the front tires then turned it (the user's fishtails,
+// RUSH2_CSPHYS_SLIDES recordings, 2026-10-21). California Speed's own cars keep its damper as it is.
 namespace {
     constexpr float damper_jump = 200.0f; // ft/s per second: 6.7 ft/s in a 1/30 s frame
     struct WheelRate {
@@ -1095,7 +1183,8 @@ namespace {
 }
 
 extern "C" void rush2_calspeed_wheel_damper(uint8_t* rdram, recomp_context* ctx) {
-    if (!road_hold_on || !on_calspeed_track(rdram)) {
+    bool converted = rush2::calspeed::physics::converted(rdram, (uint32_t)ctx->r4);
+    if ((rush2::calspeed::physics::active(rdram, (uint32_t)ctx->r4) && !converted) || !road_hold_track(rdram)) {
         return;
     }
     constexpr uint32_t physics_cars = 0x800F5470, physics_car_size = 0x81C;
@@ -1131,12 +1220,12 @@ extern "C" void rush2_calspeed_wheel_damper(uint8_t* rdram, recomp_context* ctx)
         clamped = std::fabs(v) > limit;
         v = std::clamp(v, -limit, limit);
     }
-    if (!clamped && !heavy_world) {
+    if (!clamped && (!heavy_world || converted)) {
         return;
     }
     // The heavier world (Hold::Heavy, Gravity): springs and anti-roll x gravity_scale, dampers x its square root (the
     // load at 0x8006AC8C-0x8006AD0C for 0 < c <= 10; anti-roll only while both compressions are above 0).
-    float stiff = heavy_world ? gravity_scale : 1.0f, damp = std::sqrt(stiff);
+    float stiff = heavy_world && !converted ? gravity_scale : 1.0f, damp = std::sqrt(stiff);
     float c0 = f32(rdram, sp + 0x7C), spring = f32(rdram, sp + 0x80), anti_roll = f32(rdram, sp + 0x84);
     float damper = f32(rdram, sp + (v < 0.0f ? 0x88 : 0x8C));
     float inv_dt = f32(rdram, car + car_inv_dt);
@@ -1149,7 +1238,7 @@ extern "C" void rush2_calspeed_wheel_damper(uint8_t* rdram, recomp_context* ctx)
 // car_tire_model ($a2; $a0 = the car): the springs' load (0x34($sp), x gravity_scale with the springs) /
 // gravity_scale, capped at the car's weight (+0x5AC) as the game caps it (0x8006AD30-0x8006AD44).
 extern "C" void rush2_calspeed_tire_load(uint8_t* rdram, recomp_context* ctx) {
-    if (!heavy_world || !road_hold_on || !on_calspeed_track(rdram)) {
+    if (rush2::calspeed::physics::tire_load(rdram, ctx) || !heavy_world || !road_hold_track(rdram)) {
         return;
     }
     uint32_t car = (uint32_t)ctx->r4;
@@ -1328,7 +1417,7 @@ extern "C" void rush2_calspeed_respawn_advance(uint8_t* rdram, recomp_context* c
 // slot's offset turned along the route (func_800A4C44's matrix: x = (dz, -dx)), at the point's height, and faced
 // along the route there (func_8006D348: point 0x1A8($sp), loaded into $a1 next, of branch $a2 / 0x1B0($sp), -1 the
 // main line; $a3 = 1, the route). Where that spot has no road under it, on the lane point nearest the car instead
-// ($a2 the lane, $a3 = 0).
+// ($a2 the lane, $a3 = 0). A computer car goes on a lane point near the spot (below).
 extern "C" void rush2_calspeed_respawn_place(uint8_t* rdram, recomp_context* ctx) {
     constexpr uint32_t cars = 0x800F5470, car_size = 0x81C, respawn_point = 0x664;
     int t = raced_track - 1;
@@ -1416,6 +1505,66 @@ extern "C" void rush2_calspeed_respawn_place(uint8_t* rdram, recomp_context* ctx
             on_route = 0;
         }
     }
+    // A computer car goes on a lane point, as Rush 2 puts one back (respawn_place_car_80090A40: on its lane, +1.5 ft,
+    // faced along it). California Speed's reset leaves a drone on the spot above and then calls func_8009DAA8
+    // (0x800A41C4), which sets its lane point (lane state 0x80151D80 + 0x128 x the car's +0x83A, Rush 2's car state
+    // + 0x30C: +0x24 its lane's point nearest the spot, +0x26 = -1, +0x20 the game clock) and keeps its lane (+0x28).
+    // But Rush 2's driver puts a drone back once it is more than 100 ft from that point (drone_driver_80074990 at
+    // 0x80075238), and its stuck test once it can't move on, which California Speed never does: where a track's lanes
+    // take another road than its route line (California's lanes 0-1 run 200-270 ft from the route and lane 3 at
+    // (1500, -20, 6850)) a drone reset onto the route drove back across to its lane and was put back on the route,
+    // and where the slot's side offset left it against a wall it was put back there; both over and over for the rest
+    // of the race (California, Central Valley, San Andreas). So a drone goes on the point of its own lane nearest the
+    // spot (in 3D, the whole lane), or of the lane nearest the spot when its own is more than `own_lane` ft away there.
+    constexpr uint32_t drone_flag = 0x7E6, lane_headers = 0x80110020, game_clock = 0x80117488;
+    constexpr uint32_t car_slots = 0x801124A0, car_slot_size = 0x354, drone_state = 0x30C;
+    constexpr float own_lane = 50.0f;
+    if (MEM_H(0, (int32_t)(car + drone_flag)) != 0) {
+        int32_t state = (int32_t)(car_slots + uint32_t(index) * car_slot_size + drone_state);
+        auto lane_point = [&](int lane, int i, int k) {
+            uint32_t points = (uint32_t)MEM_W(0, (int32_t)(lane_headers + uint32_t(lane) * 8 + 4));
+            return (float)MEM_H(0, (int32_t)(points + uint32_t(i) * 8 + uint32_t(k) * 2));
+        };
+        auto nearest_on = [&](int lane, int& at) {
+            int n = MEM_HU(0, (int32_t)(lane_headers + uint32_t(lane) * 8));
+            float best = 1e30f;
+            for (int i = 0; i < n && MEM_W(0, (int32_t)(lane_headers + uint32_t(lane) * 8 + 4)) != 0; i++) {
+                float d = 0.0f;
+                for (int k = 0; k < 3; k++) {
+                    float l = lane_point(lane, i, k);
+                    d += (l - pos[k]) * (l - pos[k]);
+                }
+                if (d < best) {
+                    best = d;
+                    at = i;
+                }
+            }
+            return best;
+        };
+        int lane = MEM_H(0, state + 0x28), at = -1;
+        float best = lane >= 0 && lane < 4 ? nearest_on(lane, at) : 1e30f;
+        if (best > own_lane * own_lane) {
+            for (int l = 0; l < 4; l++) {
+                int i = -1;
+                float d = nearest_on(l, i);
+                if (d < best) {
+                    best = d;
+                    lane = l;
+                    at = i;
+                }
+            }
+        }
+        if (at >= 0) {
+            for (int k = 0; k < 3; k++) pos[k] = lane_point(lane, at, k) + (k == 1 ? 1.5f : 0.0f);
+            point = at;
+            list = lane;
+            on_route = 0;
+            MEM_H(0, state + 0x28) = (int16_t)lane;
+            MEM_H(0, state + 0x24) = (int16_t)at;
+            MEM_H(0, state + 0x26) = -1;
+            MEM_W(0, state + 0x20) = MEM_W(0, (int32_t)game_clock);
+        }
+    }
     for (int k = 0; k < 3; k++) put_f32(rdram, car + respawn_point + 4 * k, pos[k]);
     MEM_W(0, (int32_t)((uint32_t)ctx->r29 + 0x1A8)) = point;
     MEM_W(0, (int32_t)((uint32_t)ctx->r29 + 0x1B0)) = list;
@@ -1443,13 +1592,14 @@ extern "C" void rush2_calspeed_fall_floor(uint8_t* rdram, recomp_context* ctx) {
 // at z -3748), where Rush 2's crash tests wrecked a car arriving at race speed. California Speed has no wrecks (it
 // brakes the car to a stop after the finish, func_80082894), so on these tracks a finished car (car state +0xEA)
 // skips the three crash tests of car_crash_damage_stage_800715E8 (the impact force, over 400 ft/s and the spin rate)
-// as in a battle arena, and only bumps off the wall. Hooked at 0x8007173C, 0x80071794 and 0x800717B8 ($a1 = the car).
+// as in a battle arena, and only bumps off the wall. Point-to-point custom tracks get the same (their road ends past
+// the finish too). Hooked at 0x8007173C, 0x80071794 and 0x800717B8 ($a1 = the car).
 extern "C" int rush2_calspeed_finished_car(uint8_t* rdram, recomp_context* ctx) {
     constexpr uint32_t cars = 0x800F5470, car_size = 0x81C, car_index = 0x7E2;     // s16: its car state
     constexpr uint32_t car_states = 0x801124A0, car_state_size = 0x354, finished = 0xEA; // s8: 1 once it finished
     uint32_t car = (uint32_t)ctx->r5;
-    if (!on_calspeed_track(rdram) || !rush2::calspeed::point_to_point(raced_track - 1) || car < cars ||
-        car >= cars + max_race_cars * car_size) {
+    bool cs = on_calspeed_track(rdram) && rush2::calspeed::point_to_point(raced_track - 1);
+    if ((!cs && !rush2::track2049::mod_point_to_point(rdram)) || car < cars || car >= cars + max_race_cars * car_size) {
         return 0;
     }
     int index = (int16_t)MEM_H(0, (int32_t)(car + car_index));

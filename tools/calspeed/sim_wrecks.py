@@ -8,14 +8,24 @@ are hard-linked in from build/. Player 1 drives car 0 and waits on the grid; the
 options (California Speed's cars among them). The race is recorded (RUSH2_RACE_RECORD, src/race_record.cpp) and the
 game exits once every computer car has finished or got stuck; a run still going after TIMEOUT is closed by its PID.
 
-    python tools/calspeed/sim_wrecks.py [--tracks 64-79] [--hold on|off|both]
+    python tools/calspeed/sim_wrecks.py [--tracks 64-79] [--hold on|off|cs|both|all] [--no-catch-up] [--env K=V ...]
+                                        [--tag NAME]
+
+--hold: the Games tab's CS Physics option: on (Partial, the default: Rush 2's physics with California Speed's road
+hold), off (Full Rush 2: Rush 2's gravity), cs (Full CS: California Speed's own physics, src/calspeed/calspeed_physics.cpp); both = on and off, all = on, off and cs. --cs-drones races only
+California Speed cars as the computer cars (CS Drones: CS Tracks).
+
+--no-catch-up turns Drone Cheating off (the drones' pace is their lanes' alone); --env passes RUSH2_* switches to the
+game; --where lists every wreck; --read summarizes the recordings already made (with the same --tag) instead of racing;
+--tag names the recordings (tmp/sim_wrecks/run_<track>_<hold>[_<tag>].r2rc, read by lane_hold.py).
 
 Prints, per track and road hold setting: each computer car's wrecks (wreck state 0 -> nonzero), rollovers (up vector
-y below 0 while not wrecked) and whether it finished, and totals. Wrecks are split by what led to them over the 2 s
+y below 0 while not wrecked), slides (velocity over the ground more than SLIDE_DEG off the heading above 60 ft/s:
+fishtails and spins; --where lists where) and whether it finished, and totals. Wrecks are split by what led to them over the 2 s
 before: rolled (upside down), stalled (below 30 ft/s: a spin into a wall, or stuck) or at speed (put back while moving:
 off its lane, under the course, a fall).
 """
-import argparse, json, os, shutil, struct, subprocess, sys, time
+import argparse, json, math, os, shutil, struct, subprocess, sys, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(os.path.dirname(HERE))
@@ -28,9 +38,12 @@ RESET = ['saves', 'mod_config', 'ghosts', 'track_reports']
 #: Title START, then A through the menus to the race (California Speed's recipe: car select about 25 s in).
 SCRIPT = '8:START,11:A,13:A,24:A,60:A,62:A,66:A'
 TIMEOUT = 2 * 60
+#: Degrees between a car's heading and its velocity over the ground past which it counts as sliding.
+SLIDE_DEG = 25
 
 
-def prepare(hold):
+def prepare(hold, catch_up=True, cs_drones=False):
+    """hold: 'on', 'off' or 'cs'."""
     os.makedirs(DATA, exist_ok=True)
     for n in os.listdir(DATA):
         p = os.path.join(DATA, n)
@@ -45,9 +58,16 @@ def prepare(hold):
                 os.link(src, dst)
             except OSError:
                 shutil.copyfile(src, dst)
-    if not hold:
+    games = {'on': {'calspeed_physics_mode': 'Partial'}, 'off': {'calspeed_physics_mode': 'FullRush2'},
+             'cs': {'calspeed_physics_mode': 'FullCS'}}[hold]
+    if cs_drones:
+        games['calspeed_computer_cars'] = 'CalSpeedTracks'
+    if games:
         with open(os.path.join(DATA, 'games.json'), 'w', encoding='utf-8') as f:
-            json.dump({'calspeed_road_hold': False}, f, indent=4)
+            json.dump(games, f, indent=4)
+    if not catch_up:
+        with open(os.path.join(DATA, 'general.json'), 'w', encoding='utf-8') as f:
+            json.dump({'drone_catch_up': False}, f, indent=4)
     # No race timer: on most tracks the first checkpoint is more than a minute away, and time running out ended the race.
     with open(os.path.join(DATA, 'cheats.json'), 'w', encoding='utf-8') as f:
         json.dump({'cheat_no_game_timer': True}, f, indent=4)
@@ -80,12 +100,16 @@ def summarize(path):
             continue
         base = 2 + c * len(fields)
         wrecks = rolls = 0
+        events = []
         why = {'rolled': 0, 'stalled': 0, 'at speed': 0}
-        was_wreck = was_roll = False
+        was_wreck = was_roll = was_slide = False
         finished = False
+        slides = 0
+        slide_at = []
         for r in range(rows):
             row = r * width + base
-            wreck = vals[row + fi['wreck']] != 0
+            # A wreck after the car finished (a point-to-point road's end) doesn't count.
+            wreck = vals[row + fi['wreck']] != 0 and vals[row + fi['finished']] == 0
             roll = vals[row + fi['uy']] < 0 and not wreck
             if wreck and not was_wreck:
                 wrecks += 1
@@ -96,23 +120,39 @@ def summarize(path):
                     why['stalled'] += 1
                 else:
                     why['at speed'] += 1
+                p = (r - 1) * width + base if r else row
+                events.append((r / 60.0, vals[row + fi['x']], vals[row + fi['y']], vals[row + fi['z']],
+                               max(vals[k * width + base + fi['speed']] for k in before) if r else 0.0,
+                               vals[p + fi['speed']], vals[p + fi['next_cp']]))
             rolls += roll and not was_roll
+            # A slide: driving (not wrecked, upright, above 60 ft/s) with the velocity over the ground more than
+            # SLIDE_DEG off the way the car points (fishtails and spins, which a wreck count misses).
+            vx, vz, fx, fz = (vals[row + fi[k]] for k in ('vx', 'vz', 'fx', 'fz'))
+            sp, fl = math.hypot(vx, vz), math.hypot(fx, fz)
+            slide = (not wreck and not roll and vals[row + fi['speed']] > 60 and sp > 60 and fl > 0.5 and
+                     (vx * fx + vz * fz) / (sp * fl) < math.cos(math.radians(SLIDE_DEG)))
+            if slide and not was_slide:
+                slides += 1
+                slide_at.append((r / 60.0, vals[row + fi['x']], vals[row + fi['y']], vals[row + fi['z']], sp))
+            was_slide = slide
             was_wreck, was_roll = wreck, roll
             finished = finished or vals[row + fi['finished']] != 0
-        out.append(dict(car=c, type=head['types'][c], wrecks=wrecks, rolls=rolls, finished=finished, why=why))
+        out.append(dict(car=c, type=head['types'][c], wrecks=wrecks, rolls=rolls, finished=finished, why=why,
+                        events=events, slides=slides, slide_at=slide_at))
     return out, rows
 
 
-def run(track, hold):
-    prepare(hold)
+def run(track, hold, catch_up=True, extra_env=None, tag='', cs_drones=False):
+    prepare(hold, catch_up, cs_drones)
     os.makedirs(WORK, exist_ok=True)
-    rec = os.path.join(WORK, 'run_%d_%s.r2rc' % (track, 'on' if hold else 'off'))
+    rec = os.path.join(WORK, 'run_%d_%s%s.r2rc' % (track, hold, '_' + tag if tag else ''))
     for old in (rec, rec + '.done'):
         if os.path.exists(old):
             os.remove(old)
     env = {k: v for k, v in os.environ.items() if not k.startswith('RUSH2_')}
     env.update(RUSH2_SIM='1', RUSH2_DATA_DIR=DATA, RUSH2_TEST_TRACK=str(track), RUSH2_RACE_RECORD=rec,
                RUSH2_TEST_CAR='0')
+    env.update(extra_env or {})
     with open(rec[:-5] + '.log', 'w') as log:
         proc = subprocess.Popen([EXE, '--input-script', SCRIPT], cwd=BUILD, env=env, stdout=log,
                                 stderr=subprocess.STDOUT)
@@ -134,21 +174,33 @@ def run(track, hold):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--tracks', default='64-79', help='track select ids: 64-79 or a comma list')
-    ap.add_argument('--hold', default='both', choices=['on', 'off', 'both'])
+    ap.add_argument('--hold', default='both', choices=['on', 'off', 'cs', 'both', 'all'])
+    ap.add_argument('--no-catch-up', action='store_true', help='Drone Cheating off')
+    ap.add_argument('--env', action='append', default=[], help='K=V passed to the game')
+    ap.add_argument('--cs-drones', action='store_true', help='only California Speed cars as computer cars')
+    ap.add_argument('--where', action='store_true',
+                    help='list every wreck: time, place, top speed over the 2 s before, speed just before, next checkpoint')
+    ap.add_argument('--read', action='store_true', help='summarize the existing recordings instead of racing')
+    ap.add_argument('--tag', default='', help='recording name suffix')
     a = ap.parse_args()
     if '-' in a.tracks:
         lo, hi = (int(x) for x in a.tracks.split('-'))
         tracks = list(range(lo, hi + 1))
     else:
         tracks = [int(x) for x in a.tracks.split(',')]
-    holds = {'on': [True], 'off': [False], 'both': [True, False]}[a.hold]
-    totals = {h: [0, 0, 0, 0] for h in holds}   # wrecks, rolls, finished, cars
+    holds = {'both': ['on', 'off'], 'all': ['on', 'off', 'cs']}.get(a.hold, [a.hold])
+    totals = {h: [0, 0, 0, 0, 0] for h in holds}   # wrecks, rolls, finished, cars, slides
     causes = {h: {} for h in holds}
     for t in tracks:
         for h in holds:
             started = time.time()
-            res, done = run(t, h)
-            label = 'track %d hold %-3s' % (t, 'on' if h else 'off')
+            if a.read:
+                rec = os.path.join(WORK, 'run_%d_%s%s.r2rc' % (t, h, '_' + a.tag if a.tag else ''))
+                res, done = (summarize(rec) if os.path.exists(rec) else None), 'read'
+            else:
+                res, done = run(t, h, not a.no_catch_up, dict(e.split('=', 1) for e in a.env), a.tag,
+                                a.cs_drones)
+            label = 'track %d hold %-3s' % (t, h)
             if res is None:
                 print('%s  %s' % (label, done), flush=True)
                 continue
@@ -156,20 +208,28 @@ def main():
             w = sum(c['wrecks'] for c in cars)
             r = sum(c['rolls'] for c in cars)
             f = sum(c['finished'] for c in cars)
-            totals[h] = [totals[h][0] + w, totals[h][1] + r, totals[h][2] + f, totals[h][3] + len(cars)]
             why = {}
             for c in cars:
                 for k, n in c['why'].items():
                     why[k] = why.get(k, 0) + n
                     causes[h][k] = causes[h].get(k, 0) + n
-            print('%s  %4.0f s race, %3.0f s wall  wrecks %2d (%s)  rollovers %2d  finished %d/%d  (%s)  %s' % (
-                label, rows / 60.0, time.time() - started, w, ', '.join('%s %d' % kv for kv in why.items()), r, f,
+            sl = sum(c['slides'] for c in cars)
+            for i, v in enumerate((w, r, f, len(cars), sl)):
+                totals[h][i] += v
+            print('%s  %4.0f s race, %3.0f s wall  wrecks %2d (%s)  rollovers %2d  slides %2d  finished %d/%d  (%s)  %s' % (
+                label, rows / 60.0, time.time() - started, w, ', '.join('%s %d' % kv for kv in why.items()), r, sl, f,
                 len(cars), done,
-                ' '.join('t%d:%d/%d' % (c['type'], c['wrecks'], c['rolls']) for c in cars)), flush=True)
+                ' '.join('t%d:%d/%d/%d' % (c['type'], c['wrecks'], c['rolls'], c['slides']) for c in cars)), flush=True)
+            for c in cars if a.where else []:
+                for e in c['slide_at']:
+                    print('    t%d %6.1f s slide at (%7.0f %5.0f %7.0f)  %4.0f ft/s' % ((c['type'],) + e))
+                for e in c['events']:
+                    print('    t%d %6.1f s at (%7.0f %5.0f %7.0f)  top %4.0f  before %4.0f ft/s  next cp %d' % (
+                        (c['type'],) + e[:6] + (int(e[6]),)))
     for h in holds:
-        w, r, f, n = totals[h]
-        print('TOTAL hold %-3s  wrecks %d (%s)  rollovers %d  finished %d/%d' % (
-            'on' if h else 'off', w, ', '.join('%s %d' % kv for kv in causes[h].items()), r, f, n))
+        w, r, f, n, sl = totals[h]
+        print('TOTAL hold %-3s  wrecks %d (%s)  rollovers %d  slides %d  finished %d/%d' % (
+            h, w, ', '.join('%s %d' % kv for kv in causes[h].items()), r, sl, f, n))
 
 
 if __name__ == '__main__':

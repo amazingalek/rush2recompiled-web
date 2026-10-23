@@ -140,10 +140,16 @@ namespace {
         return "CS" + std::to_string(n + 1);
     }
 
-    // Car n's container, converted (or from the disk cache).
+    std::string car_cache_name(int n) {
+        return "calspeed_car_" + std::to_string(n + 1);
+    }
+
+    // Car n's container, converted (or from the disk cache). Any thread: rush2::calspeed::prepare_cars makes them ahead
+    // of the boot, which then waits on the entry's claim instead of converting it again.
     bool load_car(const std::vector<uint8_t>& rom, int n, std::vector<uint8_t>& car, std::string& error) {
         uint64_t key = rush2::calspeed::rom_source(rom) ^ (uint64_t(cache_version) << 56);
-        std::string cache_name = "calspeed_car_" + std::to_string(n + 1);
+        std::string cache_name = car_cache_name(n);
+        auto claim = rush2::track_cache::claim(rush2::track_cache::blob_entry(cache_name));
         if (rush2::track_cache::load_blob(cache_name, key, car)) {
             return true;
         }
@@ -176,7 +182,10 @@ namespace {
     // Rush 2's +0x54-+0x5C (its suspension code reads only +0x50), the rear lateral grip (+0x78) and the reverse gear;
     // those come from the Pickup (1.0 rear grip: the grip factors are in the car's tire curves). Its two grip factors
     // (+0x6C, +0x70; func_800B8CE8 scales a tire's two force components by them) are folded into its curves' grip.
-    void build_descriptor(uint8_t* rdram, const std::vector<uint8_t>& rom, int n, uint32_t out) {
+    // native: for California Speed's physics (rush2::calspeed::native_car), its curves at `curves` as California Speed
+    // has them (the grip factors applied per wheel instead).
+    void build_descriptor(uint8_t* rdram, const std::vector<uint8_t>& rom, int n, uint32_t out,
+                          uint32_t curves = 0, bool native = false) {
         auto w = [&](uint32_t vram) { return rush2::calspeed::main_word(rom, vram); };
         uint32_t d = w(cs_desc_ptrs + 4 * main_byte(rom, cs_desc_index + n));
         uint32_t pickup = (uint32_t)MEM_W(0, (int32_t)(0x800C07BC + MEM_BU(0, (int32_t)0x800C07E8) * 4));
@@ -188,8 +197,8 @@ namespace {
         for (uint32_t o : { 0x54u, 0x58u, 0x5Cu, 0xC8u }) put(o, (uint32_t)MEM_W(0, (int32_t)(pickup + o)));
         copy(0x60, 0x54, 2);                                          // drag, rolling resistance
         // Tire curves: copies of California Speed's front and rear ones with the car's grip factor.
-        uint32_t curves = ct::calspeed_tire_curves + n * 0x30;
-        float grip = f32_of(w(d + 0x70));
+        if (curves == 0) curves = ct::calspeed_tire_curves + n * 0x30;
+        float grip = native ? 1.0f : f32_of(w(d + 0x70));
         for (int c = 0; c < 2; c++) {
             uint32_t from = c == 0 ? cs_front_curve : cs_rear_curve;
             for (int i = 0; i < 6; i++) {
@@ -223,8 +232,10 @@ namespace {
         float curve[2][6];
         float roll[2] = {}; // Rush 2's grip / half track (front, rear): the most a car's grip may be per foot of track
         float steer = 1.0f, yaw = 1.0f, preload = 1.0f, mass = 1.0f, inertia = 1.0f;
+        float steer_means[2] = {}; // the steer base's mean, Rush 2's and California Speed's (native_values)
         int handling = 5;
     };
+    Rebalance mapping; // load_cars' mapping, undone for the other games' cars by native_values
     // The Rush 2 descriptor ranges that are scaled: springs and dampers, torque scales (gears 1, 2, 3+, common map) and
     // gears 1-4.
     constexpr std::pair<uint32_t, uint32_t> scaled_fields[] = { { 0x18, 0x50 }, { 0xB8, 0xC8 }, { 0xD0, 0xE0 } };
@@ -281,6 +292,8 @@ namespace {
             return ratio(a / r2_n, b / car_count);
         };
         r.steer = table(r2_steer, cs_steer, 1.0f);
+        for (int t : r2_types) r.steer_means[0] += at(r2_steer + t * 4) / float(r2_n);
+        for (int n = 0; n < car_count; n++) r.steer_means[1] += w(cs_steer + n * 4) / float(car_count);
         r.yaw = table(r2_yaw_damping, cs_yaw_damping, 1.0f);
         r.preload = table(r2_preload, cs_preload, 1.0f);
         r.mass = table(r2_mass, cs_mass, w(cs_mass_scale));
@@ -365,6 +378,7 @@ namespace {
         }
         for (int n = 0; n < car_count; n++) build_descriptor(rdram, *rom, n, descriptor_of(n));
         Rebalance r = rebalance(rdram, *rom);
+        mapping = r;
         int served = 0;
         for (int n = 0; n < car_count; n++) {
             std::vector<uint8_t> car;
@@ -381,6 +395,55 @@ namespace {
         cars_loaded = served == car_count;
         printf("[CalSpeed] %d cars\n", served);
     }
+}
+
+bool rush2::calspeed::native_car(uint8_t* rdram, int n, uint32_t desc, uint32_t curves, NativeCar& out) {
+    std::shared_ptr<const std::vector<uint8_t>> rom = loaded_rom;
+    if (!cars_loaded || rom == nullptr || n < 0 || n >= car_count) return false;
+    build_descriptor(rdram, *rom, n, desc, curves, true);
+    auto w = [&](uint32_t vram) { return f32_of(rush2::calspeed::main_word(*rom, vram)); };
+    uint32_t d = rush2::calspeed::main_word(*rom, cs_desc_ptrs + 4 * main_byte(*rom, cs_desc_index + n));
+    out.steer = w(cs_steer + 4 * n);
+    out.yaw = w(cs_yaw_damping + 4 * n);
+    out.preload = w(cs_preload + 4 * n);
+    out.mass = w(cs_mass + 4 * n) * w(cs_mass_scale);
+    out.inertia = w(cs_inertia + 4 * n);
+    out.tires = 4;
+    out.grip_lateral = w(d + 0x6C);
+    out.grip_long = w(d + 0x70);
+    return true;
+}
+
+// The inverse of build_physics' mapping. The steer base alone is moved by the means' difference instead of scaled: Rush
+// 2's runs 0-1200 (0 on the SLED, BUGATTI, CONCEPT and GT90, which turn on their tires and yaw gain) against California
+// Speed's 10000 on every car, and as the slide term (func_80069E74: what keeps California Speed's cars from spinning)
+// a scaled 0 would leave those cars none.
+bool rush2::calspeed::native_values(uint8_t* rdram, int type, uint32_t desc, uint32_t curves, NativeCar& out) {
+    if (!cars_loaded || ct::is_calspeed(type)) return false;
+    const Rebalance& r = mapping;
+    auto at = [&](uint32_t a) { return f32_of((uint32_t)MEM_W(0, (int32_t)a)); };
+    auto put = [&](uint32_t a, float f) { MEM_W(0, (int32_t)a) = (int32_t)fbits(f); };
+    auto undo = [](float v, float k) { return k != 0.0f ? v / k : v; };
+    uint32_t from = (uint32_t)MEM_W(0, (int32_t)(ct::desc_ptrs + MEM_BU(0, (int32_t)ct::entry(ct::desc_index, 0, type)) * 4));
+    for (uint32_t o = 0; o < ct::desc_size; o += 4) MEM_W(0, (int32_t)(desc + o)) = MEM_W(0, (int32_t)(from + o));
+    for (auto [lo, hi] : scaled_fields) {
+        for (uint32_t o = lo; o < hi; o += 4) put(desc + o, undo(at(desc + o), r.desc[o / 4]));
+    }
+    // Tire curves (+0x68 per wheel, the fronts' then the rears'): Rush 2's two become California Speed's.
+    for (int i = 0; i < 4; i++) {
+        int c = i < 2 ? 0 : 1;
+        uint32_t src = (uint32_t)MEM_W(0, (int32_t)(from + 0x68 + 4 * i)), dst = curves + c * 0x18;
+        for (int k = 0; k < 6; k++) put(dst + 4 * k, undo(at(src + 4 * k), r.curve[c][k]));
+        MEM_W(0, (int32_t)(desc + 0x68 + 4 * i)) = (int32_t)dst;
+    }
+    out.steer = std::max(0.0f, at(ct::entry(ct::steer_base, 0, type)) + r.steer_means[1] - r.steer_means[0]);
+    out.yaw = undo(at(ct::entry(ct::yaw_damping, 0, type)), r.yaw);
+    out.preload = undo(at(ct::entry(ct::preload, 0, type)), r.preload);
+    out.mass = undo(at(ct::entry(ct::mass, 0, type)), r.mass);
+    out.inertia = undo(at(ct::entry(ct::inertia, 0, type)), r.inertia);
+    out.tires = 4;
+    out.grip_lateral = out.grip_long = 1.0f;
+    return true;
 }
 
 rush2::calspeed::CarDefaults rush2::calspeed::car_defaults(int n) {
@@ -408,6 +471,16 @@ void rush2::calspeed::set_drone_cars(rush2::car2049::DroneCars mode) {
 
 rush2::car2049::DroneCars rush2::calspeed::drone_cars() {
     return (rush2::car2049::DroneCars)drones.load();
+}
+
+void rush2::calspeed::prepare_cars(const std::vector<uint8_t>& rom) {
+    for (int n = 0; n < car_count; n++) {
+        std::vector<uint8_t> car;
+        std::string error;
+        if (load_car(rom, n, car, error)) rush2::track_cache::preload_blob(car_cache_name(n));
+    }
+    rush2::calspeed::name_logos(rom);
+    rush2::track_cache::preload_blob("calspeed_name_logos");
 }
 
 void rush2::calspeed::init_cars(uint8_t* rdram) {

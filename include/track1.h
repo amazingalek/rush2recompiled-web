@@ -28,6 +28,9 @@ namespace rush2::track1 {
 
     // The user's Rush 1 ROM (src/rush1/rush1_rom.cpp): San Francisco Rush (USA), big-endian, or null.
     std::shared_ptr<const std::vector<uint8_t>> get_rom();
+    // Rush 2's ROM image (recomp::get_rom) is in its final buffer: the game's boot grew it for the SF Rush and
+    // California Speed music (src/rush1/track1_audio.cpp). Threads off the game thread wait for this before reading it.
+    bool rom_image_final();
     bool rom_available();
     // The SF Rush settings, shown in the Games tab (src/games_tab.cpp) and kept in its config with Rush 2049's
     // (src/rush2049/wings.cpp): adding them (before recompui::config::finalize()), the tab's section, and loading the stored
@@ -102,6 +105,13 @@ namespace rush2::track1 {
     void set_redirects(uint8_t* rdram, const std::map<std::string, std::string>& records,
                        const std::map<std::string, std::string>& pieces);
     void clear_redirects();
+
+    // Converts every track into the disk cache (those not there yet) and keeps their lap times for record_seed. Any
+    // thread (src/prewarm.cpp, at launch).
+    void prepare(const std::vector<uint8_t>& rom);
+    // Reads track k's (1-7) cache entry into memory now, for the race about to load it (src/prewarm.cpp, from the car
+    // select). Any thread.
+    void preload(int k);
 
     // The Rush 1 track (1-7) being raced, or 0 (src/rush1/track1.cpp).
     int race_track();

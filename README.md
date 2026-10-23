@@ -81,8 +81,20 @@ California Speed (Atari Games, 1999) runs on the same engine as Rush 2, so it co
 
 - **The California Speed tracks.** All sixteen tracks, from Monterey to Mt. Shasta, Fuji and San Andreas, after the custom tracks in the track select. Its point-to-point courses are raced over one lap.
 - **The California Speed cars.** All twenty-one cars join the car select after the other cars. Computer cars can drive them too: on every track, only on California Speed's tracks, or not at all.
-- **Road Hold.** California Speed keeps cars on its hills instead of launching them off every crest. This is on by default and can be turned off to use Rush 2's own gravity.
+- **Road Hold.** California Speed keeps cars on its hills instead of launching them off every crest. This is on by default and can be turned off to use Rush 2's own gravity. Custom tracks can ask for it too (`road_hold = true` in their track.toml).
 - **The California Speed music.** Its nine songs play on its tracks, picked at random.
+
+### Rush 2049 arcade mods
+
+The arcade release of San Francisco Rush 2049 (Special Edition) had a track and cars the N64 version never got, and its own versions of the six race tracks. If you have the arcade game's files as unpacked by [Project R](https://t3hd0gg.com/project-r/) (a free native PC port of the arcade game; you supply your own arcade files), press Build and Install under Rush 2049 Arcade on the Games tab. It finds ProjectR's folder by itself (or press Select Folder) and builds and turns on two mods in a few seconds, no restart needed:
+
+- **Alcatraz.** The arcade-only Alcatraz track, listed right after the Rush 2049 tracks, with computer opponents, records and ghosts like any custom track.
+- **Arcade tracks.** Turn off Alcatraz Only and the arcade's own Marina, Haight, Civic, Metro, Mission and Presidio are added too, as tracks of their own (Marina Arcade and so on) before Alcatraz. Their buildings, props, skies and road shapes come from the arcade game, so they look and drive a little differently from the N64 versions.
+- **Arcade cars.** The arcade's Truck, Deuce and Caddy join the car select, and the arcade-only color schemes for the 2049 cars show up as a STYLE row.
+
+With the mods built, the Arcade Checkpoints option hangs the arcade's CHECKPOINT banner over every checkpoint on the N64 Rush 2049 tracks, which the N64 game leaves unmarked.
+
+The mods are built from your own copy of the arcade game and aren't shared with the download. They rebuild themselves when a new version of the game changes them.
 
 ## What you need
 
@@ -121,7 +133,7 @@ Most options live in the settings menu (press Escape, or select).
 - **Sound:** race and menu music per game, plus whether other cars' engines are heard
 - **Controls:** choose which controllers (and the keyboard) can play, the split screen layout, and each save profile's steering, stick deadzone and rumble settings, with buttons to test each rumble effect
 - **Progress:** see the keys and coins you've collected
-- **Games:** pick your Rush 2049, San Francisco Rush and California Speed ROMs, then turn on their tracks, cars, Wings and Rush 2049 stunt scoring
+- **Games:** pick your Rush 2049, San Francisco Rush and California Speed ROMs, then turn on their tracks, cars, Wings and Rush 2049 stunt scoring, and build the Rush 2049 arcade mods
 - **Cheats:** unlock all tracks and cars, plus driving, survival, race and visual cheats. Turn on Enable Cheat Menu first (see [docs/cheats.md](docs/cheats.md)).
 - **Online:** host or join a lobby (see below)
 
@@ -159,7 +171,7 @@ Any model in the game can be swapped for your own mesh. Run Dump Models to get e
 
 ### New cars
 
-A mod can add whole new cars to the car select, each from a `.glb` and a short `.json` under `rush2/new_cars/` (name, base car, wheel positions, colors and any physics you want to set). `rush2/liveries/` adds extra looks to an existing car through a STYLE row. See [docs/car_mods.md](docs/car_mods.md). `tools/arcade2049/car_mod.py` builds a mod with the San Francisco Rush 2049 arcade's Truck, Deuce and Caddy and its arcade-only color schemes.
+A mod can add whole new cars to the car select, each from a `.glb` and a short `.json` under `rush2/new_cars/` (name, base car, wheel positions, colors and any physics you want to set). `rush2/liveries/` adds extra looks to an existing car through a STYLE row. See [docs/car_mods.md](docs/car_mods.md). The Games tab's San Francisco Rush 2049 Arcade section builds a mod with the arcade's Truck, Deuce and Caddy and its arcade-only color schemes.
 
 ### Replacing textures
 

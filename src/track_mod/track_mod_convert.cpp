@@ -10,6 +10,8 @@
 //   AIPATH_lane1..4           optional: one of the four racing lines, its ribbon's center line (paint_lane); 1 is
 //                             the leftmost in the race's direction. A lane left out is offset from AIPATH_main.
 //   FINISH, CHECKPOINT_n      gates: Empty, green (Blender Y = glTF -Z) arrow forward, X scale = half the width (m).
+//   START                     a point-to-point or run-in race's start line ([track] point_to_point / run_in; FINISH is
+//                             then the finish (lap) line only and AIPATH_main is open).
 //   START_n                   ignored: Rush 2 lines the grid up behind FINISH itself (said in the report).
 //   AISPEED_<mph>             caps the AI's target speed from the nearest path point on (0 lifts the cap).
 //   SKY                       the sky: its own model SKYO1, drawn around the camera without depth or fog.
@@ -39,6 +41,7 @@
 
 #include "gltf_scene.h"
 #include "texture_upscale.h"
+#include "collision_polys.h"
 #include "track_mod.h"
 
 namespace {
@@ -52,11 +55,14 @@ namespace {
     constexpr int max_checkpoints = 9;          // 10 checkpoint records, the finish line one of them
     constexpr int leaf_limit = 12;              // polygons per quadtree leaf before it splits
     constexpr int min_cell = 32;                // ft: smallest quadtree cell for leaf_limit
-    // The game's collision queries copy a leaf into an unchecked u16[36] stack buffer (func_8006CF00, func_8006F704,
-    // func_8008BDC0; func_8006FC94 has 40): a longer leaf overwrites the callers' locals, e.g. func_8006FC94's saved
-    // point pointer at sp+0x15C, crashing in func_8006C670 (docs/rush2049_research/collision.md). Rush 2's own tracks
-    // reach 34. A leaf past this splits below min_cell until it fits.
-    constexpr int max_leaf = 36;
+    // The game's collision queries copied a leaf into an unchecked u16[36] stack buffer (func_8006CF00, func_8006F704,
+    // func_8008BDC0; func_8006FC94 has 40), and a longer leaf overwrote the callers' locals (func_8006FC94's saved point
+    // pointer at sp+0x15C, crashing in func_8006C670; docs/rush2049_research/collision.md). Their lists are now in spare
+    // RDRAM with room for any leaf (rush2::collision::leaf_lists), whose count is one byte: 255. A leaf past
+    // leaf_limit splits below min_cell while it is past this: to 4 ft, then (walls listed only 1 ft out) to 1 ft.
+    constexpr int max_leaf = rush2::collision::max_leaf_polys;
+    // (Splitting crowded cells toward 36 as well, down to 4 ft, took the arcade Metro and Presidio past the index's
+    // 2 MB of cell lists; a cell of a few hundred polygons costs a lookup microseconds.)
 
     // Render state of Rush 2's own track sections (most common in HAWAII's lists).
     constexpr uint32_t mode_opaque = 0xC8112230;   // fog, then AA z-buffered opaque surface
@@ -101,6 +107,7 @@ namespace {
         return n;
     }
     std::string upper(std::string s) { for (char& c : s) c = char(std::toupper((unsigned char)c)); return s; }
+    std::string lower(std::string s) { for (char& c : s) c = char(std::tolower((unsigned char)c)); return s; }
     bool starts(const std::string& s, const std::string& p) { return s.compare(0, p.size(), p) == 0; }
     // "CHECKPOINT_12" with prefix "CHECKPOINT_" -> 12, else -1.
     int number_after(const std::string& s, const std::string& p) {
@@ -326,6 +333,7 @@ namespace {
         std::string object;
         int group = 0;      // moving object (MOVE_*) it belongs to, 1-31; 0 for the fixed track
         int seg = -1;       // spline road segment (ROAD_SPLINES, the face's _SEGMENT) giving its height; -1 flat
+        uint8_t cover = 0;  // the COL_ mesh's `covered` (1 tunnel, 2 lightly covered): POLY info bits 14-15
     };
 
     constexpr int max_poly_verts = 8;       // stock polygons: 3 and 4 almost always, at most 9
@@ -339,6 +347,7 @@ namespace {
         std::vector<std::array<float, 2>> xz;   // world x/z outline (convex), for the quadtree's cell test
         int group = 0;                      // CollisionTri::group
         int seg = -1;                       // CollisionTri::seg (flag 0x1000 and the vertex list's trailer)
+        uint8_t cover = 0;                  // CollisionTri::cover
         // A moving polygon's x/z boxes (x0, x1, z0, z1) along its whole travel: the cells it is listed in.
         std::vector<std::array<float, 4>> sweep;
     };
@@ -359,7 +368,7 @@ namespace {
         // 294 per track, nearly all tunnel roofs and bridge undersides above other road (tools/stock_track_glb.py).
         // The vertices wind so that, with x along the first edge and y the normal, every later vertex has local z > 0
         // (z = x cross y; every stock polygon does: func_8006C670's edge tests).
-        struct Face { uint16_t flags; Vec3 n; std::vector<Vec3> v; bool dead = false; int group = 0; int seg = -1; };
+        struct Face { uint16_t flags; Vec3 n; std::vector<Vec3> v; bool dead = false; int group = 0; int seg = -1; uint8_t cover = 0; };
         std::vector<Face> faces;
         size_t degenerate = 0;
         auto same = [](const Vec3& a, const Vec3& b) {     // one point at the file's 1/32 ft
@@ -372,14 +381,14 @@ namespace {
             // which has no local frame and collapses to a point (a hole).
             if (length(n) < 0.5f || same(t.v[0], t.v[1]) || same(t.v[1], t.v[2]) || same(t.v[0], t.v[2])) { degenerate++; continue; }
             if (dot(n, t.front) < 0) n = mul(n, -1.0f);       // the face's own front
-            Face f{ t.flags, n, { t.v[0], t.v[1], t.v[2] }, false, t.group, t.seg };
+            Face f{ t.flags, n, { t.v[0], t.v[1], t.v[2] }, false, t.group, t.seg, t.cover };
             if (dot(cross(sub(f.v[1], f.v[0]), sub(f.v[2], f.v[0])), n) > 0) std::swap(f.v[1], f.v[2]);
             faces.push_back(std::move(f));
         }
         if (degenerate) report.info(std::to_string(degenerate) + " collision triangles have no area and were skipped.");
 
         // Flat neighbors of the same surface merge into convex polygons, as the stock collision is built (mostly
-        // quads): a modeller's triangles would otherwise take one of the game's 8191 polygons each.
+        // quads): a modeller's triangles would otherwise take a polygon (and its corners) each.
         auto key = [](const Vec3& p) {
             return std::array<int32_t, 3>{ int32_t(std::lround(p[0] * 32.0f)), int32_t(std::lround(p[1] * 32.0f)),
                                            int32_t(std::lround(p[2] * 32.0f)) };
@@ -407,7 +416,7 @@ namespace {
                     auto it = edge_of.find({ key(q), key(p) });
                     if (it == edge_of.end() || it->second == i) continue;
                     Face& b = faces[it->second];
-                    if (b.dead || b.flags != a.flags || b.group != a.group || b.seg != a.seg || dot(a.n, b.n) < 0.9995f) continue;
+                    if (b.dead || b.flags != a.flags || b.group != a.group || b.seg != a.seg || b.cover != a.cover || dot(a.n, b.n) < 0.9995f) continue;
                     if (a.v.size() + b.v.size() - 2 > size_t(max_poly_verts)) continue;
                     bool flat = true;
                     for (const Vec3& w : b.v) flat = flat && std::fabs(dot(sub(w, a.v[0]), a.n)) < 0.05f;
@@ -442,6 +451,7 @@ namespace {
             p.flags = f.seg >= 0 ? uint16_t(f.flags | 0x1000) : f.flags;   // 0x1000: height from SEG f.seg
             p.group = f.group;
             p.seg = f.seg;
+            p.cover = f.cover;
             const Vec3* rows[3] = { &x, &y, &z };
             float mq[9];
             for (int r = 0; r < 3; r++) for (int c = 0; c < 3; c++) {
@@ -482,35 +492,48 @@ namespace {
                          "the origin); " + std::to_string(far) + " polygon(s) out there are left out.");
         }
         if (polys.empty()) { report.error("No collision: add COL_ROAD_* meshes (or a visible track mesh)."); return false; }
-        if (polys.size() > 8191) {
-            report.error("Collision has " + std::to_string(polys.size()) + " polygons after merging flat neighbors; the "
-                         "game's limit is 8191, so the last " + std::to_string(polys.size() - 8191) + " are left out "
-                         "(holes). Simplify the COL_* meshes.");
-            polys.resize(8191);
+        // Rush 2's leaf entries hold 13-bit polygon numbers (8,191). Past that the leaves are written wide, a plain
+        // u16 number per entry, and the root node says so (rush2::collision::wide_leaf_tag, read by
+        // rush2_collision_leaf_read_wide). What then binds is the file's u16 corner count (polygons don't share
+        // corners: 65,535 is about 16,000 quads).
+        size_t corners = 0, kept = 0;
+        for (const BuiltPoly& p : polys) {
+            if (corners + 1 + p.l.size() > 0xFFFF) break;
+            corners += 1 + p.l.size();
+            kept++;
         }
+        if (kept < polys.size()) {
+            report.error("Collision has " + std::to_string(polys.size()) + " polygons after merging flat neighbors, "
+                         "with more corners than the game's 65,535, so the last " + std::to_string(polys.size() - kept) +
+                         " are left out (holes). Simplify the COL_* meshes.");
+            polys.resize(kept);
+        }
+        const bool wide = polys.size() > 8191;
 
         // Quadtree over x/z (func_8006CD60): q = (x >= mid) + 2 * (z < mid); the halves share the mid line. Built
         // Rush 2's way first; when the cell lists pass Rush 2's 64 KB (as Rush 2049's track 3 does), again in the form
         // the port of 2049's tracks reads (src/rush2049/track2049_collision.cpp): splits rounded toward zero, leaf
         // offsets past 16 bits flagged by mask bit 4 + q, and the root node's byte +2 = 0x80 | the size's bits 16-22.
-        struct Node { int16_t parent; uint8_t mask; int16_t b[4]; uint16_t child[4]; };
+        struct Node { int16_t parent; uint8_t mask; int16_t b[4]; uint16_t child[4]; uint32_t leaf[4] = {}; };
         std::vector<Node> nodes;
         std::vector<uint8_t> leaves;
         std::map<std::vector<uint8_t>, uint32_t> leaf_at;
         bool overflow = false, tagged = false, crowded = false;
+        size_t crowded_count = 0;
+        Vec3 crowded_at{};                              // the first crowded spot, for the error
         auto encode_leaf = [&](const std::vector<int>& list) -> uint32_t {
             if (list.empty()) return 0;
             std::vector<uint8_t> raw;
             raw.push_back(uint8_t(list.size()));
             for (size_t i = 0; i < list.size();) {
                 size_t j = i + 1;
-                while (j < list.size() && list[j] == list[j - 1] + 1 && j - i < 8) j++;
-                add16(raw, uint16_t(((j - i - 1) << 13) | list[i]));
+                while (!wide && j < list.size() && list[j] == list[j - 1] + 1 && j - i < 8) j++;
+                add16(raw, wide ? uint16_t(list[i]) : uint16_t(((j - i - 1) << 13) | list[i]));
                 i = j;
             }
             auto it = leaf_at.find(raw);
             if (it != leaf_at.end()) return it->second;
-            if (leaves.size() + raw.size() > (tagged ? 0x7FFFFFu : 0xFFFFu)) { overflow = true; return 0; }
+            if (leaves.size() + raw.size() > (tagged ? 0x1FFFFFu : 0xFFFFu)) { overflow = true; return 0; }
             uint32_t off = uint32_t(leaves.size());
             leaves.insert(leaves.end(), raw.begin(), raw.end());
             leaf_at[raw] = off;
@@ -558,6 +581,14 @@ namespace {
                 for (int i : list) if (overlaps(polys[i], cx0, cx1, cz0, cz1)) sub_list.push_back(i);
                 bool split = ((int)sub_list.size() > leaf_limit && cx1 - cx0 > min_cell && cz1 - cz0 > min_cell) ||
                              ((int)sub_list.size() > max_leaf && cx1 - cx0 > 4 && cz1 - cz0 > 4);
+                if (!split && (int)sub_list.size() > max_leaf) {
+                    // Walls listed only 1 ft past the cell; where that is still too many (polygons crowding past a
+                    // spot, as Presidio Arcade's ramp ends), smaller cells, down to 1 ft.
+                    std::vector<int> tight;
+                    for (int i : list) if (overlaps(polys[i], cx0, cx1, cz0, cz1, false)) tight.push_back(i);
+                    if ((int)tight.size() > max_leaf && cx1 - cx0 > 1 && cz1 - cz0 > 1) split = true;
+                    else sub_list = std::move(tight);
+                }
                 if (split) {
                     int child = make_node(me, cx0, cx1, cz0, cz1, sub_list);
                     nodes[me].mask |= uint8_t(1 << q);
@@ -565,13 +596,16 @@ namespace {
                 }
                 else {
                     if ((int)sub_list.size() > max_leaf) {
-                        sub_list.clear();
-                        for (int i : list) if (overlaps(polys[i], cx0, cx1, cz0, cz1, false)) sub_list.push_back(i);
+                        if (!crowded) {
+                            crowded_count = sub_list.size();
+                            crowded_at = { float(cx0 + cx1) / 2, polys[sub_list[0]].v0[1], float(cz0 + cz1) / 2 };
+                        }
+                        sub_list.resize(max_leaf), overflow = crowded = true;
                     }
-                    if ((int)sub_list.size() > max_leaf) sub_list.resize(max_leaf), overflow = crowded = true;
                     biggest = std::max(biggest, sub_list.size());
                     uint32_t off = encode_leaf(sub_list);
                     nodes[me].child[q] = uint16_t(off);
+                    nodes[me].leaf[q] = off;
                     if (off > 0xFFFF) nodes[me].mask |= uint8_t(1 << (4 + q));
                 }
             }
@@ -593,9 +627,41 @@ namespace {
             if (!overflow || tagged || crowded) break;   // the tagged form only helps with size
             tagged = true;
         }
+        if (crowded) {
+            report.error(std::to_string(crowded_count) + " collision polygons meet near " + fmt_pos(crowded_at) +
+                         ", more than the game's " + std::to_string(max_leaf) + " in one spot. Simplify the COL_* meshes there.");
+            return false;
+        }
+        // Cell lists past the 17-bit offsets (128 KB): the far children (mask bit 4 + q) become indices into a table
+        // of their u32 offsets at the section's end, entry k at end - 4 (k + 1) (rush2::collision::far_leaf_tag).
+        bool far_table = false;
+        if (tagged && !overflow && leaves.size() > 0x10000) {
+            std::map<uint32_t, uint32_t> index_of;
+            std::vector<uint32_t> table;
+            for (Node& n : nodes) {
+                for (int q = 0; q < 4; q++) {
+                    if ((n.mask & (1 << q)) || !(n.mask & (0x10 << q))) continue;
+                    auto [it, added] = index_of.try_emplace(n.leaf[q], uint32_t(table.size()));
+                    if (added) table.push_back(n.leaf[q]);
+                    n.child[q] = uint16_t(it->second);
+                }
+            }
+            far_table = std::any_of(table.begin(), table.end(), [](uint32_t o) { return o > 0x1FFFF; });
+            if (far_table) {
+                if (table.size() > 0x10000 || leaves.size() + 4 * table.size() > 0x1FFFFF) overflow = true;
+                else for (size_t k = table.size(); k-- > 0;) add32(leaves, table[k]);
+            }
+            else {
+                for (Node& n : nodes) {
+                    for (int q = 0; q < 4; q++) {
+                        if (!(n.mask & (1 << q)) && (n.mask & (0x10 << q))) n.child[q] = uint16_t(n.leaf[q]);
+                    }
+                }
+            }
+        }
         if (overflow || nodes.size() > 0x7FFF) {
-            report.error("The collision is too dense for the game's collision index (over 8 MB of cell lists, or over 36 "
-                         "polygons in one small spot). Simplify the COL_* meshes.");
+            report.error("The collision is too dense for the game's collision index (over 2 MB of cell lists). "
+                         "Simplify the COL_* meshes.");
             return false;
         }
 
@@ -624,14 +690,18 @@ namespace {
         for (size_t i = 0; i < nodes.size(); i++) {
             const Node& n = nodes[i];
             add16(out, uint16_t(n.parent));
-            add8(out, i == 0 && tagged ? uint8_t(0x80 | (leaves.size() >> 16)) : 0);
+            // The root's byte +2: the tagged form's 0x80 | leaf size bits 16-20, and the wide entries' bit.
+            add8(out, i == 0 ? uint8_t((tagged ? 0x80 | (leaves.size() >> 16) : 0) | (wide ? rush2::collision::wide_leaf_tag : 0) |
+                                       (far_table ? rush2::collision::far_leaf_tag : 0)) : 0);
             add8(out, n.mask);
             for (int16_t b : n.b) add16(out, uint16_t(b));
             for (uint16_t c : n.child) add16(out, c);
         }
         for (size_t i = 0; i < polys.size(); i++) {
             add16(out, polys[i].flags);
-            add16(out, uint16_t(1 + polys[i].l.size()));   // info: vertex count
+            // info: vertex count, and Rush 2's covered level in bits 14-15 (car state +0x344 = 2 x bit 15 + bit 14: the
+            // cars drawn darker, as in its tunnels; docs/rush2049_research/collision.md#4-poly2-info-upper-bits-the-meaning-changed).
+            add16(out, uint16_t((1 + polys[i].l.size()) | (polys[i].cover == 2 ? 0x8000 : polys[i].cover == 1 ? 0x4000 : 0)));
             for (int16_t m : polys[i].m) add16(out, uint16_t(m));
             add16(out, vlist_at[i]);                  // its run in the vertex list
         }
@@ -1309,6 +1379,9 @@ bool rush2::track_mod::parse_settings(const std::string& text, Settings& s, Repo
     str("track", "gravity", s.gravity);
     if (auto v = t["track"]["smooth_collision"].value<bool>()) s.smooth_collision = *v;
     if (auto v = t["track"]["smooth_fold"].value<double>()) s.smooth_fold = float(std::clamp(*v, 0.0, 90.0));
+    if (auto v = t["track"]["road_hold"].value<bool>()) s.road_hold = *v;
+    if (auto v = t["track"]["point_to_point"].value<bool>()) s.point_to_point = *v;
+    if (auto v = t["track"]["run_in"].value<bool>()) s.run_in = *v;
     if (s.gravity != "rush2" && s.gravity != "rush2049") {
         report.error("track.toml: [track] gravity must be \"rush2\" or \"rush2049\"; \"" + s.gravity + "\" races on Rush 2's.");
         s.gravity = "rush2";
@@ -1365,6 +1438,7 @@ bool rush2::track_mod::parse_settings(const std::string& text, Settings& s, Repo
     str("menu", "preview", s.preview);
     str("menu", "logo", s.logo);
     str("menu", "diorama", s.diorama);
+    str("menu", "after", s.menu_after);
     if (auto* surf = t["surfaces"].as_table()) {
         int next_slot = 3;
         for (auto& [key, node] : *surf) {
@@ -1396,9 +1470,37 @@ bool rush2::track_mod::parse_settings(const std::string& text, Settings& s, Repo
             if (!tbl) { report.error("track.toml: [movers." + name + "] must be a table."); continue; }
             m.mode = (*tbl)["mode"].value_or(m.mode);
             m.races = (*tbl)["races"].value_or(m.races);
-            if (m.mode != "loop" && m.mode != "pingpong" && m.mode != "ride") {
-                report.error("track.toml: movers." + name + ".mode must be \"loop\", \"pingpong\" or \"ride\".");
+            if (m.mode != "loop" && m.mode != "pingpong" && m.mode != "ride" && m.mode != "once" && m.mode != "door") {
+                report.error("track.toml: movers." + name + ".mode must be \"loop\", \"pingpong\", \"ride\", \"once\" or \"door\".");
                 m.mode = "loop";
+            }
+            // start / open / close: one event or a list of them (checked against the TRIGGER_ boxes in convert).
+            auto events = [&](const char* key, std::vector<std::string>& out) {
+                auto v = (*tbl)[key];
+                if (auto s = v.value<std::string>()) out.push_back(*s);
+                else if (auto* arr = v.as_array()) {
+                    for (auto& e : *arr) {
+                        if (auto s = e.value<std::string>()) out.push_back(*s);
+                        else report.error("track.toml: movers." + name + "." + key + " must be text, such as \"time 10\".");
+                    }
+                }
+                else if (v) report.error("track.toml: movers." + name + "." + key + " must be text or a list of text.");
+            };
+            events("start", m.start);
+            events("open", m.open);
+            events("close", m.close);
+            if (auto v = (*tbl)["open_delay"].value<double>()) m.open_delay = float(*v);
+            if (auto v = (*tbl)["close_delay"].value<double>()) m.close_delay = float(*v);
+            m.open_at_start = (*tbl)["open_at_start"].value_or(false);
+            if (m.mode == "door" && !m.start.empty()) {
+                report.warning("track.toml: movers." + name + ": a door uses open and close, not start; start is ignored.");
+            }
+            if (m.mode != "door" && (!m.open.empty() || !m.close.empty() || m.open_at_start || m.open_delay >= 0 || m.close_delay >= 0)) {
+                report.warning("track.toml: movers." + name + ": open, close, open_delay, close_delay and open_at_start "
+                               "are for mode = \"door\"; ignored.");
+            }
+            if (m.mode == "ride" && !m.start.empty()) {
+                report.warning("track.toml: movers." + name + ": a ride starts when a car is on it; start is ignored.");
             }
             if (m.races != "both" && m.races != "forward" && m.races != "backward") {
                 report.error("track.toml: movers." + name + ".races must be \"both\", \"forward\" or \"backward\".");
@@ -1427,6 +1529,7 @@ bool rush2::track_mod::convert(const std::vector<uint8_t>& glb, const std::strin
 
     // ---- sort the objects ----
     const rush2::gltf::Node* finish = nullptr;
+    const rush2::gltf::Node* start_line = nullptr;      // START: a point-to-point race's start line
     const rush2::gltf::Node* aipath = nullptr;
     std::array<const rush2::gltf::Node*, 4> lane_nodes{};   // AIPATH_lane1..4
     std::map<int, const rush2::gltf::Node*> checkpoints, grid;
@@ -1435,8 +1538,24 @@ bool rush2::track_mod::convert(const std::vector<uint8_t>& glb, const std::strin
     std::vector<const rush2::gltf::Node*> visual, sky, billboard_nodes;
     std::vector<std::pair<int, const rush2::gltf::Node*>> prop_nodes;    // PROP_: PropRecord::type
     const bool arena = is_arena(settings);
+    // A point-to-point race ([track] point_to_point): run once from START to FINISH along an open AIPATH_main, as
+    // California Speed's point-to-point courses are (checkpoint 0 the start line, flags 2; the last the finish, flags 1).
+    const bool p2p = settings.point_to_point && !arena;
+    if (settings.point_to_point && arena) report.info("track.toml: point_to_point is for races; an arena ignores it.");
+    // A circuit with a run-in ([track] run_in), as Rush 2's New York One, Rush 2049's race 6 and San Francisco Rush's
+    // Golden Gate: the race starts at START on a stretch of its own that leads into the loop, and the laps go round
+    // the loop. AIPATH_main is open, from behind START along the run-in and once round the loop, ending where it first
+    // met the loop, at the loop's checkpoint (flags 4): Rush 2 carries a car's progress past the spine's last point on
+    // from that checkpoint's crossing (func_8008CCF8, docs/rush2049_research/race.md).
+    const bool run_in = settings.run_in && !arena && !p2p;
+    if (settings.run_in && settings.point_to_point) report.error("track.toml: run_in and point_to_point can't both be set; it is raced point to point.");
+    if (settings.run_in && arena) report.info("track.toml: run_in is for races; an arena ignores it.");
+    const bool open_path = p2p || run_in;   // AIPATH_main isn't a loop; gates START, ..., FINISH
     std::vector<std::pair<uint16_t, const rush2::gltf::Node*>> collision_nodes;
     const rush2::gltf::Node* road_splines = nullptr;    // ROAD_SPLINES: the spline road's segment table
+    // TRIGGER_<name>: boxes a car drives into to start, open or close moving objects ([movers] events), game space.
+    struct Trigger { std::string name; Vec3 lo, hi; };
+    std::vector<Trigger> triggers;
     std::set<std::string> seen;
     // Moving objects: every node under an animated MOVE_<name> (the outermost) moves with it.
     std::vector<int> mover_of(scene.nodes.size(), -1);
@@ -1504,6 +1623,26 @@ bool rush2::track_mod::convert(const std::vector<uint8_t>& glb, const std::strin
             continue;
         }
         if (name == "ROAD_SPLINES") { road_splines = &n; continue; }
+        if (starts(name, "TRIGGER_")) {
+            // Its mesh's bounds, or an Empty's cube (Blender's Cube display, its scale the half sizes).
+            Trigger tr{ upper(name.substr(8)), { 1e30f, 1e30f, 1e30f }, { -1e30f, -1e30f, -1e30f } };
+            auto grow = [&](const Vec3& g) {
+                for (int k = 0; k < 3; k++) tr.lo[k] = std::min(tr.lo[k], g[k]), tr.hi[k] = std::max(tr.hi[k], g[k]);
+            };
+            for (const auto& prim : n.primitives) for (const auto& p : prim.pos) grow(to_game(p));
+            if (!mesh) {
+                for (int c = 0; c < 8; c++) {
+                    grow(to_game(mat4_point(n.world, { c & 1 ? 1.0f : -1.0f, c & 2 ? 1.0f : -1.0f, c & 4 ? 1.0f : -1.0f })));
+                }
+            }
+            if (tr.name.empty()) report.warning(n.name + ": a trigger needs a name after TRIGGER_; ignored.");
+            else if (std::any_of(triggers.begin(), triggers.end(), [&](const Trigger& t) { return t.name == tr.name; })) {
+                report.error("There are two triggers named TRIGGER_" + tr.name + ".");
+            }
+            else triggers.push_back(tr);
+            if (mover >= 0) report.warning(n.name + " is inside " + scene.nodes[mover].name + ": triggers don't move; it stays where it starts.");
+            continue;
+        }
         if (mover >= 0) {
             if (mesh) mover_visual[mover].push_back(&n);
             else if (&n != &scene.nodes[mover] && !n.name.empty()) {
@@ -1520,6 +1659,11 @@ bool rush2::track_mod::convert(const std::vector<uint8_t>& glb, const std::strin
             continue;
         }
         if (name == "FINISH") { finish = &n; continue; }
+        if (name == "START") {
+            if (open_path) start_line = &n;
+            else report.info("START is a point-to-point or run-in race's start line ([track] point_to_point or run_in); ignored.");
+            continue;
+        }
         if (int k = number_after(name, "CHECKPOINT_"); k >= 0) { checkpoints[k] = &n; continue; }
         if (int k = number_after(name, "START_"); k >= 0) { grid[k] = &n; continue; }
         if (int k = number_after(name, "AISPEED_"); k >= 0) { aispeeds.push_back({ float(k), &n }); continue; }
@@ -1590,8 +1734,9 @@ bool rush2::track_mod::convert(const std::vector<uint8_t>& glb, const std::strin
         if (!grid.empty()) finish = nullptr;
     }
     else {
-        if (!finish) report.error("No FINISH marker: add an Empty named FINISH on the start/finish line.");
-        if (checkpoints.empty()) report.error("No checkpoints: add Empties CHECKPOINT_1, CHECKPOINT_2, ... around the lap.");
+        if (!finish) report.error(p2p ? "No FINISH marker: add an Empty named FINISH on the finish line."
+                                      : "No FINISH marker: add an Empty named FINISH on the start/finish line.");
+        if (checkpoints.empty() && !open_path) report.error("No checkpoints: add Empties CHECKPOINT_1, CHECKPOINT_2, ... around the lap.");
     }
     int expected = 1;
     for (const auto& [k, n] : checkpoints) {
@@ -1599,13 +1744,20 @@ bool rush2::track_mod::convert(const std::vector<uint8_t>& glb, const std::strin
                                         std::to_string(expected) + " is missing.");
         expected = k + 1;
     }
-    if ((int)checkpoints.size() > max_checkpoints) {
-        report.error("At most " + std::to_string(max_checkpoints) + " checkpoints (the game has 10 gates including the finish).");
+    // A point-to-point race's start line takes one of the 10 gates.
+    const int max_cps = open_path ? max_checkpoints - 1 : max_checkpoints;
+    if ((int)checkpoints.size() > max_cps) {
+        report.error("At most " + std::to_string(max_cps) + " checkpoints (the game has 10 gates including the finish" +
+                     std::string(open_path ? " and the start" : "") + ").");
     }
     // at: the forward spine point where the AI path crosses it (the first past it), -1 for none.
-    struct Gate { std::string name; Vec3 pos, dir; float radius; int at = -1; };
+    // A circuit's gates are FINISH and then CHECKPOINT_1, 2, ...; a point-to-point race's START, the checkpoints and
+    // FINISH last (START stands in at the path's start when there is none: see the AI path below).
+    // loop: a run-in circuit's loop start (flags 4), where the path's end comes back onto it.
+    struct Gate { std::string name; Vec3 pos, dir; float radius; int at = -1; bool loop = false; };
     std::vector<Gate> gates;
-    if (finish) gates.push_back({ "FINISH", to_game(finish->position()), forward(finish), half_width(finish) });
+    if (finish && !open_path) gates.push_back({ "FINISH", to_game(finish->position()), forward(finish), half_width(finish) });
+    if (start_line) gates.push_back({ "START", to_game(start_line->position()), forward(start_line), half_width(start_line) });
     if (arena) {
         // Start spots: Rush 2049's battle starts player p at checkpoint [0, 2, 1, 3][p] (rush2_track49_battle_start), the
         // stunt mode at the path's first point, which is START_1's.
@@ -1619,10 +1771,12 @@ bool rush2::track_mod::convert(const std::vector<uint8_t>& glb, const std::strin
             gates.push_back({ "START_" + std::to_string(k), to_game(n->position()), forward(n), 20.0f });
         }
     }
+    int cps_added = 0;
     for (const auto& [k, n] : checkpoints) {
-        if ((int)gates.size() > max_checkpoints) break;   // the extra ones were reported above
+        if (cps_added++ >= max_cps) break;   // the extra ones were reported above
         gates.push_back({ "CHECKPOINT_" + std::to_string(k), to_game(n->position()), forward(n), half_width(n) });
     }
+    if (finish && open_path) gates.push_back({ "FINISH", to_game(finish->position()), forward(finish), half_width(finish) });
     for (size_t i = 0; i < gates.size(); i++) {
         const Gate& g = gates[i];
         if (length(g.dir) < 0.5f) report.error(g.name + " points straight up or down; turn it so its green arrow points down the track.");
@@ -1661,6 +1815,7 @@ bool rush2::track_mod::convert(const std::vector<uint8_t>& glb, const std::strin
         Section section;                        // its model's list
         float unit = 16.0f;                     // model vertex units per ft: under 16 for a mesh past vertex_reach,
                                                 // made up by the path's scale (no collision) as the sky is drawn
+        bool card = false;                      // custom property billboard = true: drawn turned to the camera
     };
     std::vector<Mover> movers;
     std::map<int, int> mover_at;                // MOVE_ node -> movers
@@ -1674,6 +1829,10 @@ bool rush2::track_mod::convert(const std::vector<uint8_t>& glb, const std::strin
             m.node = r;
             m.name = base_name(nd.name).substr(5);
             if (auto it = settings.movers.find(m.name); it != settings.movers.end()) m.set = it->second;
+            if (nd.extras.contains("billboard")) {
+                const auto& v = nd.extras["billboard"];
+                m.card = v.is_boolean() ? v.get<bool>() : v.is_number() && v.get<double>() != 0.0;
+            }
             std::vector<const rush2::gltf::Channel*> channels;
             std::string anim;
             int anims = 0;
@@ -1819,6 +1978,14 @@ bool rush2::track_mod::convert(const std::vector<uint8_t>& glb, const std::strin
         int root = mover_of[size_t(n - scene.nodes.data())];
         const Mover* m = root >= 0 && mover_at.contains(root) ? &movers[mover_at[root]] : nullptr;
         if (root >= 0 && (!m || m->group == 0)) return;
+        // covered = 1 (a tunnel: cars drawn darker) or 2 (lightly covered), a custom property of the COL_ mesh.
+        uint8_t cover = 0;
+        if (n->extras.contains("covered")) {
+            const auto& v = n->extras["covered"];
+            int c = v.is_number() ? int(v.get<double>()) : v.is_boolean() ? int(v.get<bool>()) : -1;
+            if (c >= 0 && c <= 2) cover = uint8_t(c);
+            else report.warning(n->name + ": covered must be 0, 1 (a tunnel) or 2 (lightly covered); ignored.");
+        }
         for (const auto& prim : n->primitives) {
             for (size_t t = 0; t + 2 < prim.tris.size(); t += 3) {
                 CollisionTri c;
@@ -1830,6 +1997,7 @@ bool rush2::track_mod::convert(const std::vector<uint8_t>& glb, const std::strin
                 // glTF front = counter-clockwise; x negated mirrors it, so the front normal is the game cross's negation.
                 c.front = mul(cross(sub(c.v[1], c.v[0]), sub(c.v[2], c.v[0])), -1.0f);
                 c.flags = flags;
+                c.cover = cover;
                 c.object = n->name;
                 c.group = m ? m->group : 0;
                 if (auto it = prim.attrs.find("_SEGMENT"); it != prim.attrs.end() && !m) {
@@ -2008,7 +2176,13 @@ bool rush2::track_mod::convert(const std::vector<uint8_t>& glb, const std::strin
                             std::to_string(rungs.size()) + " cross sections, " + fmt_w(min_w) +
                             (max_w - min_w > 0.5f ? " to " + fmt_w(max_w) : std::string()) + " wide.");
                 float closing = length(sub(rungs.front().p, rungs.back().p));
-                if (!ribbon.closed && closing > median * 3.0f + 10.0f && !arena) {
+                if (open_path && ribbon.closed) {
+                    report.warning(std::string("AIPATH_main is a closed loop, but the track is ") +
+                                   (p2p ? "point-to-point: it is raced once from its start to its end."
+                                        : "a run-in circuit: it is read from its start round to its end.") +
+                                   " In Blender: Curve > Toggle Cyclic to open it.");
+                }
+                if (!ribbon.closed && closing > median * 3.0f + 10.0f && !arena && !open_path) {
                     report.warning("AIPATH_main isn't a closed loop (its ends are " + fmt_ft(closing) +
                                    " apart); it is closed with a straight line. In Blender: Curve > Toggle Cyclic.");
                 }
@@ -2033,7 +2207,61 @@ bool rush2::track_mod::convert(const std::vector<uint8_t>& glb, const std::strin
     // computer cars follow it as best they can; the path's own warnings are left out, the error already says what's
     // wrong.
     bool stand_in = false;
-    if (!arena && !finish) {
+    // A point-to-point race runs along AIPATH_main to FINISH: the curve is turned round when its start is the end
+    // nearer FINISH. With no START, the start line stands p2p_run_up ft along the path from its start, room for the
+    // grid Rush 2 lines up behind it (four rows 20 ft apart; California Speed's move_start keeps 75 ft); with no
+    // FINISH, the finish line is at the path's end. A run-in circuit's curve starts at its free end: the other end is
+    // the one that comes back onto the path, where the loop begins.
+    constexpr float p2p_run_up = 100.0f;
+    if (open_path && rungs.size() >= 4) {
+        if (p2p && finish && dist_xz(rungs.front().p, to_game(finish->position())) < dist_xz(rungs.back().p, to_game(finish->position()))) {
+            std::reverse(rungs.begin(), rungs.end());
+            for (PathPoint& r : rungs) r.lateral = mul(r.lateral, -1.0f);
+            report.info("AIPATH_main starts at FINISH's end; it was turned round to run to FINISH.");
+        }
+        if (run_in) {
+            // How close each end comes to the rest of the path (more than a quarter of it away along the curve).
+            size_t n = rungs.size(), far = n / 4;
+            auto nearest = [&](const Vec3& p, size_t from, size_t to) {
+                float best = 1e30f;
+                for (size_t i = from; i < to; i++) best = std::min(best, length(sub(rungs[i].p, p)));
+                return best;
+            };
+            if (nearest(rungs.front().p, far, n) < nearest(rungs.back().p, 0, n - far)) {
+                std::reverse(rungs.begin(), rungs.end());
+                for (PathPoint& r : rungs) r.lateral = mul(r.lateral, -1.0f);
+                report.info("AIPATH_main starts at the end that joins the loop; it was turned round to start on the run-in.");
+            }
+        }
+        auto line_at = [&](const char* name, size_t i, size_t j) {
+            Gate g{ name, mul(add(rungs[i].p, rungs[j].p), 0.5f), sub(rungs[j].p, rungs[i].p), 40.0f };
+            g.dir[1] = 0.0f;
+            g.dir = normalize(g.dir);
+            g.radius = std::max(rungs[i].half_width * 1.5f, 40.0f);
+            return g;
+        };
+        if (!start_line) {
+            size_t i = 0;
+            for (float s = 0.0f; i + 2 < rungs.size() && s < p2p_run_up; i++) s += length(sub(rungs[i + 1].p, rungs[i].p));
+            Gate g = line_at("START", i, i + 1);
+            report.info("No START: the start line is " + fmt_ft(p2p_run_up) + " along AIPATH_main from its start, at " +
+                        fmt_pos(g.pos) + ".");
+            gates.insert(gates.begin(), g);
+        }
+        if (!finish) {
+            Gate g = line_at("FINISH", rungs.size() - 2, rungs.size() - 1);
+            report.warning("With no FINISH, a stand-in finish line is used at the end of AIPATH_main, " + fmt_pos(g.pos) + ".");
+            gates.push_back(g);
+        }
+    }
+    else if (open_path && !start_line && !gates.empty()) {
+        Gate g = gates.front();
+        g.name = "START";
+        g.pos = sub(g.pos, mul(g.dir, p2p_run_up));
+        report.warning("With no START and no usable AI path, a stand-in start line is used at " + fmt_pos(g.pos) + ".");
+        gates.insert(gates.begin(), g);
+    }
+    if (!arena && !finish && !open_path) {
         Gate f{ "FINISH", {}, { 0.0f, 0.0f, 1.0f }, 40.0f };
         if (rungs.size() >= 2) {
             f.pos = mul(add(rungs[0].p, rungs[1].p), 0.5f);
@@ -2094,7 +2322,7 @@ bool rush2::track_mod::convert(const std::vector<uint8_t>& glb, const std::strin
                 corners.push_back({ sub(m.pos, mul(m.dir, d)), m.radius });
                 corners.push_back({ add(m.pos, mul(m.dir, d)), m.radius });
             }
-            for (size_t k = 0; k < corners.size(); k++) {
+            for (size_t k = 0; k + (open_path ? 1 : 0) < corners.size(); k++) {   // an open path stops at its last gate
                 const auto& [a, wa] = corners[k];
                 const auto& [b, wb] = corners[(k + 1) % corners.size()];
                 add_run(a, b, wa, wb);
@@ -2124,6 +2352,8 @@ bool rush2::track_mod::convert(const std::vector<uint8_t>& glb, const std::strin
         struct Crossing { float s; bool along; Vec3 at; };   // s: distance along rungs; along: the arrow's way
         size_t nr = rungs.size();
         std::vector<float> at(nr + 1, 0.0f);   // distance along the closed loop to rung i (at[nr]: the lap)
+        // A point-to-point or run-in path is open: no step from its last rung back to its first.
+        const size_t steps = open_path ? nr - 1 : nr;
         std::vector<std::vector<Crossing>> found(gates.size());
         auto trace = [&]() {
             for (size_t i = 0; i < nr; i++) at[i + 1] = at[i] + length(sub(rungs[(i + 1) % nr].p, rungs[i].p));
@@ -2131,7 +2361,7 @@ bool rush2::track_mod::convert(const std::vector<uint8_t>& glb, const std::strin
                 const Gate& gate = gates[g];
                 Vec3 side_dir = { -gate.dir[2], 0.0f, gate.dir[0] };
                 found[g].clear();
-                for (size_t i = 0; i < nr; i++) {
+                for (size_t i = 0; i < steps; i++) {
                     const Vec3& a = rungs[i].p;
                     const Vec3& b = rungs[(i + 1) % nr].p;
                     float sa = dot(sub(a, gate.pos), gate.dir), sb = dot(sub(b, gate.pos), gate.dir);
@@ -2151,8 +2381,8 @@ bool rush2::track_mod::convert(const std::vector<uint8_t>& glb, const std::strin
                     again = false;
                     for (size_t k = 0; k < c.size() && !again; k++) {
                         size_t j = (k + 1) % c.size();
-                        if (j == k || c[k].along == c[j].along) continue;
-                        float apart = std::fmod(c[j].s - c[k].s + at[nr], at[nr]);
+                        if (j == k || c[k].along == c[j].along || (open_path && j == 0)) continue;
+                        float apart = open_path ? c[j].s - c[k].s : std::fmod(c[j].s - c[k].s + at[nr], at[nr]);
                         if (apart > jitter) continue;
                         c.erase(c.begin() + long(std::max(k, j)));
                         c.erase(c.begin() + long(std::min(k, j)));
@@ -2172,7 +2402,39 @@ bool rush2::track_mod::convert(const std::vector<uint8_t>& glb, const std::strin
             report.info("AIPATH_main runs against the gates' arrows; it was reversed.");
             trace();
         }
-        float lap = at[nr];
+        float lap = at[steps];   // a point-to-point race's: start to end
+        // A run-in circuit's loop start: the gate (not START) whose first crossing is nearest where the path ends. A
+        // path drawn a little past it crosses it again there: the path is cut at that second crossing, so it ends on
+        // the loop start as the stock run-in paths do (New York One's spine and lanes end 7-45 ft before it).
+        if (run_in) {
+            constexpr float join_reach = 300.0f;   // ft from the path's end to the loop start's crossing
+            const Vec3 end = rungs.back().p;
+            int best_g = -1;
+            float best_d = 1e30f;
+            for (size_t g = 1; g < gates.size(); g++) {
+                if (found[g].empty()) continue;
+                float d = length(sub(found[g].front().at, end));
+                if (d < best_d) { best_d = d; best_g = int(g); }
+            }
+            if (best_g < 0) {
+                report.error("A run-in circuit needs a checkpoint where AIPATH_main's end comes back onto it: the loop "
+                             "starts there.");
+            }
+            else {
+                auto& c = found[size_t(best_g)];
+                for (size_t k = 1; k < c.size(); k++) {
+                    if (c[k].s > c[0].s + join_reach && length(sub(c[k].at, end)) < join_reach) { lap = c[k].s; break; }
+                }
+                if (best_d > join_reach && lap == at[steps]) {
+                    report.error("AIPATH_main ends " + fmt_ft(best_d) + " from " + gates[size_t(best_g)].name + ", the "
+                                 "nearest checkpoint: a run-in circuit's path ends where it comes back onto itself, at "
+                                 "the checkpoint where the loop starts.");
+                }
+                gates[size_t(best_g)].loop = true;
+                for (auto& cg : found) cg.erase(std::remove_if(cg.begin(), cg.end(), [&](const Crossing& k) { return k.s > lap + 1.0f; }), cg.end());
+                report.info("Run-in circuit: the loop starts at " + gates[size_t(best_g)].name + "; the laps go round from there.");
+            }
+        }
         out.lap_feet = lap;
         // Each gate's crossing: the one going the way its arrow points. A gate wide enough to reach another stretch of
         // road (a compact track's next leg) is told apart by its arrow when that stretch runs the other way; the game
@@ -2217,8 +2479,13 @@ bool rush2::track_mod::convert(const std::vector<uint8_t>& glb, const std::strin
                 gate.dir = mul(gate.dir, -1.0f);
             }
         }
-        // The lap starts at FINISH's crossing (else, already reported, at the rung nearest FINISH).
-        float start = gate_s[0];
+        // The lap starts at FINISH's crossing (else, already reported, at the rung nearest FINISH); a point-to-point
+        // race's spine at the path's start, its run-up to START included (the grid lines up behind START on it).
+        float start = open_path ? 0.0f : gate_s[0];
+        if (open_path && gate_s[0] >= 0.0f && gate_s[0] < 60.0f) {
+            report.warning("START is only " + fmt_ft(gate_s[0]) + " along AIPATH_main from its start: the grid lines up "
+                           "behind START, four rows 20 ft (6 m) apart, so begin the curve about 30 m (100 ft) further back.");
+        }
         if (start < 0.0f) {
             size_t near = 0;
             float best = 1e30f;
@@ -2228,10 +2495,10 @@ bool rush2::track_mod::convert(const std::vector<uint8_t>& glb, const std::strin
             }
             start = at[near];
         }
-        for (float s = 0.0f; s < lap - spine_step * 0.5f; s += spine_step) {
-            float u = std::fmod(start + s, lap);
+        for (float s = 0.0f; open_path ? s <= lap : s < lap - spine_step * 0.5f; s += spine_step) {
+            float u = open_path ? s : std::fmod(start + s, lap);
             size_t seg = size_t(std::upper_bound(at.begin(), at.end(), u) - at.begin());
-            seg = std::clamp<size_t>(seg, 1, nr) - 1;
+            seg = std::clamp<size_t>(seg, 1, steps) - 1;
             float span = std::max(1e-6f, at[seg + 1] - at[seg]);
             float f = std::clamp((u - at[seg]) / span, 0.0f, 1.0f);
             const PathPoint& a = rungs[seg];
@@ -2245,22 +2512,56 @@ bool rush2::track_mod::convert(const std::vector<uint8_t>& glb, const std::strin
             p.mode = f < 0.5f ? a.mode : b.mode;
             spine.push_back(p);
         }
-        // Each gate's crossing as the first spine point past it (the finish line: point 0, on it).
+        // Each gate's crossing as the first spine point past it (the finish line: point 0, on it; a point-to-point
+        // race's gates all where the path meets them, in order START, CHECKPOINT_1, ..., FINISH).
         std::vector<std::pair<float, size_t>> order;
         for (size_t g = 0; g < gates.size(); g++) {
             if (gate_s[g] < 0.0f || spine.empty()) continue;
+            if (open_path) {
+                gates[g].at = int(std::min(size_t(gate_s[g] / spine_step) + 1, spine.size() - 1));
+                order.push_back({ gate_s[g], g });
+                continue;
+            }
             float q = std::fmod(gate_s[g] - start + lap, lap);
             gates[g].at = g == 0 ? 0 : int((size_t(q / spine_step) + 1) % spine.size());
             if (g > 0) order.push_back({ q, g });
         }
         std::sort(order.begin(), order.end());
+        if (run_in) {
+            // A run-in circuit's gates go in the file as the path meets them, FINISH among them (San Francisco Rush's
+            // Golden Gate has a checkpoint after its finish line): START first, the checkpoints in number order.
+            bool ok = !order.empty() && order[0].second == 0;
+            int last = 0;
+            for (const auto& [q, g] : order) {
+                int k = number_after(gates[g].name, "CHECKPOINT_");
+                if (k < 0) continue;
+                ok = ok && k > last;
+                last = k;
+            }
+            if (!ok) {
+                std::string seen;
+                for (const auto& [q, g] : order) seen += ", " + gates[g].name;
+                report.error("The gates aren't in race order: along the AI path from its start it meets them as " +
+                             seen.substr(2) + ". START comes first and the checkpoints are numbered 1, 2, 3, ... in "
+                             "that order (FINISH may be anywhere among them).");
+            }
+            std::vector<Gate> sorted;
+            std::vector<bool> taken(gates.size(), false);
+            for (const auto& [q, g] : order) { sorted.push_back(gates[g]); taken[g] = true; }
+            for (size_t g = 0; g < gates.size(); g++) if (!taken[g]) sorted.push_back(gates[g]);
+            gates = std::move(sorted);
+        }
         bool in_order = true;
-        for (size_t k = 0; k < order.size(); k++) in_order = in_order && order[k].second == k + 1;
-        if (!in_order && order.size() + 1 == gates.size()) {
+        size_t first = p2p ? 0 : 1;
+        for (size_t k = 0; k < order.size(); k++) in_order = in_order && order[k].second == k + first;
+        if (!run_in && !in_order && order.size() + first == gates.size()) {
             std::string seen;
             for (const auto& [q, g] : order) seen += ", " + gates[g].name;
-            report.error("The checkpoints aren't numbered in race order: from FINISH the AI path meets them as " +
-                         seen.substr(2) + ". Number them 1, 2, 3, ... in that order.");
+            report.error(p2p ? "The gates aren't in race order: along the AI path from its start it meets them as " +
+                               seen.substr(2) + ". Number the checkpoints 1, 2, 3, ... in that order, START before them "
+                               "and FINISH after."
+                             : "The checkpoints aren't numbered in race order: from FINISH the AI path meets them as " +
+                               seen.substr(2) + ". Number them 1, 2, 3, ... in that order.");
         }
         if (spine.size() > 4000) { report.error("The AI path is too long for the game (over 80 km)."); spine.clear(); }
         // The path's height: the road under it (the game's nearest-point searches are 3D).
@@ -2284,7 +2585,7 @@ bool rush2::track_mod::convert(const std::vector<uint8_t>& glb, const std::strin
         auto off = [&](size_t i) { return std::isnan(road[i]) || std::fabs(road[i] - spine[i].p[1]) > off_road; };
         size_t first_on = 0;
         while (first_on < n && off(first_on)) first_on++;
-        size_t in_air = 0;
+        size_t in_air = 0, gaps = 0;
         for (size_t k = 0; first_on < n && k < n;) {
             size_t a = (first_on + k) % n;
             if (!off(a)) { k++; continue; }
@@ -2319,11 +2620,31 @@ bool rush2::track_mod::convert(const std::vector<uint8_t>& glb, const std::strin
                 for (size_t j = 0; j < len; j++) spine[(a + j) % n].air = true;
                 in_air += len;
             }
+            // Otherwise a point or two off the road between points on it, where the curve carries on between the
+            // road's heights either side: the probe slipped through a seam between collision polygons and found nothing
+            // near, or road 60 ft above (the Rush 2049 arcade's Civic Center and Mission each have one). The road is
+            // there at the curve's height.
+            else if (len <= 2 && !off(before) && !off(after)) {
+                bool follows = true;
+                for (size_t j = 0; j < len; j++) {
+                    float t = float(j + 1) / float(len + 1);
+                    float h = road[before] + (road[after] - road[before]) * t;
+                    follows = follows && std::fabs(spine[(a + j) % n].p[1] - h) < off_road;
+                }
+                if (follows) {
+                    for (size_t j = 0; j < len; j++) road[(a + j) % n] = spine[(a + j) % n].p[1];
+                    gaps += len;
+                }
+            }
             k += len;
         }
         if (in_air) {
             report.info("AIPATH_main is over a gap for " + std::to_string(in_air) + " point(s) (a jump): kept at the "
                         "curve's height.");
+        }
+        if (gaps) {
+            report.info("AIPATH_main crosses a seam in the road's collision at " + std::to_string(gaps) + " point(s): "
+                        "kept at the curve's height.");
         }
         size_t off_height = 0, no_road = 0;
         float worst = 0.0f;
@@ -2357,13 +2678,26 @@ bool rush2::track_mod::convert(const std::vector<uint8_t>& glb, const std::strin
     // ---- target speeds ----
     // Per point of sp, for a race along it: the backward race brakes for the same corners from the other side, and an
     // AISPEED_ marker caps the speed from it on in either direction. forward: the race the report speaks of.
+    // Past a run-in circuit's last spine point the race goes on from the loop start's crossing.
+    long loop_at = -1;
+    for (const Gate& g : gates) if (g.loop && g.at >= 0) loop_at = g.at;
     auto target_speeds = [&](const std::vector<PathPoint>& sp, bool forward) {
         size_t n = sp.size();
+        // Point i + k along the race: a circuit wraps to its start, a run-in circuit to its loop start, a
+        // point-to-point path stops at its end.
+        auto ahead_of = [&](size_t i, size_t k) -> size_t {
+            if (!open_path) return (i + k) % n;
+            size_t j = i + k;
+            if (j < n) return j;
+            if (run_in && loop_at >= 0 && size_t(loop_at) < n) return std::min(size_t(loop_at) + (j - n), n - 1);
+            return n - 1;
+        };
         std::vector<float> v(n), mph(n), radius(n);
         for (size_t i = 0; i < n; i++) {
-            const Vec3& a = sp[(i + n - 3) % n].p;
+            // A point-to-point path doesn't wrap: its ends look only along the path.
+            const Vec3& a = sp[open_path ? (i < 3 ? 0 : i - 3) : (i + n - 3) % n].p;
             const Vec3& b = sp[i].p;
-            const Vec3& c = sp[(i + 3) % n].p;
+            const Vec3& c = sp[ahead_of(i, 3)].p;
             Vec3 ab = sub(b, a), bc = sub(c, b), ac = sub(c, a);
             ab[1] = bc[1] = ac[1] = 0.0f;
             float area2 = std::fabs(ab[0] * bc[2] - ab[2] * bc[0]);
@@ -2379,7 +2713,7 @@ bool rush2::track_mod::convert(const std::vector<uint8_t>& glb, const std::strin
         const size_t ahead = size_t(500.0f / spine_step);
         for (size_t i = 0; i < n; i++) {
             float r = 1e9f;
-            for (size_t k = 0; k <= ahead; k++) r = std::min(r, radius[(i + k) % n]);
+            for (size_t k = 0; k <= ahead; k++) r = std::min(r, radius[ahead_of(i, k)]);
             float s = table[0][1];
             if (r >= table[10][0]) s = table[10][1];
             else for (int t = 0; t < 10; t++) {
@@ -2420,6 +2754,7 @@ bool rush2::track_mod::convert(const std::vector<uint8_t>& glb, const std::strin
             // From this marker up to the next one (all the way round when it is the only one).
             size_t from = caps[c].first, to = caps[(c + 1) % caps.size()].first;
             size_t count = caps.size() == 1 ? n : (to + n - from) % n;
+            if (open_path && (c + 1 == caps.size() || caps.size() == 1)) count = n - from;   // the last one: to the end
             for (size_t k = 0; k < count; k++) {
                 size_t f = (from + k) % n;
                 size_t i = forward ? f : (n - f) % n;
@@ -2430,8 +2765,8 @@ bool rush2::track_mod::convert(const std::vector<uint8_t>& glb, const std::strin
         const float decel = 28.0f;
         for (int pass = 0; pass < 2; pass++) {
             for (size_t k = 0; k < n; k++) {
-                size_t i = (n - 1 - k), j = (i + 1) % n;
-                if (authored[i]) continue;
+                size_t i = (n - 1 - k), j = ahead_of(i, 1);
+                if (authored[i] || (p2p && i + 1 == n)) continue;
                 v[i] = std::min(v[i], std::sqrt(v[j] * v[j] + 2.0f * decel * spine_step));
             }
         }
@@ -2513,6 +2848,7 @@ bool rush2::track_mod::convert(const std::vector<uint8_t>& glb, const std::strin
             float best = 1e30f;
             Vec3 pick{};
             float pick_speed = std::nanf(""), pick_mode = std::nanf("");
+            bool pick_lifted = false;
             for (size_t j = 0; j < segments; j++) {
                 const Vec3& a = line[j];
                 const Vec3& b = line[(j + 1) % line.size()];
@@ -2522,10 +2858,21 @@ bool rush2::track_mod::convert(const std::vector<uint8_t>& glb, const std::strin
                 if (std::fabs(dot(normalize(Vec3{ ab[0], 0.0f, ab[2] }), fwd)) < 0.5f) continue;
                 Vec3 x = add(a, mul(ab, sa / (sa - sb)));
                 float off = dot(sub(x, q.p), lat);
-                if (std::fabs(off) > reach || std::fabs(x[1] - q.p[1]) > gate_height) continue;
+                if (std::fabs(off) > reach) continue;
+                // Higher than gate_height above the spine is still beside it when the nearest road under the lane is
+                // no higher than the spine's: a racing line that jumps higher or further than AIPATH_main (the Rush
+                // 2049 arcade's Civic Center and Marina jumps), not road on another level. Such a point keeps its
+                // own height.
+                bool lifted = false;
+                if (std::fabs(x[1] - q.p[1]) > gate_height) {
+                    float g = x[1] > q.p[1] && !cpolys.empty() ? ground_under(cpolys, x, 400.0f) : NAN;
+                    lifted = x[1] > q.p[1] && (cpolys.empty() || std::isnan(g) || g < q.p[1] + gate_height);
+                    if (!lifted) continue;
+                }
                 if (std::fabs(off - want) < best) {
                     best = std::fabs(off - want);
                     pick = x;
+                    pick_lifted = lifted;
                     float f = sa / (sa - sb);
                     size_t jb = (j + 1) % line.size();
                     float s0 = ribbon.speed[j], s1 = ribbon.speed[jb];
@@ -2537,7 +2884,7 @@ bool rush2::track_mod::convert(const std::vector<uint8_t>& glb, const std::strin
                 if (!missed++) first_missed = add(q.p, mul(lat, want));
                 continue;
             }
-            lane[i] = on_road(pick, q.air);
+            lane[i] = on_road(pick, q.air || pick_lifted);
             lane_speed[i] = pick_speed;
             lane_mode[i] = pick_mode;
         }
@@ -2587,6 +2934,8 @@ bool rush2::track_mod::convert(const std::vector<uint8_t>& glb, const std::strin
         for (size_t i = 0; i < spine.size(); i++) {
             if (spine[i].air) continue;              // over a jump: nothing under it is the point
             for (const auto& lane : lanes) {
+                // A painted lane jumping higher than the spine (paint_lane keeps such points over 30 ft above it).
+                if (lane[i][1] > spine[i].p[1] + 30.0f) continue;
                 if (!surface_near(cpolys, lane[i], 40.0f)) {
                     if (!off_road) first = lane[i];
                     off_road++;
@@ -2610,7 +2959,28 @@ bool rush2::track_mod::convert(const std::vector<uint8_t>& glb, const std::strin
     auto write_path = [&](const std::vector<PathPoint>& sp, const Lanes& lanes, const std::vector<float>& mph,
                           const std::vector<Gate>& order, std::vector<uint8_t>& d, const LaneAI* ai = nullptr) {
         add16(d, 0);                               // base time (the game uses 90)
-        for (int i = 0; i < 3; i++) add16(d, 0xFFFF); // loop / finish / arm checkpoints: recomputed at load
+        // An open path's flags per gate: the start line arms lap counting (2), FINISH is the lap line (1), a run-in
+        // circuit's loop start is where its laps go round from (4); a point-to-point race's loop start is the start.
+        auto open_flags = [&](size_t c) -> uint16_t {
+            const Gate& g = order[c];
+            if (c == 0) return 2;
+            return uint16_t((g.name == "FINISH" || (p2p && c + 1 == order.size()) ? 1 : 0) | (g.loop ? 4 : 0));
+        };
+        if (open_path && !order.empty()) {
+            // The header's loop, finish and arm checkpoints, as California Speed's point-to-point files and Rush 2's
+            // run-in ones (New York One: 1, 5, 0) have them.
+            size_t loop = 0, fin = order.size() - 1;
+            for (size_t c = 1; c < order.size(); c++) {
+                if ((open_flags(c) & 4) && loop == 0) loop = c;
+                if (open_flags(c) & 1) fin = c;
+            }
+            add16(d, uint16_t(loop));
+            add16(d, uint16_t(fin));
+            add16(d, 0);
+        }
+        else {
+            for (int i = 0; i < 3; i++) add16(d, 0xFFFF); // loop / finish / arm checkpoints: recomputed at load
+        }
         add16(d, uint16_t(order.size()));
         add16(d, 0);
         for (size_t c = 0; c < 10; c++) {
@@ -2621,7 +2991,9 @@ bool rush2::track_mod::convert(const std::vector<uint8_t>& glb, const std::strin
                 // side change either way).
                 for (float f : g.dir) addf(d, -f);
                 add32(d, uint32_t(std::min(65535.0f, g.radius) * std::min(65535.0f, g.radius)));
-                add16(d, c == 0 ? 7 : 0);          // finish: lap line, arms lap counting, loop start
+                // Circuit: the finish is the lap line, arms lap counting and starts the loop (7). An open path:
+                // open_flags.
+                add16(d, open_path ? open_flags(c) : c == 0 ? 7 : 0);
                 add16(d, 45);
                 add16(d, 45);
             }
@@ -2845,6 +3217,15 @@ bool rush2::track_mod::convert(const std::vector<uint8_t>& glb, const std::strin
             }
         }
     }
+    else if (!spine.empty() && open_path) {
+        // Raced one way only (the track select lists no BACKWARD for it): the backward file is the forward one. The
+        // race behind the records screen starts its cars at START, not partway down a road that ends or on the loop.
+        write_path(spine, lanes, speed_mph, gates, out.track.path, &lane_ai);
+        out.track.path_backward = out.track.path;
+        int16_t at = int16_t(std::max(0, gates[0].at));
+        for (int b = 0; b < 2; b++) out.track.demo_starts[b].assign(4, at);
+        out.checkpoints = int(gates.size()) - 2;
+    }
     else if (!spine.empty()) {
         write_path(spine, lanes, speed_mph, gates, out.track.path, &lane_ai);
         // Backward: from the finish line the other way round (point i is forward point n - i), lanes mirrored with
@@ -2904,6 +3285,17 @@ bool rush2::track_mod::convert(const std::vector<uint8_t>& glb, const std::strin
         if (far) {
             report.error("MOVE_" + m.name + " reaches more than " + fmt_ft(vertex_reach) + " from its origin; " +
                          std::to_string(far) + " of its triangles aren't drawn. Keep a moving object with collision near its origin.");
+        }
+        // A moving billboard (billboard = true): Rush 2 draws a camera card at its pose's position only, so the model
+        // keeps the first key's scale and is turned half a turn, as BILLBOARD_ models are (below).
+        if (m.card) {
+            const Vec3& s0 = m.scale[0];
+            for (VisualTri& t : m.tris) {
+                for (int k = 0; k < 3; k++) {
+                    t.p[k] = { -s0[0] * t.p[k][0], s0[1] * t.p[k][1], -s0[2] * t.p[k][2] };
+                    t.n[k] = normalize(Vec3{ -t.n[k][0], t.n[k][1], -t.n[k][2] });
+                }
+            }
         }
         // A mesh reaching past vertex_reach is stored in coarser units and drawn scaled back up by its path.
         float extent = 0.0f;
@@ -3392,7 +3784,7 @@ bool rush2::track_mod::convert(const std::vector<uint8_t>& glb, const std::strin
         Vec3 pos = bb ? bb->pos : mv ? mv->pos[0] : is_finish ? (gates.empty() ? Vec3{} : gates[0].pos) : sections[i].origin;
         for (float f : pos) addf(pl, f);
         bool late = bm ? bm->section.late : !mv && !is_finish && sections[i].late;
-        add32(pl, 0x40 | (late ? late_pass : 0) | (bb && bb->card ? camera_card : 0));
+        add32(pl, 0x40 | (late ? late_pass : 0) | ((bb && bb->card) || (mv && mv->card) ? camera_card : 0));
         if (bb && bb->prop) {
             rush2::track2049::PropRecord r{};
             r.record = int(i);
@@ -3412,8 +3804,106 @@ bool rush2::track_mod::convert(const std::vector<uint8_t>& glb, const std::strin
 
     // ---- moving objects' paths: a 2049 file with one PTHD chunk (movers.md; movers::parse_paths reads it) ----
     if (!movers.empty()) {
+        // Scripted movers (start / open / close events, once and door modes): a SCRP chunk with one script per path
+        // and a TRIG chunk with the trigger boxes, read by movers::parse_scripts (track2049_movers_logic.cpp).
+        std::vector<uint8_t> scripts;
+        bool any_script = false, any_progress = false;
+        std::set<std::string> used_triggers;
+        auto event_bytes = [&](const Mover& m, const std::string& text, std::vector<uint8_t>& d) {
+            std::istringstream in(text);
+            std::vector<std::string> w;
+            for (std::string x; in >> x;) w.push_back(x);
+            std::string what = w.empty() ? "" : lower(w[0]);
+            int kind = -1, trigger = -1, lap = 0;
+            float seconds = 0.0f;
+            char* end = nullptr;
+            if (what == "time" && w.size() == 2) {
+                seconds = std::strtof(w[1].c_str(), &end);
+                if (end && !*end && seconds >= 0) kind = 0;
+            }
+            else if (what == "trigger" && (w.size() == 2 || (w.size() == 4 && lower(w[2]) == "lap"))) {
+                std::string tn = upper(w[1]);
+                for (size_t i = 0; i < triggers.size(); i++) if (triggers[i].name == tn) trigger = int(i);
+                if (w.size() == 4) lap = int(std::strtol(w[3].c_str(), &end, 10));
+                if (trigger < 0) {
+                    report.error("track.toml: movers." + m.name + ": \"" + text + "\" names no TRIGGER_" + tn + " object.");
+                    return false;
+                }
+                if (w.size() == 4 && (!end || *end || lap < 1)) {
+                    report.error("track.toml: movers." + m.name + ": \"" + text + "\": lap must be a lap number (1 is the first).");
+                    return false;
+                }
+                used_triggers.insert(tn);
+                kind = 1;
+            }
+            else if (w.size() == 1 && what == "odd_lap") kind = 2;
+            else if (w.size() == 1 && what == "even_lap") kind = 3;
+            else if (w.size() == 1 && what == "final_lap") kind = 4;
+            else if (what == "progress" && w.size() == 2) {
+                seconds = std::strtof(w[1].c_str(), &end);
+                if (end && !*end && seconds >= 0) kind = 5;
+                if (kind == 5 && spine.empty()) {
+                    report.error("track.toml: movers." + m.name + ": \"" + text + "\" needs an AI path (AIPATH_main) to "
+                                 "measure the race along.");
+                    return false;
+                }
+                any_progress = true;
+            }
+            else if (w.size() == 1 && what == "last_checkpoint") kind = 6;
+            if (kind < 0) {
+                report.error("track.toml: movers." + m.name + ": \"" + text + "\" isn't an event. Use \"time <seconds>\", "
+                             "\"trigger <name>\", \"trigger <name> lap <n>\", \"progress <feet>\", \"odd_lap\", \"even_lap\", "
+                             "\"final_lap\" or \"last_checkpoint\".");
+                return false;
+            }
+            add8(d, uint8_t(kind));
+            add8(d, 0);
+            add16(d, uint16_t(int16_t(trigger)));
+            add16(d, uint16_t(int16_t(lap)));
+            add16(d, 0);
+            addf(d, seconds);
+            return true;
+        };
+        auto scripted = [](const Mover& m) {
+            return m.set.mode == "once" || m.set.mode == "door" || (m.set.mode != "ride" && !m.set.start.empty());
+        };
+        for (const Mover& m : movers) {
+            const auto& st = m.set;
+            bool on = scripted(m);
+            any_script = any_script || on;
+            uint8_t mode = !on ? 0 : st.mode == "loop" ? 1 : st.mode == "pingpong" ? 2 : st.mode == "once" ? 3 : 4;
+            std::vector<uint8_t> ev;
+            int counts[3] = {};
+            const std::vector<std::string>* lists[3] = { &st.start, &st.open, &st.close };
+            for (int l = 0; on && l < 3; l++) {
+                if (mode == 4 ? l == 0 : l > 0) continue;
+                for (const std::string& e : *lists[l]) {
+                    if (counts[l] == 255) {
+                        report.warning("track.toml: movers." + m.name + ": more than 255 events in one setting; the rest are left out.");
+                        break;
+                    }
+                    if (event_bytes(m, e, ev)) counts[l]++;
+                }
+            }
+            add8(scripts, mode);
+            add8(scripts, uint8_t(on && mode == 4 && st.open_at_start ? 1 : 0));
+            for (int c : counts) add8(scripts, uint8_t(c));
+            scripts.resize(scripts.size() + 3, 0);
+            addf(scripts, on && mode == 4 ? st.open_delay : -1.0f);
+            addf(scripts, on && mode == 4 ? st.close_delay : -1.0f);
+            scripts.insert(scripts.end(), ev.begin(), ev.end());
+            if (mode == 4 && st.open.empty() && st.close.empty() && st.open_delay < 0 && st.close_delay < 0) {
+                report.warning("track.toml: movers." + m.name + " is a door with no open or close events; it never moves.");
+            }
+        }
+        for (const Trigger& t : triggers) {
+            if (!used_triggers.contains(t.name)) {
+                report.warning("TRIGGER_" + t.name + " isn't used by any [movers] start, open or close; it does nothing.");
+            }
+        }
         std::vector<uint8_t>& pb = out.track.mover_paths;
-        uint32_t headers = 4 + 24;      // directory at 4: PTHD's entry and an empty one ending it
+        // Directory at 4: PTHD's entry, SCRP's, TRIG's and LAPP's (custom tracks), and an empty one ending it.
+        uint32_t headers = 4 + 12 * (any_script || !triggers.empty() ? 5 : 2);
         add32(pb, 4);
         for (char c : std::string("PTHD")) add8(pb, uint8_t(c));
         add32(pb, headers);
@@ -3429,7 +3919,9 @@ bool rush2::track_mod::convert(const std::vector<uint8_t>& glb, const std::strin
             bool loop = m.set.mode == "loop";
             size_t keys = m.times.size(), count = loop && m.closed ? keys - 1 : keys;
             uint32_t flags = 0x8000;    // no TRIGGERON/OFF models or sounds
-            flags |= loop ? 0x2 : m.set.mode == "pingpong" ? 0x1 : 0x40 | 0x4000;
+            // A scripted mover's path is a loop's or a pingpong's (its script runs its clock, track2049_movers_logic.cpp
+            // step_scripted); a ride waits for a car on its floor.
+            flags |= loop ? 0x2 : m.set.mode == "pingpong" || scripted(m) ? 0x1 : 0x40 | 0x4000;
             flags |= m.set.races == "forward" ? 0x4 : m.set.races == "backward" ? 0x8 : 0xC;
             if (m.group) flags |= 0x20 | (m.set.races != "both" ? 0x800 : 0);
             add_name(pb, nm);
@@ -3461,6 +3953,31 @@ bool rush2::track_mod::convert(const std::vector<uint8_t>& glb, const std::strin
             }
         }
         pb.insert(pb.end(), node_bytes.begin(), node_bytes.end());
+        if (any_script || !triggers.empty()) {
+            auto entry = [&](size_t at, const char* tag, uint32_t count) {
+                for (int k = 0; k < 4; k++) pb[at + k] = uint8_t(tag[k]);
+                uint32_t vals[2] = { uint32_t(pb.size()), count };
+                for (int v = 0; v < 2; v++) for (int k = 0; k < 4; k++) pb[at + 4 + v * 4 + k] = uint8_t(vals[v] >> (24 - 8 * k));
+            };
+            entry(16, "SCRP", uint32_t(movers.size()));
+            pb.insert(pb.end(), scripts.begin(), scripts.end());
+            entry(28, "TRIG", uint32_t(triggers.size()));
+            for (const Trigger& t : triggers) {
+                for (float f : t.lo) addf(pb, f);
+                for (float f : t.hi) addf(pb, f);
+            }
+            // LAPP, for progress events: the spine (the AI path from the finish line, a point every spine_step ft) and
+            // the lap's length, read by movers::parse_lap; 0 for an open AI path (point to point, run-in), measured
+            // along it with no laps.
+            entry(40, "LAPP", uint32_t(any_progress ? spine.size() : 0));
+            addf(pb, any_progress && !open_path ? float(spine.size()) * spine_step : 0.0f);
+            if (any_progress) {
+                for (const PathPoint& q : spine) for (float f : q.p) addf(pb, f);
+            }
+        }
+    }
+    else if (!triggers.empty()) {
+        report.warning("TRIGGER_ objects only start, open or close moving objects (MOVE_), and this track has none; ignored.");
     }
 
     // ---- tables ----

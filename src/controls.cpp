@@ -68,10 +68,13 @@ namespace {
         0x0002, // WINGS: C-left
         0x0000, // FIRE: not an N64 button (rush2::controls::battle_buttons)
         0x0000, // DROP WEAPON: the same
+        0x0000, // LOOK BACK: not an N64 button either (rush2::controls::look_back_held)
     };
 
     // The battle weapon buttons held on each port, as of its last get_race_input.
     std::array<std::atomic<uint8_t>, num_ports> battle_held{};
+    // LOOK BACK held on each port, as of its last get_race_input.
+    std::array<std::atomic<bool>, num_ports> look_held{};
 
     constexpr uint16_t n64_a = 0x8000;
     constexpr uint16_t n64_b = 0x4000;
@@ -120,6 +123,7 @@ namespace {
             set(Action::Wings, button(SDL_CONTROLLER_BUTTON_A));
             set(Action::Fire, button(SDL_CONTROLLER_BUTTON_RIGHTSTICK));
             set(Action::DropWeapon, button(SDL_CONTROLLER_BUTTON_DPAD_DOWN));
+            set(Action::LookBack, button(SDL_CONTROLLER_BUTTON_DPAD_LEFT));
         }
         else {
             set(Action::Gas, key(SDL_SCANCODE_UP));
@@ -134,6 +138,7 @@ namespace {
             set(Action::Wings, key(SDL_SCANCODE_SPACE));
             set(Action::Fire, key(SDL_SCANCODE_LCTRL));
             set(Action::DropWeapon, key(SDL_SCANCODE_G));
+            set(Action::LookBack, key(SDL_SCANCODE_B));
         }
         return b;
     }
@@ -242,9 +247,34 @@ namespace {
         return in.id == SDL_CONTROLLER_AXIS_LEFTX || in.id == SDL_CONTROLLER_AXIS_LEFTY;
     }
 
+    // Taken by steering on that stick, so it can't drive another action. An analog stick only steers with its left and
+    // right; its up and down can be bound to actions (an N64 wheel's pedals are the stick's up and down) and then stop
+    // reaching the game as the stick's vertical.
+    bool input_steers(const Input& in, int stick_id) {
+        if (stick_id == rush2::controls::Dpad || !input_uses_stick(in, stick_id)) {
+            return input_uses_stick(in, stick_id);
+        }
+        return in.id == SDL_CONTROLLER_AXIS_LEFTX || in.id == SDL_CONTROLLER_AXIS_RIGHTX;
+    }
+
     int steering_stick(const PortBindings& b) {
         const Input& in = b[static_cast<int>(Device::Controller)][static_cast<int>(Action::Steering)][0];
         return in.type == Input::Type::Stick ? in.id : -1;
+    }
+
+    // Whether an action is bound to the steering stick's up (`up`) or down, which then drops out of its vertical.
+    bool stick_direction_bound(const PortBindings& b, int stick_id, bool up) {
+        int axis_id = stick_id == rush2::controls::RightStick ? SDL_CONTROLLER_AXIS_RIGHTY : SDL_CONTROLLER_AXIS_LEFTY;
+        // SDL's Y axis is positive down.
+        Input dir = axis((SDL_GameControllerAxis)axis_id, !up);
+        for (const Slots& slots : b[static_cast<int>(Device::Controller)]) {
+            for (const Input& in : slots) {
+                if (in == dir) {
+                    return true;
+                }
+            }
+        }
+        return false;
     }
 
     // Binds `in` to an action slot. Whatever already used `in` on the same device takes the slot's old input.
@@ -265,7 +295,7 @@ namespace {
         if (in.type == Input::Type::Stick) {
             for (int a = 0; a < rush2::controls::action_count; a++) {
                 for (Input& other : set[a]) {
-                    if (input_uses_stick(other, in.id)) {
+                    if (input_steers(other, in.id)) {
                         other = {};
                     }
                 }
@@ -322,7 +352,7 @@ namespace {
             else {
                 for (int b = 0; b < SDL_CONTROLLER_BUTTON_MAX; b++) {
                     Input in = button((SDL_GameControllerButton)b);
-                    if (!reserved_button(b) && !input_uses_stick(in, steer) && button_down(d, (SDL_GameControllerButton)b)) {
+                    if (!reserved_button(b) && !input_steers(in, steer) && button_down(d, (SDL_GameControllerButton)b)) {
                         *out = in;
                         return Scan::Captured;
                     }
@@ -330,7 +360,7 @@ namespace {
                 for (int a = 0; a < SDL_CONTROLLER_AXIS_MAX; a++) {
                     float v = axis_value(d.controller, a);
                     Input in = axis((SDL_GameControllerAxis)a, v > 0.0f);
-                    if (std::fabs(v) >= listen_threshold && !input_uses_stick(in, steer)) {
+                    if (std::fabs(v) >= listen_threshold && !input_steers(in, steer)) {
                         *out = in;
                         return Scan::Captured;
                     }
@@ -358,7 +388,7 @@ namespace {
     // JSON names for actions and inputs.
     constexpr std::array<const char*, rush2::controls::action_count> action_names = {
         "gas", "brake", "steering", "shift_up", "shift_down", "reverse", "abort", "view", "horn", "wings",
-        "fire", "drop_weapon",
+        "fire", "drop_weapon", "look_back",
     };
     constexpr std::array<const char*, 3> stick_names = { "left", "right", "dpad" };
 
@@ -450,8 +480,9 @@ void rush2::controls::load() {
                 const auto& actions = ports[port][device_name];
                 for (int a = 0; a < action_count; a++) {
                     if (!actions.contains(action_names[a])) {
-                        // An action added since the file was saved (FIRE, DROP WEAPON) keeps its default, unless
-                        // the player already bound that input to another action: then it starts unbound.
+                        // An action added since the file was saved (FIRE, DROP WEAPON, LOOK BACK) keeps its default,
+                        // unless the player already bound that input to another action or steers with the stick or
+                        // D-pad it lies on: then it starts unbound.
                         for (Input& in : bindings[port][device][a]) {
                             for (int other = 0; other < action_count; other++) {
                                 if (other == a || !actions.contains(action_names[other])) {
@@ -463,7 +494,8 @@ void rush2::controls::load() {
                                 }
                                 for (const auto& u : used) {
                                     Input taken{};
-                                    if (in.type != Input::Type::None && input_from_json(u, &taken) && taken == in) {
+                                    if (in.type != Input::Type::None && input_from_json(u, &taken) &&
+                                        (taken == in || (taken.type == Input::Type::Stick && input_steers(in, taken.id)))) {
                                         in = {};
                                     }
                                 }
@@ -660,6 +692,7 @@ void rush2::controls::get_race_input(int port, uint16_t* buttons_out, float* x_o
     *brake_out = brake;
     uint8_t battle = uint8_t((action_held(d, b, Action::Fire) ? battle_fire : 0) |
                              (action_held(d, b, Action::DropWeapon) ? battle_drop : 0));
+    look_held[port] = action_held(d, b, Action::LookBack);
 
     if (button_down(d, SDL_CONTROLLER_BUTTON_START) || key_down(d, SDL_SCANCODE_RETURN)) {
         buttons |= n64_start;
@@ -682,6 +715,10 @@ void rush2::controls::get_race_input(int port, uint16_t* buttons_out, float* x_o
             };
             sx = apply_deadzone(sx);
             sy = apply_deadzone(sy);
+            // A direction bound to an action (pedals on the stick) doesn't also tilt the wings or aim behind.
+            if ((sy > 0.0f && stick_direction_bound(b, steer, true)) || (sy < 0.0f && stick_direction_bound(b, steer, false))) {
+                sy = 0.0f;
+            }
             x += std::copysign(std::pow(std::fabs(sx), steering_exponent), sx);
             y += sy;
         }
@@ -720,6 +757,10 @@ void rush2::controls::get_race_input(int port, uint16_t* buttons_out, float* x_o
 
 uint8_t rush2::controls::battle_buttons(int port) {
     return port >= 0 && port < num_ports ? battle_held[port].load() : 0;
+}
+
+bool rush2::controls::look_back_held(int port) {
+    return port >= 0 && port < num_ports && look_held[port].load();
 }
 
 void rush2::controls::get_menu_input(int port, uint16_t* buttons_out, float* x_out, float* y_out) {

@@ -37,10 +37,12 @@
 #include "assets.h"
 #include "car_probes.h"
 #include "dl_copy.h"
+#include "rush2.h"
 #include "track2049.h"
 #include "track2049_convert.h"
 #include "track_cache.h"
 #include "wings.h"
+#include "scene_nodes.h"
 
 namespace rush2::probes {
 
@@ -53,12 +55,12 @@ namespace {
     constexpr int slot_record_count = 64;
     constexpr uint32_t geometry_record = 0x8010C400;  // s32: the track geometry's slot record (func_800A4C98)
     constexpr int first_geometry = 0x33, first_placement = 0x3F, track_slots = 12;
-    constexpr uint32_t mirrored = 0x80119848;         // u8: the race is mirrored (the lists' winding is swapped)
+    constexpr uint32_t mirrored = 0x800D0190;         // u8: the race is mirrored (the lists' winding is swapped)
     constexpr uint32_t car_body_nodes = rush2::car_types::car_states;   // + car * 0x134: the car's body scene node index
     constexpr uint32_t car_body_node_stride = 0x134;
-    constexpr uint32_t scene_nodes = 0x800D9E90;
+    constexpr uint32_t scene_node_table = rush2::scene_nodes::table;
     constexpr uint32_t scene_node_size = 0x38;
-    constexpr int max_scene_nodes = 0x400;
+    constexpr int max_scene_nodes = (int)rush2::scene_nodes::capacity;
     constexpr int max_cars = 8;
     constexpr uint32_t copies_start = 0x80F80000;
     constexpr uint32_t copies_per_car = 0x10000;
@@ -338,8 +340,8 @@ bool update(uint8_t* rdram) {
     for (int car = 0; car < max_cars; car++) {
         int node = (int32_t)MEM_W(0, (int32_t)(car_body_nodes + uint32_t(car) * car_body_node_stride));
         if (node < 0 || node >= max_scene_nodes) continue;
-        uint32_t transform = (uint32_t)MEM_W(4, (int32_t)(scene_nodes + uint32_t(node) * scene_node_size));
-        if (transform < 0x80000000u || transform >= 0x80800000u) continue;
+        uint32_t transform = (uint32_t)MEM_W(4, (int32_t)(scene_node_table + uint32_t(node) * scene_node_size));
+        if (!rush2::in_game_ram(transform)) continue;
         float pos[3];
         for (int k = 0; k < 3; k++) {
             uint32_t bits = (uint32_t)MEM_W(0x24 + k * 4, (int32_t)transform);

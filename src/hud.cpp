@@ -338,7 +338,7 @@ namespace {
     constexpr int32_t palette_colors = 0x14;
 
     bool is_rdram(uint32_t address) {
-        return address >= 0x80000000 && address < 0x80800000;
+        return rush2::in_game_ram(address);
     }
 
     // Where a widget's image texels are: pixels, the colors of a color indexed image (RGBA16), format, texel size and
@@ -1934,6 +1934,7 @@ void rush2_hud_draw_end(uint8_t* rdram, recomp_context* ctx) {
         }
     }
     rush2::players4::draw_join_hint(rdram, ctx);
+    rush2::look_back_draw_end(rdram);
 }
 
 // func_800B9D48, around its printf of the laps-left number at ($a0, $a1). The text sits on the track map (above its

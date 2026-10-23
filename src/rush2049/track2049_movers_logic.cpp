@@ -15,6 +15,7 @@
 #include <cstring>
 
 #include "track2049_movers_logic.h"
+#include "online_sync.h"
 
 #if defined(__clang__)
 #pragma clang fp contract(off)
@@ -437,6 +438,100 @@ namespace rush2::track2049::movers {
                 p.nodes.push_back(node);
             }
             out.push_back(std::move(p));
+        }
+        return true;
+    }
+
+    // SCRP (custom tracks, src/track_mod/track_mod_convert.cpp): count = paths, then per path a 16-byte header (u8
+    // mode, u8 flags (1 = open at start), u8 start, open and close event counts, 3 pad, f32 open delay, f32 close
+    // delay) and its events, 12 bytes each (u8 kind, pad, s16 trigger box, s16 lap, pad, f32 seconds). TRIG: count
+    // boxes of f32 lo[3], hi[3].
+    bool parse_scripts(const uint8_t* data, size_t size, std::vector<Path>& paths, std::vector<TriggerBox>& boxes) {
+        boxes.clear();
+        uint32_t base, count;
+        if (find_chunk(data, size, "TRIG", base, count)) {
+            if ((uint64_t)base + (uint64_t)count * 24 > size) {
+                return false;
+            }
+            for (uint32_t k = 0; k < count; k++) {
+                TriggerBox b;
+                for (int i = 0; i < 3; i++) {
+                    b.lo[i] = bef(data + base + k * 24 + i * 4);
+                    b.hi[i] = bef(data + base + k * 24 + 12 + i * 4);
+                }
+                boxes.push_back(b);
+            }
+        }
+        if (!find_chunk(data, size, "SCRP", base, count)) {
+            return true;
+        }
+        if (count != paths.size()) {
+            return false;
+        }
+        size_t o = base;
+        for (Path& p : paths) {
+            if (o + 16 > size) {
+                return false;
+            }
+            Script s;
+            s.mode = data[o] <= Script::door ? (Script::Mode)data[o] : Script::plain;
+            s.open_at_start = (data[o + 1] & 1) != 0;
+            int counts[3] = { data[o + 2], data[o + 3], data[o + 4] };
+            s.open_delay = bef(data + o + 8);
+            s.close_delay = bef(data + o + 12);
+            o += 16;
+            std::vector<ScriptEvent>* lists[3] = { &s.start, &s.open, &s.close };
+            for (int l = 0; l < 3; l++) {
+                for (int k = 0; k < counts[l]; k++) {
+                    if (o + 12 > size) {
+                        return false;
+                    }
+                    ScriptEvent e;
+                    e.kind = data[o] <= ScriptEvent::last_checkpoint ? (ScriptEvent::Kind)data[o] : ScriptEvent::time;
+                    e.box = be16(data + o + 2);
+                    e.lap = be16(data + o + 4);
+                    e.seconds = bef(data + o + 8);
+                    if (e.kind == ScriptEvent::trigger && (e.box < 0 || e.box >= (int)boxes.size())) {
+                        return false;
+                    }
+                    lists[l]->push_back(e);
+                    o += 12;
+                }
+            }
+            s.fired.assign(s.start.size() + s.open.size() + s.close.size(), 0);
+            p.script = std::move(s);
+        }
+        return true;
+    }
+
+    bool parse_lap(const uint8_t* data, size_t size, LapPath& lap) {
+        lap = {};
+        uint32_t base, count;
+        if (!find_chunk(data, size, "LAPP", base, count)) {
+            return true;
+        }
+        if ((uint64_t)base + 4 + (uint64_t)count * 12 > size) {
+            return false;
+        }
+        lap.length = bef(data + base);
+        float at = 0.0f;
+        for (uint32_t k = 0; k < count; k++) {
+            std::array<float, 3> p;
+            for (int i = 0; i < 3; i++) p[i] = bef(data + base + 4 + k * 12 + i * 4);
+            if (k > 0) {
+                const auto& q = lap.points.back();
+                at += std::sqrt((p[0] - q[0]) * (p[0] - q[0]) + (p[1] - q[1]) * (p[1] - q[1]) + (p[2] - q[2]) * (p[2] - q[2]));
+            }
+            lap.points.push_back(p);
+            lap.at.push_back(at);
+        }
+        // Length 0: an open path (point to point, a run-in circuit), measured along it with no laps.
+        lap.closed = lap.length > 0.0f;
+        if (!lap.closed && !lap.at.empty()) {
+            lap.length = lap.at.back();
+        }
+        if (lap.points.size() < 2 || !(lap.length > 0.0f)) {
+            lap = {};
         }
         return true;
     }
@@ -940,15 +1035,270 @@ namespace rush2::track2049::movers {
         std::memcpy(focus_, pos, sizeof(focus_));
     }
 
+    void World::set_race(bool racing, int leader_lap, int laps, const std::vector<std::vector<int>>& entered) {
+        racing_ = racing;
+        leader_lap_ = leader_lap;
+        laps_ = laps;
+        entered_ = entered;
+    }
+
+    void World::set_lap(const LapPath& lap) {
+        lap_ = lap;
+        car_laps_.clear();
+        car_into_.clear();
+        car_segment_.clear();
+        leader_progress_ = 0.0f;
+    }
+
+    // Each car's progress as the Rush 2049 arcade works it out (ProjectR 0x140233840): the distance along the lap to
+    // the point nearest the car, plus its own lap counter x the lap's length; the counter goes up when that distance
+    // falls by more than half a lap (the car crossed the line forward) and down when it rises by as much (backward).
+    // The leader's progress is the furthest car's (0x14029E8C0), only while racing.
+    void World::set_cars(const std::vector<std::array<float, 3>>& cars, const std::vector<uint8_t>& live, bool at_last_checkpoint) {
+        last_checkpoint_ = racing_ && at_last_checkpoint && !at_last_checkpoint_;
+        at_last_checkpoint_ = racing_ && at_last_checkpoint;
+        if (lap_.points.empty() || !racing_) {
+            return;
+        }
+        car_laps_.resize(cars.size(), 0);
+        car_into_.resize(cars.size(), -1.0f);
+        car_segment_.resize(cars.size(), -1);
+        const float half = lap_.length * 0.5f;
+        const int n = (int)lap_.points.size(), segments = lap_.closed ? n : n - 1;
+        for (size_t c = 0; c < cars.size(); c++) {
+            if (c >= live.size() || !live[c]) {
+                continue;
+            }
+            // Nearest point on the lap's segments (a closed lap's last one runs back to the first): every segment the
+            // first time, then those within 50 segments (1,000 ft) of the last, so a part of the course passing near
+            // another (a bridge over it) can't take the car there; a reset's move back stays in reach.
+            float best = 1e30f, into = 0.0f;
+            int found = car_segment_[c];
+            auto test = [&](int i) {
+                const auto& a = lap_.points[i];
+                const auto& b = lap_.points[(i + 1) % n];
+                float ab[3], ap[3], len2 = 0.0f, t = 0.0f;
+                for (int k = 0; k < 3; k++) {
+                    ab[k] = b[k] - a[k];
+                    ap[k] = cars[c][k] - a[k];
+                    len2 += ab[k] * ab[k];
+                    t += ab[k] * ap[k];
+                }
+                t = len2 > 0.0f ? std::clamp(t / len2, 0.0f, 1.0f) : 0.0f;
+                float d2 = 0.0f;
+                for (int k = 0; k < 3; k++) d2 += (ap[k] - ab[k] * t) * (ap[k] - ab[k] * t);
+                if (d2 < best) {
+                    best = d2;
+                    found = i;
+                    float seg_end = i + 1 < n ? lap_.at[i + 1] : lap_.length;
+                    into = lap_.at[i] + (seg_end - lap_.at[i]) * t;
+                }
+            };
+            if (car_segment_[c] < 0 || car_segment_[c] >= segments) {
+                for (int i = 0; i < segments; i++) test(i);
+            }
+            else {
+                for (int step = -50; step <= 50; step++) {
+                    int i = car_segment_[c] + step;
+                    if (lap_.closed) i = ((i % segments) + segments) % segments;
+                    else if (i < 0 || i >= segments) continue;
+                    test(i);
+                }
+            }
+            car_segment_[c] = found;
+            into = std::min(into, lap_.length);
+            if (!lap_.closed) {
+                car_laps_[c] = 0;
+            }
+            else if (car_into_[c] < 0.0f) {
+                // First seen (the grid): a car behind the line is on lap 0, short of the first.
+                car_laps_[c] = into > half ? -1 : 0;
+            }
+            else if (car_into_[c] - into > half) {
+                car_laps_[c]++;
+            }
+            else if (into - car_into_[c] > half) {
+                car_laps_[c]--;
+            }
+            car_into_[c] = into;
+            leader_progress_ = std::max(leader_progress_, (float)car_laps_[c] * lap_.length + into);
+        }
+    }
+
     void World::update(float dt) {
+        if (racing_) {
+            race_time_ += dt;
+        }
         for (int i : order_) {
             step(objects_[i], dt);
         }
+        prev_leader_lap_ = leader_lap_;
+        entered_.clear();
+        last_checkpoint_ = false;
+    }
+
+    // Whether one of `events` happens this update. A time event happens once (s.fired from index first_time).
+    bool World::fires(Script& s, const std::vector<ScriptEvent>& events, size_t first_time) {
+        bool any = false;
+        bool new_lap = leader_lap_ > 0 && leader_lap_ != prev_leader_lap_;
+        for (size_t k = 0; k < events.size(); k++) {
+            const ScriptEvent& e = events[k];
+            switch (e.kind) {
+            case ScriptEvent::time:
+                if (racing_ && race_time_ >= e.seconds && first_time + k < s.fired.size() && !s.fired[first_time + k]) {
+                    s.fired[first_time + k] = 1;
+                    any = true;
+                }
+                break;
+            case ScriptEvent::trigger:
+                if (e.box >= 0 && e.box < (int)entered_.size()) {
+                    for (int lap : entered_[e.box]) {
+                        any = any || e.lap == 0 || lap == e.lap;
+                    }
+                }
+                break;
+            case ScriptEvent::odd_lap:
+                any = any || (new_lap && (leader_lap_ & 1));
+                break;
+            case ScriptEvent::even_lap:
+                any = any || (new_lap && !(leader_lap_ & 1));
+                break;
+            case ScriptEvent::final_lap:
+                any = any || (new_lap && laps_ > 0 && leader_lap_ == laps_);
+                break;
+            case ScriptEvent::progress:
+                // Once, as the arcade's sorted progress list fires each entry the leader has passed (0x14029E8C0).
+                if (racing_ && leader_progress_ >= e.seconds && first_time + k < s.fired.size() && !s.fired[first_time + k]) {
+                    s.fired[first_time + k] = 1;
+                    any = true;
+                }
+                break;
+            case ScriptEvent::last_checkpoint:
+                any = any || last_checkpoint_;
+                break;
+            }
+        }
+        return any;
+    }
+
+    // A custom track's scripted mover: its clock (seconds into the animation) runs as the script says, and the
+    // follower is set to the node and time the clock is at, then posed as 2049 poses any object.
+    void World::step_scripted(Object& o, float dt) {
+        Path& p = paths_[o.path];
+        Script& s = p.script;
+        Follower& f = o.f;
+        int count = (int)p.nodes.size();
+        bool loop = s.mode == Script::loop;
+        // The travel: every node for a loop (the last one runs back to the first), else all but the end node.
+        int segs = loop ? count : count - 1;
+        float total = 0.0f;
+        for (int n = 0; n < segs; n++) {
+            total += p.nodes[n].time;
+        }
+        o.sound = Sound::none;
+        if (segs <= 0 || !(total > 0.0f)) {
+            pose(o, dt);
+            return;
+        }
+        size_t first_open = s.start.size(), first_close = first_open + s.open.size();
+        if (!s.placed) {
+            s.placed = true;
+            if (s.mode == Script::door && s.open_at_start) {
+                s.clock = total;
+            }
+        }
+        if (s.mode == Script::door) {
+            bool open = fires(s, s.open, first_open);
+            bool close = fires(s, s.close, first_close);
+            if (open != close) {
+                s.rate = open ? 1 : -1;
+                s.wait = -1.0f;
+            }
+            if (s.wait >= 0.0f) {
+                s.wait -= dt;
+                if (s.wait < 0.0f) {
+                    s.rate = s.clock >= total ? -1 : 1;
+                }
+            }
+            s.clock += (float)s.rate * dt;
+            if (s.rate > 0 && s.clock >= total) {
+                s.clock = total;
+                s.rate = 0;
+                s.wait = s.close_delay;
+            }
+            else if (s.rate < 0 && s.clock <= 0.0f) {
+                s.clock = 0.0f;
+                s.rate = 0;
+                s.wait = s.open_delay;
+            }
+        }
+        else {
+            if (!s.started) {
+                // With no start event it starts with the race (the green light), as a time event does.
+                s.started = s.start.empty() ? racing_ : fires(s, s.start, 0);
+            }
+            bool finished = s.mode == Script::once && s.clock >= total;
+            if (s.started && !finished) {
+                if (s.rate == 0) {
+                    s.rate = 1;
+                }
+                s.clock += (float)s.rate * dt;
+                if (s.mode == Script::loop) {
+                    if (s.clock >= total && (p.flags & path_moves_group)) {
+                        // As 2049's loop wraps (step): the group goes back to its rest copy, so the 1/32 ft
+                        // translations don't drift lap after lap.
+                        GroupOp op = {};
+                        op.kind = GroupOp::restore;
+                        op.group = p.group;
+                        ops_.push_back(op);
+                    }
+                    s.clock = std::fmod(s.clock, total);
+                }
+                else if (s.mode == Script::once) {
+                    if (s.clock >= total) {
+                        s.clock = total;
+                        s.rate = 0;
+                    }
+                }
+                else {
+                    // pingpong: turn round at either end.
+                    if (s.clock >= total) {
+                        s.clock = std::max(0.0f, 2.0f * total - s.clock);
+                        s.rate = -1;
+                    }
+                    else if (s.clock <= 0.0f) {
+                        s.clock = std::min(total, -s.clock);
+                        s.rate = 1;
+                    }
+                }
+            }
+        }
+        float c = s.clock;
+        int n = 0;
+        while (n < segs - 1 && c >= p.nodes[n].time) {
+            c -= p.nodes[n].time;
+            n++;
+        }
+        c = std::min(std::max(c, 0.0f), p.nodes[n].time);
+        f.node = (int16_t)n;
+        if (s.rate < 0) {
+            f.dir = (uint16_t)((f.dir & ~4) | 8);
+            f.t = p.nodes[n].time - c;
+        }
+        else {
+            f.dir = (uint16_t)((f.dir & ~8) | 4);
+            f.t = c;
+        }
+        pose(o, dt);
     }
 
     // func_800C0AC0.
     void World::step(Object& o, float dt) {
         Path& p = paths_[o.path];
+        if (options_.custom && p.script.mode != Script::plain) {
+            step_scripted(o, dt);
+            return;
+        }
         Follower& f = o.f;
         const TypeInfo& t = types_[o.type];
         auto restore = [&]() {
@@ -1110,6 +1460,16 @@ namespace rush2::track2049::movers {
                 }
             }
         } while (!done);
+        pose(o, dt);
+    }
+
+    // func_800C0AC0 from the pose on (split out so the custom tracks' scripted movers, which set the follower's node
+    // and time themselves, pose the same way).
+    void World::pose(Object& o, float dt) {
+        Path& p = paths_[o.path];
+        Follower& f = o.f;
+        const TypeInfo& t = types_[o.type];
+        int count = (int)p.nodes.size();
 
         // Pose. Position and rotation run unless the node turns them off; scale is applied below.
         bool moved = false;
@@ -1180,7 +1540,7 @@ namespace rush2::track2049::movers {
             float tt = (f.dir & 8) ? node.time - f.t : f.t;
             float r = tt / node.time;
             // A custom track's flip-book frame steps between full size and hidden (scale under 0.01, write_pose)
-            // over 2 ms (tools/arcade2049/track_mod.py). Blended, a game frame landing in that window drew the
+            // over 2 ms (src/arcade2049/arcade_track.cpp). Blended, a game frame landing in that window drew the
             // outgoing and incoming frames both shrunk about their pivots: their edges pulled in from the walls
             // around them (see-through cracks) and shook. A step shorter than a frame jumps at its middle instead:
             // the frames' timers drift apart by float rounding, and a jump at a node's end let a game frame landing
@@ -1205,5 +1565,61 @@ namespace rush2::track2049::movers {
                 o.m[k] = o.m[k] * s[k / 3];
             }
         }
+    }
+}
+
+namespace rush2::track2049::movers {
+    void World::online_sync(rush2::online::sync::Walker& w) {
+        namespace s = rush2::online::sync;
+        for (Path& p : paths_) {
+            s::field(w, p.flags);
+            s::field(w, p.follower);
+            for (PathNode& n : p.nodes) {
+                s::field(w, n.flags);
+            }
+            s::field(w, p.script.started);
+            s::field(w, p.script.placed);
+            s::field(w, p.script.clock);
+            s::field(w, p.script.rate);
+            s::field(w, p.script.wait);
+            s::vector(w, p.script.fired);
+        }
+        s::field(w, race_time_);
+        s::field(w, prev_leader_lap_);
+        s::vector(w, car_laps_);
+        s::vector(w, car_into_);
+        s::vector(w, car_segment_);
+        s::field(w, leader_progress_);
+        s::field(w, at_last_checkpoint_);
+        s::vector(w, objects_, [](s::Walker& w, Object& o) {
+            s::field(w, o.path);
+            s::field(w, o.type);
+            s::field(w, o.f.t);
+            s::field(w, o.f.node);
+            s::field(w, o.f.dir);
+            s::field(w, o.f.speed);
+            s::field(w, o.f.max_speed);
+            s::field(w, o.f.prev);
+            s::field(w, o.f.inv_rest);
+            s::field(w, o.f.rest_set);
+            s::field(w, o.f.rest_pos);
+            s::field(w, o.f.rest_inv);
+            s::field(w, o.m);
+            s::field(w, o.pos);
+            s::field(w, o.slot);
+            s::field(w, o.cars);
+            s::field(w, o.body);
+            s::field(w, o.body_index);
+            s::field(w, o.body_vel);
+            s::field(w, o.model);
+            s::field(w, o.anim_frame);
+            s::field(w, o.anim_timer);
+            s::field(w, o.anim_count);
+            s::field(w, o.anim_model);
+            s::field(w, o.sound_state);
+            s::field(w, o.sound);
+        });
+        s::vector(w, order_);
+        s::field(w, body_count_);
     }
 }

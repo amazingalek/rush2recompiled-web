@@ -19,11 +19,14 @@ found and what is wrong (see [Checking your track](#checking-your-track)), so re
 - [Sky](#sky)
 - [Moving objects](#moving-objects)
 - [Billboards and props](#billboards-and-props)
+- [Point to point](#point-to-point)
+- [Run-in circuits](#run-in-circuits)
 - [Stunt and battle arenas](#stunt-and-battle-arenas)
 - [Track select art](#track-select-art)
 - [Textures](#textures)
 - [Checking your track](#checking-your-track)
 - [Previewing your track](#previewing-your-track)
+- [Everything you can use](#everything-you-can-use)
 - [Size limits](#size-limits)
 - [How custom tracks race](#how-custom-tracks-race)
 - [Not supported yet](#not-supported-yet)
@@ -109,6 +112,10 @@ Recalculate Outside if the car falls through a road. Give a wall one face, towar
 on both sides (or two back to back) pushes a car that gets into it out through the far side. Flat neighboring triangles of the same surface are joined into
 the game's larger polygons, as the stock collision is built, so triangulating doesn't cost you anything.
 
+Give a `COL_*` mesh a custom property `covered` (Object Properties > Custom Properties) to shade the cars on it, as
+Rush 2 does in its tunnels: `1` for a tunnel (cars drawn much darker) or `2` for a lightly covered spot such as under
+a bridge or trees. Leave it out, or `0`, for open sky.
+
 ### Custom surfaces
 
 `[surfaces.<name>]` in track.toml adds a surface of your own, used in Blender as `COL_<NAME>_*` (upper case). Each one
@@ -171,17 +178,37 @@ and a raised ledge beside the road (a sidewalk, a platform) whose top is a plain
 lifts a wheel that strays under it by its full height in one step. With smooth collision on, a floor face whose
 footprint is within 1 ft of the point counts too, the surface nearest the wheel wins (so a ledge more than 0.75 ft up
 gives way to the road the wheel is on while any road is under it), and a ledge with no road left under the wheel is
-climbed at 0.1 ft per probe instead of jumped onto (a car coming down fast, a landing, keeps the full depth so the floor holds it). A face steeper than the fold angle is never extended past its
+climbed at 0.1 ft per probe instead of jumped onto (a car coming down fast, a landing, keeps the full depth so the floor holds it). A ramp is not a ledge:
+a face whose plane is no more than 0.5 ft above the spot where the wheel last rested on a surface is the road going
+on, and keeps its full depth however deep a fast wheel goes into it in one step (before this, cars sank through
+California Speed San Francisco's start ramps and stood on end). A face steeper than the fold angle is never extended past its
 edge. None of this touches Rush 2's own tracks.
 
 - `[track] smooth_fold = 20`: the fold angle in degrees (0 to 90). An edge whose faces meet at more than this angle
   stays sharp. Lower it to keep more edges sharp, raise it to round more.
 - `[track] smooth_collision = false`: the raw flat faces, as the game would drive them, cracks and ledges included.
 
+The Rush 2049 arcade tracks the Games tab builds set `smooth_collision = false`: their road is built for flat faces.
+
+(`rush2::track2049::mod_smooth_collision` hands the raced track's `smooth_collision` and `smooth_fold` to
+src/smooth_collision.cpp, set as the race applies the track, so the wheel probes never read the settings.)
+
 Checking it: RUSH2_SMOOTH_LOG=1 prints how many corners were smoothed and how many kept sharp when a race on the
 track starts; RUSH2_SMOOTH_LOG=2 adds every probe of the player's car that found a surface more than a foot off, every
 crack filled and ledge held, and (from `car_ground_contact_800703EC`) every wheel height over half a foot;
 RUSH2_SMOOTH_FOLD=<degrees> tries another fold angle without editing the track.
+
+### Road hold
+
+`[track] road_hold = true` races the track with California Speed's road hold, as its own tracks are raced
+(`rush2_calspeed_road_hold` and the hooks beside it in src/calspeed/calspeed_rom.cpp, explained in
+docs/calspeed_research.md#road-hold): the world is 2.28 times as heavy with every car's springs, dampers and tire loads
+scaled to match, so on flat road, slopes and corners a car drives as on any other track, but it takes 2.28 g to lift
+off a crest, a car whose wheels leave the road falls at up to 4.6 g, and over a kink between two faces the car's
+velocity away from the road is taken out so it follows the road instead of hopping. Use it for a track whose hills
+are built like California Speed's (long crests taken flat out, made of large flat faces); jumps still fly, a little
+shorter. The default is off: Rush 2's own gravity. It runs only while the player's CS Road Hold option (Games tab) is
+on, which needs no California Speed ROM. It stacks with `gravity = "rush2049"`, which raises the gravity it scales.
 
 ## Markers
 
@@ -192,9 +219,11 @@ the display size. Move every marker into place: markers left at the origin are r
 
 | Name | What |
 |---|---|
-| `FINISH` | The start/finish line. The grid lines up behind it. |
+| `FINISH` | The start/finish line. The grid lines up behind it. On a point-to-point track, the finish line only. |
+| `START` | A point-to-point or run-in track's start line ([Point to point](#point-to-point), [Run-in circuits](#run-in-circuits)). The grid lines up behind it. |
 | `CHECKPOINT_1`, `CHECKPOINT_2`, ... | Checkpoints in lap order, numbered without gaps. At most 9. |
 | `AISPEED_<mph>` | Optional speed cap for the computer cars ([The AI path](#the-ai-path)). |
+| `TRIGGER_<name>` | A box that sets off moving objects when a car drives into it ([Trigger boxes](#trigger-boxes)). A mesh or a cube Empty; not drawn. |
 
 You don't place the starting grid: Rush 2 lines the cars up itself, two per row, rows 20 ft (6 m) apart, back from the
 finish line. Empties named `START_*` are ignored on a race track; arenas use them instead of `FINISH` (see
@@ -268,6 +297,9 @@ version     = "0.1"
 description = "One short line"
 type        = "race"                  # "race" (the default), "stunt" or "battle": see Stunt and battle arenas
 gravity     = "rush2"                 # "rush2" (the default) or "rush2049": Rush 2049's, 15% stronger at Normal
+road_hold   = false                   # true: California Speed's road hold keeps cars on crests: see Road hold
+point_to_point = false                # true: raced once from START to FINISH: see Point to point
+run_in      = false                   # true: starts on a run-in into the loop: see Run-in circuits
 
 [race]
 # Timer (with checkpoints on). Leave these out and the game works it out from the AI path, as stock Rush 2 does.
@@ -281,7 +313,7 @@ sky          = "none"      # a stock sky: see Sky
 cloud_scroll = 0.0         # sky texture scroll speed (the clouds sky)
 sky_parallax = 0.0         # how much the sky shifts as the camera moves (the clouds sky)
 
-[movers.lift]              # a moving object's settings: see Moving objects
+[movers.lift]              # a moving object's settings (and start, open, close...): see Moving objects
 mode  = "ride"
 races = "both"
 
@@ -290,12 +322,13 @@ like = "dirt"
 drag = 14
 
 [audio]
-music = "track5"           # default song: "track1" to "track8"; players can still change it
+music = "track5"           # default song: "track1" to "track8" (left out: each race a random one of every song, any game's, switched on in the Sound tab); players can still change it
 
 [menu]
 logo    = "logo.png"
 preview = "preview.png"
 diorama = "diorama.glb"
+after   = "rush2049"      # where the track select lists it: see Track select art
 ```
 
 - `checkpoint_time` has one entry per checkpoint. Rush 2 keeps one time for the first lap and one for every lap
@@ -358,7 +391,7 @@ Lifts, spinning signs, swinging gates and the like are animated in Blender and p
 
 ```toml
 [movers.lift]          # for MOVE_lift
-mode  = "ride"         # "loop" (default), "pingpong" or "ride"
+mode  = "ride"         # "loop" (default), "pingpong", "ride", "once" or "door"
 races = "both"         # "both" (default), "forward" or "backward": the races it is there in
 ```
 
@@ -367,11 +400,69 @@ races = "both"         # "both" (default), "forward" or "backward": the races it
 | `"loop"` | The animation over and over. For a smooth loop make the last key the same pose as the first; otherwise it jumps back to the first pose at the end. |
 | `"pingpong"` | Forward to the end, back to the start, and again. |
 | `"ride"` | Waits at its first pose until a car is on one of its `COL_*` floors, then plays forward to the end and back. For a lift, give it a `COL_ROAD_*` floor. |
+| `"once"` | Plays forward to the end one time and stays there, such as a bridge that falls. Starts at the race start unless it has a `start`. |
+| `"door"` | Sits shut (its first pose) until an `open` event, plays forward to its last pose (open) and stays; a `close` event plays it back. |
 
 Moving floors carry the cars on them (up, down, sideways and turning) and moving walls push them. The animation keeps
 its timing in seconds whatever the frame rate.
 
-Limits:
+### Making it react to the race
+
+Give a moving object events and it waits for them instead of playing from the moment the track loads. An event is
+a short piece of text:
+
+| Event | Happens |
+|---|---|
+| `"time 10"` | 10 seconds after the green light |
+| `"trigger gate"` | A car drives into the box `TRIGGER_gate` (see below) |
+| `"trigger gate lap 2"` | A car on its 2nd lap drives into `TRIGGER_gate` |
+| `"odd_lap"` | The leading car starts lap 1, 3, 5, ... |
+| `"even_lap"` | The leading car starts lap 2, 4, 6, ... |
+| `"final_lap"` | The leading car starts the last lap |
+| `"progress 14000"` | The leading car is 14,000 ft into the race, counting every lap: on a 12,000 ft lap that is 2,000 ft into lap 2. Measured along `AIPATH_main` from the finish line (on a point-to-point track, from its start, with no laps). Needs `AIPATH_main` |
+| `"last_checkpoint"` | Player 1 passes the last checkpoint before the finish on the last lap (the finish banner turning to FINISH, say) |
+
+Each setting takes one event or a list of them; any one of a list sets it off.
+
+| Setting | For | What it does |
+|---|---|---|
+| `start = "time 5"` | `loop`, `pingpong`, `once` | Waits at its first pose until the event, then plays as its mode says. Without it, a `once` plays at the race start and a `loop` or `pingpong` plays from the moment the track loads. |
+| `open = ["trigger button", "time 30"]` | `door` | Opens (plays forward) on the event |
+| `close = "final_lap"` | `door` | Closes (plays back) on the event |
+| `open_delay = 8` | `door` | After it has shut, opens again by itself this many seconds later |
+| `close_delay = 8` | `door` | After it has opened, shuts again by itself this many seconds later |
+| `open_at_start = true` | `door` | Starts the race open (at its last pose) instead of shut |
+
+A drawbridge that lifts when the leader starts the final lap, and a ramp a car opens by driving through a box, which
+shuts again 8 seconds later:
+
+```toml
+[movers.bridge]
+mode  = "once"
+start = "final_lap"
+
+[movers.ramp]
+mode = "door"
+open = "trigger button"
+close_delay = 8
+```
+
+### Trigger boxes
+
+A trigger is a box cars set off by driving into it. Make a mesh or an Empty (Display As: Cube) named
+`TRIGGER_<name>`, such as `TRIGGER_button`, and size it over the spot: a mesh's bounds, or the Empty's cube (its scale
+is the half size). It isn't drawn and cars pass through it. Its name is the one events use (`"trigger button"`, upper
+or lower case). Wrecked cars and ghosts don't set it off. A trigger no event names gets a warning, and two with the
+same name are an error. Triggers don't move, even under a `MOVE_` object.
+
+### Moving billboards
+
+Give `MOVE_<name>` a custom property `billboard` set to True (Object Properties > Custom Properties) and its meshes
+turn to face the camera as it moves, like a [billboard](#billboards): smoke, a flag, a flat sign that slides. Model it
+facing Blender's front view (-Y).
+
+### Moving object limits
+
 
 - 31 moving objects with collision (any number without).
 - 2,000 keys per animation. A longer one is sampled at 2,000 evenly spaced times (the report says so).
@@ -419,6 +510,54 @@ see-through by its texture's alpha after the solid scenery, the way Rush 2 draws
 scenery, billboards, props, moving objects and the `SKY`. See-through surfaces aren't sorted against each other, so
 two that overlap on screen can show in either order: keep them apart, or use Alpha Clip where hard edges will do.
 
+## Point to point
+
+`[track] point_to_point = true` makes a race that runs once from a start line to a finish line somewhere else, as
+California Speed's courses do, instead of laps round a circuit:
+
+- `AIPATH_main` is an open curve (not Cyclic) from behind the start to the finish and a little past it. If the curve
+  is drawn from the finish end, it is turned round.
+- `START` (an Empty, like the other gates) is the start line. Leave it out and the start line goes 30 m (100 ft) along
+  `AIPATH_main` from its start. The grid lines up behind `START`, four rows 6 m (20 ft) apart, so begin the curve
+  about 30 m (100 ft) before it; the report warns when there isn't room.
+- `CHECKPOINT_1` to `CHECKPOINT_8` lie in order between them, and `FINISH` is the finish line. With no `FINISH`, the
+  finish line is the end of `AIPATH_main`.
+- The race is one lap: the track select hides LAPS and BACKWARD for it.
+- Cars that have finished keep driving and bump off whatever ends the road without wrecking, as on California Speed's
+  tracks.
+- `[race] start_time` is the clock at the start, and `checkpoint_time` has one entry per `CHECKPOINT_n`. The time
+  added at the finish doesn't matter.
+
+The path file is written as California Speed's point-to-point ones are: checkpoint 0 is `START` (flags 2), the last
+is `FINISH` (flags 1), and the header's loop, finish and arm checkpoints are 0, the last and 0. The converter's
+`p2p` / `open_path` branches (track_mod_convert.cpp) keep the path open, and `rush2::track_mod::point_to_point` /
+`rush2::track2049::mod_point_to_point` give the race one lap, hide the rows, and extend `rush2_calspeed_finished_car`
+to these tracks.
+
+## Run-in circuits
+
+`[track] run_in = true` makes a circuit whose race starts on a stretch of its own that leads into the loop, as Rush 2's
+New York One, Rush 2049's race 6 (Presidio) and San Francisco Rush's Golden Gate do. The first lap runs from `START`
+along the run-in and round to `FINISH`; the laps after that go round the loop.
+
+- `AIPATH_main` is an open curve (not Cyclic): it starts about 30 m (100 ft) behind `START`, runs along the run-in,
+  goes once round the loop and ends where it first came onto the loop, a few meters before the checkpoint there. That
+  checkpoint is where the loop starts. If the curve is drawn from the loop end, it is turned round.
+- Put a `CHECKPOINT_n` where the run-in meets the loop. The report names the checkpoint it took as the loop start;
+  the curve's end has to finish within 90 m (300 ft) of it. A curve drawn on past it is cut there.
+- `START` is the start line and the grid lines up behind it. Leave it out and the start line goes 30 m (100 ft) along
+  `AIPATH_main`. `FINISH` is the lap line, anywhere on the loop. The checkpoints are numbered in the order the race
+  meets them from `START`, and `FINISH` may come before the last of them (Golden Gate has a checkpoint after its
+  finish line).
+- LAPS works as on any circuit; the track select has no BACKWARD for it.
+
+The path file is written as Rush 2's run-in ones are (New York One: header loop, finish and arm checkpoints 1, 5 and 0):
+the gates in the order the path meets them, `START` flagged 2, the loop start 4 and `FINISH` 1. The spine and the lanes
+end at the loop start's crossing, and past the spine's last point the game carries a car's progress on from that
+crossing (`func_8008CCF8`, docs/rush2049_research/race.md). The converter's `run_in` branches (track_mod_convert.cpp)
+pick the loop start, put the gates in race order and wrap the target speeds' look-ahead and braking from the path's
+end to the loop start; `rush2::track_mod::run_in` hides BACKWARD and keeps the race forwards.
+
 ## Stunt and battle arenas
 
 Set `type = "stunt"` or `type = "battle"` in track.toml's `[track]` to make an arena instead of a race track. A stunt
@@ -459,6 +598,22 @@ The track select shows a track's logo and a model of it, as it does for the stoc
 - **Route preview:** without a diorama, the track select shows Rush 2049's kind of preview: the AI path as a small tube
   with a light running round it in the race direction, in front of `preview.png` (a screenshot of your track, for
   example).
+
+### Where it is listed
+
+Custom tracks come after the stock and added tracks, in the mod order. `after` in `[menu]` lists a track elsewhere:
+
+| `after =` | Listed |
+|---|---|
+| `"rush2"`, `"sfrush"`, `"rush2049"`, `"calspeed"` | right after that game's tracks on the same select (a stunt arena after that game's stunt arenas, and so on) |
+| a custom track's folder name | right after that track |
+
+Several tracks after the same one keep the mod order. A name that matches nothing leaves the track at the end (the log
+says so). Only the order changes: records, ghosts and saved choices are kept under the track's folder name as before.
+
+For developers: the ids stay 38-63; `build_order` in src/rush2049/track2049_menu.cpp makes the display order, the
+carousel is put in that order once built (0x803AB878) and TRACK left / right takes the track at the new carousel
+position (0x803AC12C).
 
 ## Textures
 
@@ -520,6 +675,22 @@ Click any point for its details (a racing line point's target speed, its Blender
 drag to pan, scroll to zoom, F to frame the track; while you move the camera a small cross marks the point it turns
 around.
 
+**Export track** saves the track as a custom track folder, zipped, that the game reads back as the same track:
+
+- A custom track: its folder's files exactly as they are.
+- A stock track (Rush 2's, Rush 2049's, San Francisco Rush's and California Speed's): a track.glb with everything a
+  modder would build. That means the collision as `COL_<surface>_stock` meshes, the gates as `FINISH` / `CHECKPOINT_n`
+  (or `START` ... `FINISH` on a point-to-point or run-in course) and `AIPATH_main`. The four racing lines come as `AIPATH_lane1`
+  to `AIPATH_lane4` with the game's own target speeds and steering in `_SPEED` and `_AI_MODE`, and the track's
+  textured model is included. A track.toml comes with it, holding the game's settings for that track: Rush 2049
+  gravity, California Speed's road hold, point to point, run-in.
+
+What a stock export can't keep: the collision is the game's own (polygons as the game cut them, not the faces they
+were modeled from), and lanes are re-spaced at 6 m (20 ft) like any custom track's. California Speed's start lines
+are moved 30 m (100 ft) along the road for the grid, as the game moves them; the run-in courses (New York One, Rush
+2049's race 6, Golden Gate) keep theirs, and their AI path is drawn 30 m (100 ft) back behind the start line instead. California Speed's shared
+roadside objects (cones, lamps, trees) aren't in its track files, so they're missing.
+
 **Run AI** races the computer cars around your track in the real game. The race runs hidden and as fast as your PC
 manages: a three-lap race takes about half a minute. The game uses its own settings and save for it, so nothing
 you've set or saved is touched. Then watch the race: play, pause, rewind and fast forward on the timeline, follow a
@@ -550,11 +721,60 @@ Reload. Close the command window to stop it.
 
 How it works inside is in [Track previewer](#track-previewer) and [Race replays](#race-replays).
 
+## Everything you can use
+
+Every name, custom property and setting a track can use, on one page. Each links to where it is explained.
+
+### Object names in Blender
+
+| Name | What |
+|---|---|
+| `COL_ROAD_*`, `COL_DIRT_*`, `COL_GRASS_*`, `COL_WALL_*`, `COL_WATER_*`, `COL_KILL_*`, `COL_<NAME>_*` | Collision: what cars drive on and hit ([Collision surfaces](#collision-surfaces)) |
+| any other mesh | Scenery: drawn, not hit |
+| `FINISH`, `START`, `CHECKPOINT_n` | Start, finish and checkpoints ([Markers](#markers)) |
+| `AISPEED_<mph>` | Speed cap for the computer cars ([The AI path](#the-ai-path)) |
+| `AIPATH_main`, `AIPATH_lane1` to `AIPATH_lane4` | The computer cars' path and lanes ([The AI path](#the-ai-path)) |
+| `TRIGGER_<name>` | A box that sets off moving objects ([Trigger boxes](#trigger-boxes)) |
+| `MOVE_<name>` | A moving object; its children move with it ([Moving objects](#moving-objects)) |
+| `BILLBOARD_<name>` | Turns to face the camera ([Billboards](#billboards)) |
+| `PROP_KNOCK_*`, `PROP_TIP_*` | Knocked flying or tipped over by cars ([Props](#props)) |
+| `SKY` | Your own sky dome ([Your own sky](#your-own-sky)) |
+| `START_1` to `START_4`, `PICKUP_<kind>` | Arenas only ([Stunt and battle arenas](#stunt-and-battle-arenas)) |
+| `ROAD_SPLINES` | Spline road, for converter tools ([Spline road](#spline-road)) |
+
+### Custom properties and attributes
+
+Custom properties are set in Object Properties > Custom Properties; attributes in Object Data Properties >
+Attributes (tick Data > Mesh > Attributes when you export).
+
+| On | Property | Values | What |
+|---|---|---|---|
+| `COL_*` | `covered` | 0, 1, 2 | Shades the cars on it: 1 a tunnel, 2 lightly covered ([Collision surfaces](#collision-surfaces)) |
+| `MOVE_<name>` | `billboard` | True | Its meshes face the camera as it moves ([Moving billboards](#moving-billboards)) |
+| `PROP_*` | `billboard` | True | The prop faces the camera ([Props](#props)) |
+| `AIPATH_main` | `keep_height` | True | The path keeps its height over every gap ([The AI path](#the-ai-path)) |
+| `AIPATH_main`, `AIPATH_lane*` | attributes `_SPEED`, `_AI_MODE` | mph; 2 or 5 | The computer cars' speed and steering point by point ([The AI path](#the-ai-path)) |
+| `COL_*` | attribute `_SEGMENT` | segment number | Spline road, for converter tools ([Spline road](#spline-road)) |
+| `ROAD_SPLINES` | `segments` | lists of numbers | Spline road, for converter tools ([Spline road](#spline-road)) |
+
+### track.toml settings
+
+| Section | Settings | See |
+|---|---|---|
+| `[track]` | `name` (required), `author`, `version`, `description`, `type`, `gravity`, `road_hold`, `point_to_point`, `run_in`, `smooth_collision`, `smooth_fold` | [track.toml](#tracktoml), [Smooth collision](#smooth-collision) |
+| `[race]` | `start_time`, `checkpoint_time`, `best_times` | [track.toml](#tracktoml) |
+| `[look]` | `fog_color`, `sky`, `cloud_scroll`, `sky_parallax` | [Sky](#sky) |
+| `[movers.<name>]` | `mode`, `races`, `start`, `open`, `close`, `open_delay`, `close_delay`, `open_at_start` | [Moving objects](#moving-objects) |
+| `[surfaces.<name>]` | `like`, `drag` | [Custom surfaces](#custom-surfaces) |
+| `[audio]` | `music` | [track.toml](#tracktoml) |
+| `[menu]` | `logo`, `preview`, `diorama`, `after` | [Track select art](#track-select-art) |
+
 ## Size limits
 
 | What | Limit | Why |
 |---|---|---|
-| Collision polygons | 8,191 after flat neighbors are joined, and at most 255 in one small area | The game's collision format. Stock tracks use 2,100 to 7,100. |
+| Collision polygons | about 16,000 after flat neighbors are joined (65,535 corners: polygons don't share them, so 16,000 quads or 21,000 triangles) | The game's collision format. Stock tracks use 2,100 to 7,100. |
+| Collision in one spot | 255 polygons within about a foot of any point (walls count within 6 ft where there is room) | The game's collision lookups hold 255. The report names the spot when a track passes it. |
 | Track triangles | about 40,000 (rule of thumb) | The whole track is loaded into the game's memory, which it shares with the cars. |
 | Track size | about 10 km (32,000 ft) from the origin in any direction | Positions are stored as 16-bit numbers. |
 | Checkpoints | 9 | The game has 10 gates including the finish line. |
@@ -566,7 +786,8 @@ merges and renames as needed.
 
 ## How custom tracks race
 
-- **Options:** backward, mirror, laps, fog, drones and the rest all work as on stock tracks.
+- **Options:** backward, mirror, laps, fog, drones and the rest all work as on stock tracks (a point-to-point track
+  has no laps or backward).
 - **Records:** each track keeps its own records, forward and backward, under its folder name.
 - **Ghosts:** saved like the stock tracks'. A ghost holds at most 150 seconds a lap, so a longer lap cuts its ghost
   short.
@@ -575,10 +796,8 @@ merges and renames as needed.
 
 ## Not supported yet
 
-- Moving objects that react to the race, such as traffic or a train that waits for the cars: they play on their own
-  clock (a ride only waits for a car on its floor)
-- A run-up before the lap: the AI path must be a closed loop through `FINISH` (NY One and Rush 2049's race 6 start
-  outside their loop)
+- Traffic that drives the road and reacts to the cars (moving objects follow their animation; they can wait for
+  [events](#making-it-react-to-the-race) but don't steer round cars)
 - Setting the fog distance
 - Surface grip, such as ice or sticky surfaces (Rush 2 only changes slowdown per surface)
 - New sounds, dust or skid marks for custom surfaces
@@ -676,6 +895,41 @@ merges and renames as needed.
   format is version 2 (`track_cache.cpp`: `mover_paths`, `mover_collision`). `tools/track_mod_cases.py`'s `movers`
   case checks the flags, node counts, every key's vertex pose against the glTF (a parented, scaled and turned object
   included), the records and the quadtree coverage.
+- **Scripted moving objects and triggers:** a mover with `mode = "once"` or `"door"`, or a `start` on a loop or
+  pingpong, is scripted. The converter appends three chunks to the mover file's directory (12-byte entries at +4:
+  PTHD per path, then SCRP, TRIG, LAPP, terminator). SCRP has one record per path in PTHD order: u8 mode (0 not scripted,
+  1 loop, 2 pingpong, 3 once, 4 door), u8 flags (bit 0 open_at_start), u8 counts of start / open / close events,
+  3 pad, f32 open_delay, f32 close_delay (-1 = none), then the events, 12 bytes each: u8 kind (0 time, 1 trigger,
+  2 odd_lap, 3 even_lap, 4 final_lap, 5 progress, 6 last_checkpoint), pad, s16 box (TRIG index), s16 lap (0 = any),
+  pad, f32 seconds (progress: feet). LAPP (count = points, 0 when no event is a progress one): f32 lap length (0 for
+  an open AI path: point to point or run-in, measured along it with no laps), then the spine's points (f32 x, y, z,
+  game space, from the finish line every 20 ft), read by `movers::parse_lap`. TRIG holds
+  24-byte boxes (f32 lo[3], hi[3], game space) from `TRIGGER_` nodes (mesh bounds, or an Empty's ±1 cube through its
+  world matrix). A scripted path gets path flag pingpong 0x1 (loop 0x2 for a loop) and no ride flags.
+  `movers::parse_scripts` reads them into `Path::script` and the boxes (`track2049_movers_logic.cpp`), for
+  `light_track` 0 only. Each tick `track2049_movers.cpp` hands `World::set_race` whether the race is on (any active,
+  non-ghost car released: car +0x71C), the leader's lap (max car +0x7FD laps done + 1), the race's laps (0x8010C0E2)
+  and the boxes each car entered this tick with that car's lap (tested in the per-car hook against car +0x224, live
+  cars only: active +0x7E4, not wrecked, not a ghost); then `World::set_cars` every active non-ghost car's position
+  and whether player 1 is on the last lap with the finish's checkpoint (0x8010BCEC) as its next (car +0x800).
+  Progress is the Rush 2049 arcade's (docs/arcade2049.md#dobsrom-dynamic-objects): distance along the lap to the
+  nearest point plus a per-car lap counter x the lap length, the counter stepped when that distance jumps by more than
+  half a lap; a progress event fires once when the leader's passes it, `last_checkpoint` as player 1's next
+  checkpoint turns into the finish on the last lap. `World::step_scripted` runs such a path on a clock in seconds
+  (every node's time is travel except the end node's; a loop counts every node, wrapping with a restore group op as
+  2049's loop does), sets the follower's node / t / dir from it and poses it with the shared `pose()`; time events
+  fire once each, from the green light; progress events once each. The script state is in the online sync. `movers_test.exe --script
+  <mover_paths.bin> [laps] [lap seconds]` simulates a race and prints each scripted object's starts and stops;
+  `track_mod_cases.py`'s `scripts` case checks the chunks, a moving billboard's record flag (0x8000, `camera_card`:
+  `MOVE_` with `billboard`, vertices scaled by key 0 and turned half a turn for the camera basis) and `covered`
+  (polygon info 0x4000 for 1, 0x8000 for 2: Rush 2's covered bits, which set car +0x344 and the tunnel shading).
+  In the game, `RUSH2_MOVERS_LOG=1` prints the setup (paths, scripted ones, each trigger box) and, each tick, changes
+  of the race flag and leader's lap and every box a car enters; `tools/test_race.py TRACK --records
+  <converted>/placement.bin --env RUSH2_MOVERS_LOG=1` adds which records moved (`track_mod_test.exe <track dir> <out>`
+  writes the placement.bin). A car that isn't driven runs out of checkpoint time about 30 s in: add `--drones 3
+  --config cheats.cheat_no_game_timer=true` so the drones run the laps (2026-10-20: Marina A's STVRAMP door, set in a
+  test copy to `trigger PROGRESS_14000`, opened 17 ft in game). A flip-book on `final_lap` swaps at the green light in a
+  one-lap race, before race_watch's first sample, so it shows as unchanged there.
 - **Billboards and props:** each `BILLBOARD_` and `PROP_` node becomes a model in its own frame (`<prefix>B%03u`, or
   `P%03u` for a prop that isn't a billboard), shared by nodes whose triangles are the same in the units the model
   stores (1/16 ft vertices, uv and color to 1/1024), and a top-level placement record after the moving objects, with no
@@ -692,7 +946,27 @@ merges and renames as needed.
   whose origin reaches all its corners, else starts one at its center. Before, each got a section of its own: the
   arcade Alcatraz's bay (water pieces out to 10,700 ft) made 258 sections, and the race crashed at its start
   (scene_node_create_8007F6DC appends nodes to the table at 0x800D9E90 with no bound; real globals follow it near
-  0x800E7950, so it holds about 1,000 nodes for the track, cars and everything else). It now makes 110.
+  0x800E7950, so it holds about 1,000 nodes for the track, cars and everything else). It now makes 110. The table
+  itself has since moved (see Scene node table below).
+- **Scene node table:** every section, billboard, prop and moving object's record gets a scene node, and so do the
+  cars. The game's table at 0x800D9E90 holds 1,000 (0x38 bytes each, count `scene_node_table_count_800FAE58`, appended
+  with no bound). The arcade Haight (Rush 2049 Arcade, Alcatraz Only off) made 1,045 with its 167 billboards, 80 props
+  and 117 moving objects: the extra nodes ran over `text_state_stack_a_800E7C50`, whose handler the loading screen
+  calls, so its race start jumped to 0x300 and quit every time (and the texture deriver's thread then crashed on the
+  exit, which is what the dumps show). The arcade Metro makes 944 and Marina 831 (`race_watch.py --peek 800FAE58
+  --peek-always`). The table now lives at 0x80400000-0x80420000, 2,340 nodes (`include/scene_nodes.h`): it is a
+  `PLACED` entry of `tools/players4/relocate.py`, which points all 106 game accesses at it in us.toml (two stores in
+  func_800BC888 through another pointer are excluded), and the game heap starts at 0x80420000 (`src/assets.cpp`;
+  3 MB of it was still free in the arcade Metro's race). Interpolation keeps state for every node and its matrix IDs
+  hold 12 bits of node index (`src/interpolation.cpp` node_id).
+- **A big track and the heap:** the arcade Presidio (Rush 2049 Arcade, Alcatraz Only off) fills the heap to about
+  0x80A5EAA0 (`test_race.py --peek 8010C438 --peek 8010C454`: heap low and high). Two things broke there (issue 27).
+  `race_preload_car_assets_800A37F4` loads a car's model only if the free heap holds its asset + 0x200, else a smaller
+  Rush 2 type's. Its checks read the size table at asset 0x1D + type, which for a Rush 2049 type is a track asset
+  (type 24: 0x35, the HAWAII slot's geometry, the custom track itself), so every 2049 car became the Pickup; they are
+  hooked to the type's own asset now (`rush2_car49_asset_size`, src/rush2049/car2049.cpp). And code that checked game
+  pointers against the old 8 MB end (0x80800000) rejected data loaded past it: the pause menu's row images, so SKIP
+  TRACK was blank. Those checks use `rush2::in_game_ram` (include/rush2.h, the full 16 MB) now.
 - **See-through materials:** BLEND triangles get their own sections (the grid cell is keyed by translucency too),
   whose records have the late-pass flag 0x40000 (drawn after the opaque nodes, as Rush 2's own transparent ones). Every
   list draws its translucent materials last with render mode 0xC8104A50 (fog, then AA z-buffered translucent: Rush 2's
@@ -728,7 +1002,7 @@ merges and renames as needed.
   from the walls, see-through cracks, shaking); jumping at the segment's end, the frames' float timers drifted enough
   for a game frame to show two frames or none. A frame shown after being hidden has no matrix group in RT64's previous
   frame, so it was drawn unblended for a game frame while the camera (whose position is in every node's matrix) was
-  blended, and it shook at every step: a book's frames share one pivot (`tools/arcade2049/track_mod.py`), and
+  blended, and it shook at every step: a book's frames share one pivot (`src/arcade2049/arcade_track.cpp`), and
   `track2049_movers.cpp` setup gives the nodes of frames on one pivot one interpolation ID
   (`rush2::interpolation_node_alias`, `src/interpolation.cpp`), so the frame shown pairs with the one it replaces,
   whose matrix is the same. `tools/rush2049/cpp_test/movers_test.cpp --custom <mover_paths.bin>` checks a converted
@@ -755,17 +1029,35 @@ merges and renames as needed.
   frame, which collapse to a point (holes).
 - **Collision:** `build_collision` keeps each face's normal (no flipping), merges flat same-surface neighbors into
   convex polygons of up to 8 vertices, and builds the quadtree Rush 2's way; past 64 KB of leaves it builds the tagged
-  form the 2049 port reads (splits toward zero, 17-bit leaf offsets, root byte +2 = 0x80 | size bits 16-22:
-  `src/rush2049/track2049_collision.cpp`). A leaf holds at most 36 polygons (`max_leaf`): the game's queries copy a
-  leaf into an unchecked u16[36] stack buffer, and a longer one overwrites the callers' locals
-  (docs/rush2049_research/collision.md). With leaves of up to 255 the stock Alcatraz export had cells of 70, and a
+  form the 2049 port reads (splits toward zero, 17-bit leaf offsets, root byte +2 = 0x80 | size bits 16-20:
+  `src/rush2049/track2049_collision.cpp`). Past 8,191 polygons (Rush 2's leaf entries hold a 13-bit polygon number
+  and a 3-bit run) the leaves are written wide, one plain u16 polygon number per entry, and the root's byte +2 gets
+  bit 5 (`rush2::collision::wide_leaf_tag`, either form); `rush2_collision_leaf_read_wide` reads them in place of
+  `collision_leaf_read_8006CCEC` (docs/rush2049_research/collision.md#leaf-lists-v). The limit is then the header's
+  u16 corner count (65,535; each polygon has its own corners), which past it leaves the last polygons out with an
+  error (until 2026-10-19 the converter cut every track at 8,191 polygons). A leaf holds at most 255 polygons (`max_leaf` = `rush2::collision::max_leaf_polys`, the u8 leaf count's limit).
+  The game's four leaf queries copy a leaf into an unchecked u16[36] (u16[40] in the wall query) stack buffer, and a
+  longer one overwrote the callers' locals: with leaves of up to 255 the stock Alcatraz export had cells of 70, and a
   computer car's wall query (`car_wall_collision_query_8006FC94`) about 35 s into a race got its saved point pointer
-  (sp+0x15C) overwritten by polygon numbers and crashed in `collision_poly_point_test_8006C670` (until 2026-10-15).
+  (sp+0x15C) overwritten by polygon numbers and crashed in `collision_poly_point_test_8006C670` (until 2026-10-15 the
+  converter held leaves to 36 for it). Since 2026-10-20 hooks in us.toml (`rush2_collision_leaf_list`, before each
+  query's copy and its read loop) point the buffer register at a 0x200-byte list per query at RDRAM 0x80E1EA00
+  (`rush2::collision::leaf_lists`; 0 = `collision_query_8006CF00`, 1 = 0x8006F704, 2 = 0x8006FC94, 3 = 0x8008BDC0),
+  swapping it only while it still holds sp + the buffer's offset, and the ghost leaf filters read the same lists
+  (`rush2_collision_leaf_list_at`) (docs/rush2049_research/collision.md#leaf-list-buffers). Splitting cells toward 36
+  as well took the arcade Metro and Presidio past the 2 MB leaf index, so cells split only past 255.
   A cell lists the polygons whose x/z outline (not box: a long diagonal strip's box covers far more than the strip,
-  and stacked boxes on pipes and terraced slopes crowded single spots past 36) comes within 1 ft of it, walls within
-  6 ft (the wall query reaches 5 ft past the car) unless that crowds the cell past 36. A cell past 36 splits below
-  `min_cell` until it fits; one that never does fails with "too dense". `tools/rush2049/collision.py` validation
-  flags leaves past 36.
+  and stacked boxes on pipes and terraced slopes crowded single spots) comes within 1 ft of it, walls within
+  6 ft (the wall query reaches 5 ft past the car) unless that crowds the cell past 255. A cell past `leaf_limit` (12) splits down to
+  `min_cell` (32 ft); one past 255 splits on below it, down to 4 ft, and past 255 there with walls listed only 1 ft out
+  down to 1 ft
+  (until 2026-10-19 the 4 ft cell failed: a polygon passing near a crowded spot no longer counts). One that never fits
+  fails with "N collision polygons meet near (x, y, z)", the spot in the author's Blender coordinates.
+  Past 128 KB of leaves the tagged form's 17-bit child offsets run out (the arcade Presidio): the converter then
+  writes a far-leaf table, u32 leaf offsets stored backward from the leaf section's end (entry k at end - 4(k + 1)),
+  sets `rush2::collision::far_leaf_tag` (0x40) beside 0x80 in the root's byte +2, and a leaf child's 16-bit field is
+  then k. `leaf_offset` in `src/rush2049/track2049_collision.cpp` reads it (California Speed's files use 0x40 without
+  0x80, which keeps its own meaning). `tools/rush2049/collision.py` decodes it (`TAG_FAR`) and flags leaves past 255.
 - **Reading the ribbon:** `read_ribbon` builds the rungs from the mesh's shape, never the order its vertices are
   stored in. Blender's glTF export of a cyclic curve stores the first rung's two vertices twice each (the UV seam: u
   wraps 1 to 0), so pairing stored vertices two at a time read a 0 m first rung and failed every cyclic curve with
@@ -824,6 +1116,24 @@ bake.py; Reload converts again. The page works in glTF meters (game = (-x, y, z)
 over it as is. `?show=a,b&hide=c`, `?dir=backward`, `?click=x,y` and `?pivot` set layers, the path, an inspector click
 and the orbit marker from the URL, for headless screenshots
 (`msedge --headless=new --use-angle=swiftshader --virtual-time-budget=20000 --screenshot=...`).
+
+**Export track** is `tools/trackview/export.py` (`/export?folder=`; also `python tools/trackview/export.py FOLDER
+OUT.zip`). A custom track's folder is zipped as it is. A stock track is rebuilt by `tools/stock_track_glb.py`
+`build_glb(..., visual=False, lanes=True)` from the game's collision and path files, and the model dump's placed glb
+is merged in by `merge_glb` (its root nodes scaled from feet to meters, its buffers, accessors, textures and
+animations re-indexed). The page used to export from the browser through three.js's GLTFLoader and GLTFExporter,
+which isn't a round trip: GLTFLoader lower-cases custom attributes (`_SPEED` becomes `_speed`), and GLTFExporter
+prefixes every non-standard attribute with `_` again, so the file came back with `__SPEED`, `__AI_MODE` and
+`__SEGMENT`, losing authored AI speeds and the spline road. That export also dropped animations, `START_*` and
+`AISPEED_*`, and wrote the AI path as lines the converter can't read. Checked by converting the exports back (export, bake, compare
+path.bin with the ROM's): Rush 2's and Rush 2049's lanes land within 1.5 m (median) of the ROM's with the same speeds
+and the gates exactly on the stock ones; the run-in courses get the stock header (1, 5, 0 on New York One) and flags,
+their spine ending 30-57 ft before the loop start as the stock ones do (25-41 ft); a custom track's zip is
+byte-identical to its folder. `stock_track_glb.path_layout` tells the three layouts apart from the path file: an
+open spine whose start line (flags 2) isn't its finish line (flags 1) is a run-in when a later checkpoint is flagged 4
+(the loop start), else point to point. `build_glb` sets each gate's arrow along the path's travel
+at the gate's own spine crossing (`cross[0]`). San Francisco Rush's converted paths point their gates along the race,
+where Rush 2's point back, and the old blind flip also had New York One's CHECKPOINT_5 backwards.
 
 ### Race replays
 

@@ -5,9 +5,11 @@ got past the race (test aid; docs/menus.md#starting-a-race-without-the-menus).
 
     python tools/test_race.py TRACK [--cars T,T,...] [--laps N] [--drones N] [--script S] [--seconds S]
                               [--turbo] [--finish S] [--mod NAME] [--out DIR] [--env K=V ...] [--games K=V ...]
-                              [--shots S,S,...]
+                              [--config NAME.K=V ...]
+                              [--shots S,S,...] [--records PLACEMENT_BIN] [--user-settings] [--show]
 
-TRACK is a track select id (0-11 Rush 2, 12-17 Rush 2049, 18-24 SF Rush, 25-28 stunt arenas, 29 obstacle course,
+TRACK `menus` sets no race up: the game boots to the title and the --script drives the menus (as JUST PLAY: the
+data folder has no saved players). Otherwise TRACK is a track select id (0-11 Rush 2, 12-17 Rush 2049, 18-24 SF Rush, 25-28 stunt arenas, 29 obstacle course,
 30-37 battle arenas, 38-63 custom tracks, 64-79 California Speed) or a custom track's folder name. --cars gives one
 car type per player (1-4 players; Rush 2 0-21, 2049 23-35, California Speed 36-56, mod cars 57-72). --script is the
 --input-script (default: gas held from 1 s), counted from launch: the race is up about 5 s in.
@@ -15,14 +17,16 @@ car type per player (1-4 players; Rush 2 0-21, 2049 23-35, California Speed 36-5
 The game runs as a sim run (RUSH2_SIM=1, src/sim_run.cpp): hidden, deaf to real controllers, no audio, from a data
 folder of its own (tmp/test_race/data), so the player's settings and saves are never read or written. Before each run
 its settings and saves are cleared (its caches are kept), the ROMs in build/ are hard-linked in, build/games.json is
-copied (the same games on; --games K=V sets one of its options, V as JSON or else a string), and the mods enabled
-in build/mods.json are linked in and enabled, plus --mod ones and the mod holding a TRACK folder. Real time by
+copied (the same games on; --games K=V sets one of its options, V as JSON or else a string; --config NAME.K=V sets
+one in NAME.json, e.g. cheats.unlock_all_parts=true), and the mods enabled
+in build/mods.json are linked in and enabled, plus --mod ones and the mod holding a TRACK folder (--mod-dir PATH links
+a mod folder from anywhere, such as a converter's output, or copies a .rtz, in place of the installed mod of its id). Real time by
 default; --turbo runs the race as fast as the machine goes from its first tick (the script's presses stop then).
 --finish S finishes the players' cars S seconds into the race (RUSH2_TEST_FINISH) to reach the race-over screens.
 The run is closed after --seconds (by its PID). race_watch.py does the watching: DIR/samples.jsonl, DIR/events.txt,
 DIR/run.log (the game's output).
 """
-import argparse, json, math, os, shutil, subprocess, sys
+import argparse, json, math, os, shutil, subprocess, sys, zipfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
@@ -60,7 +64,25 @@ def mod_name(entry):
     return entry[:-4] if entry.endswith('.rtz') else entry
 
 
-def prepare_data(track, extra_mods, games=()):
+def set_options(name, pairs):
+    """Sets options K=V (V as JSON, or else a string) in the data folder's NAME.json, keeping its others."""
+    path = os.path.join(DATA, name + '.json')
+    cfg = json.load(open(path, encoding='utf-8')) if os.path.exists(path) else {}
+    for kv in pairs:
+        k, _, v = kv.partition('=')
+        try:
+            cfg[k] = json.loads(v)
+        except ValueError:
+            cfg[k] = v
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump(cfg, f, indent=4)
+
+
+#: Settings files --user-settings copies from build/ (how the game looks and plays; never the saves or the sound).
+USER_SETTINGS = ['graphics.json', 'general.json', 'cheats.json', 'circuit.json', 'npc_cars.json']
+
+
+def prepare_data(track, extra_mods, games=(), configs=(), mod_dirs=(), user_settings=False):
     os.makedirs(DATA, exist_ok=True)
     for n in os.listdir(DATA):
         p = os.path.join(DATA, n)
@@ -74,17 +96,18 @@ def prepare_data(track, extra_mods, games=()):
             link(src, dst)
     if os.path.exists(os.path.join(BUILD, 'games.json')):
         shutil.copyfile(os.path.join(BUILD, 'games.json'), os.path.join(DATA, 'games.json'))
+    if user_settings:
+        for n in USER_SETTINGS:
+            if os.path.exists(os.path.join(BUILD, n)):
+                shutil.copyfile(os.path.join(BUILD, n), os.path.join(DATA, n))
+        # A test window never opens fullscreen over the user's desktop, whatever their own window mode is.
+        if os.path.exists(os.path.join(DATA, 'graphics.json')):
+            set_options('graphics', ['wm_option=Windowed'])
     if games:
-        path = os.path.join(DATA, 'games.json')
-        cfg = json.load(open(path, encoding='utf-8')) if os.path.exists(path) else {}
-        for kv in games:
-            k, _, v = kv.partition('=')
-            try:
-                cfg[k] = json.loads(v)
-            except ValueError:
-                cfg[k] = v
-        with open(path, 'w', encoding='utf-8') as f:
-            json.dump(cfg, f, indent=4)
+        set_options('games', games)
+    for entry in configs:
+        name, _, kv = entry.partition('.')
+        set_options(name, [kv])
     enabled = []
     try:
         with open(os.path.join(BUILD, 'mods.json'), encoding='utf-8') as f:
@@ -94,17 +117,36 @@ def prepare_data(track, extra_mods, games=()):
     enabled += extra_mods
     src_mods = os.path.join(BUILD, 'mods')
     entries = os.listdir(src_mods) if os.path.isdir(src_mods) else []
-    if not track.isdigit():
+    if not track.isdigit() and track != 'menus':
         for e in entries:
             if os.path.isdir(os.path.join(src_mods, e, 'tracks', track)) or os.path.isdir(os.path.join(src_mods, e, 'rush2', 'tracks', track)):
                 enabled.append(mod_name(e))
     mods = os.path.join(DATA, 'mods')
     os.makedirs(mods, exist_ok=True)
     for n in os.listdir(mods):
-        remove_link(os.path.join(mods, n))
+        p = os.path.join(mods, n)
+        if os.path.isdir(p) and not os.path.isjunction(p) and not os.path.islink(p):
+            shutil.rmtree(p)      # a --mod-dir copy, or a mod the game rebuilt into a folder
+        else:
+            remove_link(p)
     wanted = []
+    replaced = set()
+    for d in mod_dirs:
+        if os.path.isfile(d):
+            # A packed mod (.rtz): copied, since the game may replace it (the arcade mods' rebuild).
+            with zipfile.ZipFile(d) as z:
+                mid = json.loads(z.read('mod.json'))['id']
+            shutil.copyfile(d, os.path.join(mods, mid + '.rtz'))
+            replaced.add(mid)
+            wanted.append(mid)
+            continue
+        with open(os.path.join(d, 'mod.json'), encoding='utf-8') as f:
+            mid = json.load(f)['id']
+        link(os.path.abspath(d), os.path.join(mods, mid))
+        replaced.add(mid)
+        wanted.append(mid)
     for e in entries:
-        if mod_name(e) in enabled and not e.endswith('.7z'):
+        if mod_name(e) in enabled and not e.endswith('.7z') and mod_name(e) not in replaced:
             link(os.path.join(src_mods, e), os.path.join(mods, e))
             if mod_name(e) not in wanted:
                 wanted.append(mod_name(e))
@@ -152,16 +194,37 @@ def main():
     ap.add_argument('--turbo', action='store_true')
     ap.add_argument('--finish', type=float)
     ap.add_argument('--mod', action='append', default=[])
+    ap.add_argument('--mod-dir', action='append', default=[], help='a mod folder to link in (or a .rtz to copy in), '
+                    'in place of the installed mod with the same id (its mod.json id)')
     ap.add_argument('--out', default=os.path.join(REPO, 'tmp', 'test_race', 'out'))
     ap.add_argument('--env', action='append', default=[], help='extra environment variable K=V for the game')
     ap.add_argument('--games', action='append', default=[], help='games.json option K=V for the run')
+    ap.add_argument('--config', action='append', default=[],
+                    help='option of another settings file for the run, NAME.K=V (e.g. cheats.unlock_all_parts=true)')
     ap.add_argument('--shots', help='screenshot the game window at these seconds after launch (comma separated) into '
                     'DIR/shot_<seconds>.png; the window is shown for it (RUSH2_SIM_SHOW), without taking the focus')
+    ap.add_argument('--records', help="a custom track's placement.bin: report which of its records moved during the race "
+                    "(race_watch.py --records; moving objects)")
+    ap.add_argument('--peek', action='append', default=[], help='an RDRAM u32 (hex) to print the smallest and largest of '
+                    'during the race (race_watch.py --peek, repeatable; e.g. heap pointers 8010C438 8010C454)')
+    ap.add_argument('--user-settings', action='store_true', help="copy build/'s graphics, general, cheats, circuit "
+                    "and opponent settings in (profiling what the player sees: MSAA, SSAO and the like change RT64's "
+                    "work); the saves and sound settings stay the run's own")
+    ap.add_argument('--show', action='store_true', help='show the window (RUSH2_SIM_SHOW, without taking the focus): '
+                    'a hidden window presents differently, so profile with it shown')
+    ap.add_argument('--data', help="the run's data folder (default tmp/test_race/data); give each run that may "
+                    "overlap another session's its own")
     a = ap.parse_args()
-    mods = prepare_data(a.track, a.mod, a.games)
+    if a.data:
+        global DATA
+        DATA = os.path.abspath(a.data)
+    if a.records and not os.path.isfile(a.records):
+        sys.exit('no placement file %s (the converted track: track_mod_test.exe output)' % a.records)
+    mods = prepare_data(a.track, a.mod, a.games, a.config, a.mod_dir, a.user_settings)
     env = {k: v for k, v in os.environ.items() if not k.startswith('RUSH2_')}
-    env.update(RUSH2_SIM='1', RUSH2_DATA_DIR=DATA, RUSH2_SIM_TURBO='1' if a.turbo else '0', RUSH2_TEST_RACE=a.track,
-               RUSH2_TEST_RACE_CARS=a.cars)
+    env.update(RUSH2_SIM='1', RUSH2_DATA_DIR=DATA, RUSH2_SIM_TURBO='1' if a.turbo else '0')
+    if a.track != 'menus':
+        env.update(RUSH2_TEST_RACE=a.track, RUSH2_TEST_RACE_CARS=a.cars)
     if a.laps is not None:
         env['RUSH2_TEST_RACE_LAPS'] = str(a.laps)
     if a.drones is not None:
@@ -171,16 +234,20 @@ def main():
     for kv in a.env:
         k, _, v = kv.partition('=')
         env[k] = v
-    if a.shots:
+    if a.shots or a.show:
         env['RUSH2_SIM_SHOW'] = '1'
     script = a.script or '1:A:%g' % max(1.0, a.seconds - 1)
     print('track %s, cars %s, mods %s' % (a.track, a.cars, ', '.join(mods) or 'none'), flush=True)
     os.makedirs(a.out, exist_ok=True)
     r = subprocess.run([sys.executable, os.path.join(HERE, 'race_watch.py'), '--launch', script, '--seconds',
-                        str(a.seconds), '--out', a.out] + (['--shots', a.shots] if a.shots else []), env=env, capture_output=True, text=True,
+                        str(a.seconds), '--out', a.out] + (['--shots', a.shots] if a.shots else []) +
+                       (['--records', os.path.abspath(a.records)] if a.records else []) +
+                       [v for p in a.peek for v in ('--peek', p)], env=env, capture_output=True, text=True,
                        timeout=a.seconds + 60)
     with open(os.path.join(a.out, 'watch.txt'), 'w') as f:
         f.write(r.stdout + r.stderr)
+    if a.records or a.peek:
+        print(r.stdout.rstrip())
     log = os.path.join(a.out, 'run.log')
     if os.path.exists(log):
         for line in open(log, errors='replace'):

@@ -3,10 +3,14 @@
 
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <string>
 
 namespace recompui {
     class Element;
+}
+namespace rush2::ui {
+    struct ExpandPanel;
 }
 
 // Circuit length and courses (src/circuit.cpp): the General tab's Circuit Length select and Circuit Courses section.
@@ -14,7 +18,8 @@ namespace recompui {
 // next circuit.
 namespace rush2::circuit {
     constexpr int stock_length = 28;    // Rush 2's circuit: 28 races.
-    // Track select ids a circuit can pick from: Rush 2 0-6, 2049 12-17, SF Rush 18-24, California Speed 64-79.
+    // Track select ids a circuit can pick from: Rush 2 0-6, CRASH 8 and PIPE 9 (off by default), 2049 12-17, SF Rush
+    // 18-24, California Speed 64-79.
     constexpr int course_ids = 80;
 
     // Registers the hidden choices (circuit.json). Call before recompui::config::finalize().
@@ -24,8 +29,9 @@ namespace rush2::circuit {
     // Makes a callback that shows text in the page's description pane (OptionsPage::text_shower).
     using TextShower = std::function<std::function<void()>(const std::string&)>;
     // Adds the Circuit Length select and the collapsible Circuit Courses section to a list (the General tab's, under
-    // Gameplay).
-    void add_section(recompui::Element* parent, const TextShower& text_shower);
+    // Circuits). With a panel, the course list opens in the panel's area instead of under its button.
+    void add_section(recompui::Element* parent, const TextShower& text_shower,
+                     std::shared_ptr<rush2::ui::ExpandPanel> panel = nullptr);
 
     // Game thread. The current circuit's (0x800D3E40's) length in races, and whether it may pick track t.
     int length(uint8_t* rdram);
@@ -38,6 +44,13 @@ namespace rush2::circuit {
     // More Circuit Settings (General tab): the track select lets DIFFICULTY and DEATHS change on every circuit race,
     // DIFFICULTY included. Takes effect at once.
     void set_more_settings(bool enabled);
+
+    // Game thread. The race select's BATTLE row in a circuit is the circuit's, like DEATHS: race_battle gives the
+    // current circuit's (0 / 1; -1 not set yet, or not in a circuit of this machine's), set_race_battle sets it (false
+    // when not in one). The track select opens on it and its step sets it; the row is open on the first race and,
+    // with More Circuit Settings, on every race.
+    int race_battle(uint8_t* rdram);
+    bool set_race_battle(uint8_t* rdram, bool on);
 
     // Fixed Circuit Difficulty (General tab): a circuit race no longer steps the circuit's difficulty toward the
     // standings. Read at the end of each circuit race.

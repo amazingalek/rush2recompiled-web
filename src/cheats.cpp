@@ -22,7 +22,7 @@
 // - Unlock All Cars replaces each player's car list once car select (func_803B81F0) has built it. The game lists
 //   cars 0-15, cars 16-19 for every 3 keys found on the current track, car 20 once 0x800C20D8 (or the profile's
 //   +0x4B4) is set, and car 21 once all 4 cans on the current track are found; the Rush 2049 cars follow.
-// - Unlock All Parts offers every ENGINE level on the Rush 2049 cars.
+// - Unlock All Parts offers every ENGINE level on the Rush 2049 cars and the SLICKS and PRO SLICKS tires.
 // Otherwise the unlock system decides what each player's car list holds (src/unlocks.cpp). Its own option, Unlock
 // System, is kept in this tab's config but shown on the Progress tab.
 //
@@ -62,6 +62,7 @@
 #include "calspeed.h"
 #include "car2049.h"
 #include "car_mods.h"
+#include "prewarm.h"
 #include "track2049.h"
 #include "track_mod_runtime.h"
 #include "unlocks.h"
@@ -78,7 +79,7 @@ namespace {
     constexpr uint32_t midway_unlocked = 0x800E7D19;
 
     constexpr uint32_t num_players = 0x8010C3E2;  // s16
-    constexpr uint32_t car_list = rush2::car2049::car_list; // u8 [36][2]: car i of player p at + 2 * i + p.
+    constexpr uint32_t car_list = rush2::car2049::car_list; // u8 [types][2]: car i of player p at + 2 * i + p.
     constexpr uint32_t car_list_size = 0x803CB398; // s16 [2]
     constexpr int num_cars = 22;
     constexpr int max_car_players = 2;
@@ -381,13 +382,15 @@ namespace {
             recomp::config::Config& config = recompui::config::get_config(config_id);
             set_as_navigation_container(NavigationType::Vertical);
 
-            // One full-width side: the columns, then the description.
+            // One full-width side: the columns, then the description. Placed, not flexed, like the column layout of
+            // rush2::ui::OptionsPage: RmlUi lays out nested flex boxes many times over (tools/rml_layout_bench).
+            constexpr float description_height = 92.0f;
+            constexpr float column_gap = 32.0f;
             body->get_right()->set_display(Display::None);
             Element* left = body->get_left();
-            left->set_display(Display::Flex);
-            left->set_flex_direction(FlexDirection::Column);
-            left->set_padding(16.0f);
-            left->set_gap(8.0f);
+            left->set_display(Display::Block);
+            left->set_position(Position::Relative);
+            left->set_height(100.0f, Unit::Percent);
 
             ConfigHeaderFooter* top = add_header();
             Label* intro = context.create_element<Label>(top->get_left(), page_description, theme::Typography::Body);
@@ -396,21 +399,29 @@ namespace {
             reset->add_pressed_callback([this]() { reset_cheats(); });
 
             Element* grid = context.create_element<Element>(left, 0, "div", false);
-            grid->set_display(Display::Flex);
-            grid->set_flex_direction(FlexDirection::Row);
-            grid->set_gap(32.0f);
-            grid->set_width(100.0f, Unit::Percent);
+            grid->set_position(Position::Absolute);
+            grid->set_top(16.0f);
+            grid->set_left(16.0f);
+            grid->set_right(16.0f - column_gap * 0.5f);
+            grid->set_bottom(description_height + 24.0f);
             grid->set_as_navigation_container(NavigationType::Horizontal);
 
-            for (const auto& groups : page_columns) {
+            const size_t column_count = page_columns.size();
+            for (size_t c = 0; c < column_count; c++) {
+                const auto& groups = page_columns[c];
                 Element* column = context.create_element<Element>(grid, 0, "div", false);
-                column->set_display(Display::Flex);
-                column->set_flex_direction(FlexDirection::Column);
-                column->set_flex_grow(1.0f);
-                column->set_flex_basis(0.0f);
+                column->set_position(Position::Absolute);
+                column->set_top(0.0f);
+                column->set_bottom(0.0f);
+                column->set_left(100.0f * c / column_count, Unit::Percent);
+                column->set_width(100.0f / column_count, Unit::Percent);
+                column->set_padding_left(c == 0 ? 0.0f : column_gap * 0.5f);
+                column->set_padding_right(column_gap * 0.5f);
+                column->set_overflow_y(Overflow::Auto);
                 column->set_as_navigation_container(NavigationType::Vertical);
                 for (const Group& group : groups) {
                     Label* title = context.create_element<Label>(column, group.title, theme::Typography::LabelLG);
+                    title->set_display(Display::Block);
                     title->set_padding_top(column_has_rows(column) ? 16.0f : 0.0f);
                     title->set_padding_bottom(6.0f);
                     title->set_margin_bottom(4.0f);
@@ -423,10 +434,14 @@ namespace {
             }
 
             description = context.create_element<Element>(left, 0, "p", true);
+            description->set_position(Position::Absolute);
+            description->set_left(16.0f);
+            description->set_right(16.0f);
+            description->set_bottom(16.0f);
+            description->set_height(description_height);
             description->set_typography(theme::Typography::Body);
             description->set_line_height(28.0f);
             description->set_padding_top(8.0f);
-            description->set_min_height(64.0f);
             description->set_color(theme::color::TextDim);
 
             queue_update();
@@ -614,7 +629,9 @@ void rush2::cheats::create_tab() {
     config.add_bool_option(
         unlock_parts_id,
         "Unlock All Parts",
-        "Offers every <recomp-color primary>ENGINE</recomp-color> level on the Rush 2049 cars without buying them. "
+        "Offers every <recomp-color primary>ENGINE</recomp-color> level on the Rush 2049 cars and the "
+        "<recomp-color primary>SLICKS</recomp-color> and <recomp-color primary>PRO SLICKS</recomp-color> tires "
+        "without buying them. "
         "Nothing is saved, so turning this off locks them again.",
         false
     );
@@ -766,7 +783,7 @@ extern "C" void rush2_cheats_frame(uint8_t* rdram, recomp_context* ctx) {
     rush2::calspeed::check_cars(rdram);
     rush2::car_mods::check(rdram);
     rush2::car2049::prepare_bars(rdram, ctx);
-    rush2::track_mod::prepare_in_background();
+    rush2::prewarm::frame(rdram);
 }
 
 bool rush2::cheats::unlock_all_cars() {

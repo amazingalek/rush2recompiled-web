@@ -18,6 +18,10 @@
 // - Visibility (0x800C0680, 16 bytes per region, the tracks' tables back to back, counts at 0x800C4C80), fog colour
 //   (0x80094CB4), cloud scroll (0x80094C2C) and sky parallax (0x80094C6C) from California Speed's per-track tables,
 //   which have Rush 2's layout.
+// - Extended scenery (option): src/calspeed/calspeed_scenery.cpp adds to the track's container, placement and
+//   collision before the merge.
+// - Billboard trees (option): src/calspeed/calspeed_billboards.cpp then turns the single tree cards of the track's
+//   sections to face the camera.
 
 #include <algorithm>
 #include <array>
@@ -31,6 +35,8 @@
 #include <vector>
 
 #include "calspeed.h"
+#include "calspeed_billboards.h"
+#include "calspeed_scenery.h"
 #include "texture_upscale.h"
 #include "track2049.h"
 #include "track2049_convert.h"
@@ -695,7 +701,7 @@ namespace {
     }
 
     bool convert(const Bytes& rom, int t, const std::string& prefix, const std::set<std::string>& shared_models,
-                 rush2::calspeed::Converted& out) {
+                 bool scenery, bool billboards, rush2::calspeed::Converted& out) {
         rush2::track2049::ConvertedTrack& track = out.track;
         out.record_models.clear();
         out.piece_models.clear();
@@ -704,9 +710,31 @@ namespace {
         std::set<std::string> used;
         track.placement = convert_placement(asset(rom, placement_asset + t), prefix, out.record_models, renamed, kinds, used);
 
+        track.collision = asset(rom, collision_asset + t);
+        remap_surfaces(track.collision);
+        track.path = asset(rom, path_asset + t);
+        if (rush2::calspeed::point_to_point(t)) move_start(track.path, track.collision);
+        split_lane_steps(track.path);
+        track.path_backward = track.path;
+
         // The track's container and the shared object containers its records draw from.
         std::vector<Bytes> files;
         files.push_back(asset(rom, geometry_asset + t));
+        // The extended scenery's models go into the track's own container (they draw with its texture-load lists),
+        // its records into the placement and its polygons into the collision.
+        if (scenery) {
+            rush2::calspeed::SceneryResult added;
+            bool ok = rush2::calspeed::add_scenery(t, files[0], track.placement, track.collision, track.path, added);
+            printf("[CalSpeed] Track %d scenery: %s%s", t, ok ? "" : "not added: ", added.report.c_str());
+            fflush(stdout);
+        }
+        // After the scenery, which reads the sections' lists as California Speed built them.
+        if (billboards) {
+            rush2::calspeed::BillboardResult turned;
+            rush2::calspeed::add_billboards(t, files[0], track.placement, turned);
+            printf("[CalSpeed] Track %d billboard trees: %s", t, turned.report.c_str());
+            fflush(stdout);
+        }
         for (int a = first_object_asset; a <= last_object_asset; a++) {
             Bytes objects = asset(rom, a);
             std::set<std::string> names = rush2::track2049::model_names(objects);
@@ -744,13 +772,6 @@ namespace {
         piece("CONE1O1", "CON17HIT1I1");
         piece("CURVEHITO1", names.contains("LAMPHIT1I1") ? "LAMPHIT1I1" : "LIGHTHIT1I1");
 
-        track.collision = asset(rom, collision_asset + t);
-        remap_surfaces(track.collision);
-        track.path = asset(rom, path_asset + t);
-        if (rush2::calspeed::point_to_point(t)) move_start(track.path, track.collision);
-        split_lane_steps(track.path);
-        track.path_backward = track.path;
-
         int regions = 0;
         for (int k = 0; k < t; k++) regions += main_byte(rom, pvs_counts + k);
         int count = std::min<int>(main_byte(rom, pvs_counts + t), max_regions);
@@ -775,9 +796,12 @@ namespace {
         return true;
     }
 
-    std::string extras_name(int t, const std::string& prefix) {
-        return "calspeed_track" + std::to_string(t) + "_" + prefix;
+    std::string extras_name(int t, const std::string& prefix, bool scenery, bool billboards) {
+        return "calspeed_track" + std::to_string(t) + "_" + prefix + (scenery ? "_scenery" : "") + (billboards ? "_bb" : "");
     }
+    // track_cache keys: the track with its extended scenery (and billboard trees) is kept apart from it without.
+    constexpr int scenery_k = 100;
+    constexpr int billboards_k = 200;
 
     std::mutex art_mutex;
     const Bytes* art_rom = nullptr;
@@ -829,15 +853,19 @@ std::string rush2::calspeed::menu_logo_name(int t) {
 }
 
 bool rush2::calspeed::load_track(const std::vector<uint8_t>& rom, int t, const std::string& prefix,
-                                 const std::set<std::string>& shared_models, Converted& out, std::string& error) {
+                                 const std::set<std::string>& shared_models, bool scenery, bool billboards, Converted& out,
+                                 std::string& error) {
     if (t < 0 || t >= track_count) {
         error = "no such California Speed track";
         return false;
     }
     uint64_t source = rom_source(rom);
     Bytes extras;
-    if (rush2::track_cache::load_2049(calspeed_k + t, prefix, source, out.track) &&
-        rush2::track_cache::load_blob(extras_name(t, prefix), source, extras)) {
+    int k = calspeed_k + t + (scenery ? scenery_k : 0) + (billboards ? billboards_k : 0);
+    // The background builds (src/prewarm.cpp) convert these too: whichever comes second waits here, then reads the disk.
+    auto claim = rush2::track_cache::claim(rush2::track_cache::entry_2049(k));
+    if (rush2::track_cache::load_2049(k, prefix, source, out.track) &&
+        rush2::track_cache::load_blob(extras_name(t, prefix, scenery, billboards), source, extras)) {
         Reader r{ extras };
         out.cloud_scroll = r.word();
         out.sky_parallax = r.word();
@@ -846,20 +874,43 @@ bool rush2::calspeed::load_track(const std::vector<uint8_t>& rom, int t, const s
         if (r.ok) return true;
     }
     try {
-        convert(rom, t, prefix, shared_models, out);
+        convert(rom, t, prefix, shared_models, scenery, billboards, out);
     }
     catch (const ConvertError& e) {
         error = e.message;
         return false;
     }
-    rush2::track_cache::save_2049(calspeed_k + t, prefix, source, out.track);
+    rush2::track_cache::save_2049(k, prefix, source, out.track);
     Writer w;
     w.word(out.cloud_scroll);
     w.word(out.sky_parallax);
     w.map(out.record_models);
     w.map(out.piece_models);
-    rush2::track_cache::save_blob(extras_name(t, prefix), source, w.b);
+    rush2::track_cache::save_blob(extras_name(t, prefix, scenery, billboards), source, w.b);
     return true;
+}
+
+void rush2::calspeed::prepare_track(const std::vector<uint8_t>& rom, int t, const std::string& prefix,
+                                    const std::set<std::string>& shared_models) {
+    bool scenery = scenery_enabled(), billboards = billboards_enabled();
+    uint64_t source = rom_source(rom);
+    int k = calspeed_k + t + (scenery ? scenery_k : 0) + (billboards ? billboards_k : 0);
+    if (rush2::track_cache::has_2049(k, prefix, source) &&
+        rush2::track_cache::has_blob(extras_name(t, prefix, scenery, billboards), source)) {
+        return;
+    }
+    Converted out;
+    std::string error;
+    if (!load_track(rom, t, prefix, shared_models, scenery, billboards, out, error)) {
+        printf("[CalSpeed] Couldn't convert track %d: %s\n", t, error.c_str());
+    }
+}
+
+void rush2::calspeed::preload_track(int t) {
+    bool scenery = scenery_enabled(), billboards = billboards_enabled();
+    rush2::track_cache::preload_2049(calspeed_k + t + (scenery ? scenery_k : 0) + (billboards ? billboards_k : 0));
+    // Raced in the host slot, HAWAII (src/rush2049/track2049.cpp prefix_of).
+    rush2::track_cache::preload_blob(extras_name(t, "HAWAII", scenery, billboards));
 }
 
 bool rush2::calspeed::menu_art(const std::vector<uint8_t>& rom, std::vector<rush2::track2049::MenuModel>& models,
@@ -990,7 +1041,8 @@ float rush2::calspeed::record_seed(int t) {
     if (seeds[size_t(t)] >= 0.0f) return seeds[size_t(t)];
     // Lane 0 of the path (docs/rush2049_research/race.md: route header 0x32C, branches, points, then 4 lanes of
     // {u16 count, u8, u8, u32} + count x {s16 x, y, z, u8 mph, u8}), driven at its speeds; a circuit's lap closes the
-    // loop. The speeds are displayed mph, true mph x 1.2 (as Rush 2049's: track2049.cpp rush2_race_lane_speeds).
+    // loop, at its speeds / 1.2, the speeds the race timer is worked out from (track2049.cpp rush2_race_lane_speeds;
+    // the drones drive them as true mph, capped: docs/calspeed_research.md#5-paths).
     float seconds = 0.0f;
     try {
         Bytes p = asset(*rom, path_asset + t);
@@ -1017,4 +1069,83 @@ float rush2::calspeed::record_seed(int t) {
     }
     seeds[size_t(t)] = seconds;
     return seconds;
+}
+
+// California Speed's lanes are set for its own cars, whose tires grip about 3 times as hard as Rush 2's (tire curve
+// grip 7.8 against 2.6-3.2, tools/rush2049/cars.py calspeed) and which its road hold keeps on the road over crests,
+// and Rush 2's drone driver (func_80074990) only aims for the lane's speed: it never slows for a curve the lane doesn't
+// slow for. So a lane point's speed is capped at what the lane's curve there allows at `corner_g` (the circle through
+// the points `reach` ft before and after it, seen from above) and its crest or dip at `vertical_g` (the change of
+// grade over `reach` ft either side), and then, walking back from every point, at what braking at `brake_ft_s2` from
+// the point before reaches. Points 1000 ft or more apart (a lane jumping back at its end) don't join. The values are
+// the sim's (tools/calspeed/sim_wrecks.py, lane_hold.py; docs/calspeed_research.md#5-paths): Rush 2's drones pull
+// up to about 2.5 g; at 3 g they ran wide and wrecked twice as often, and without the crest cap they flew off crests
+// California Speed's lanes take at 190-200 mph and landed in wrecks. Those are the defaults (Rush 2's physics); CS
+// Physics Partial passes its own (track2049.cpp).
+std::vector<uint8_t> rush2::calspeed::capped_lane_speeds(const std::vector<std::array<float, 3>>& pos,
+                                                         const std::vector<uint8_t>& mph, bool loop, double corner_g,
+                                                         double vertical_g) {
+    constexpr double brake_ft_s2 = 40.0, reach = 60.0, gap = 1000.0, g = 32.17, mph_ft_s = 5280.0 / 3600.0;
+    const int n = int(pos.size());
+    std::vector<uint8_t> out = mph;
+    if (n < 3 || int(mph.size()) != n) return out;
+    auto step = [&](int i, int j) { return std::hypot(double(pos[j][0] - pos[i][0]), double(pos[j][2] - pos[i][2])); };
+    auto next = [&](int i, int dir) {
+        int k = i + dir;
+        if (loop) k = (k + n) % n;
+        return k >= 0 && k < n ? k : -1;
+    };
+    // The point `reach` ft from i along the lane in `dir`, or -1 past an end or a gap.
+    auto point_at = [&](int i, int dir) {
+        double d = 0.0;
+        int j = i;
+        while (d < reach) {
+            int k = next(j, dir);
+            if (k < 0 || k == i) return -1;
+            double s = step(j, k);
+            if (s >= gap) return -1;
+            d += s;
+            j = k;
+        }
+        return j;
+    };
+    std::vector<double> v(mph.size());
+    for (int i = 0; i < n; i++) {
+        v[size_t(i)] = mph[size_t(i)] * mph_ft_s;
+        int a = point_at(i, -1), c = point_at(i, 1);
+        if (mph[size_t(i)] == 0 || a < 0 || c < 0) continue;
+        double ab = step(a, i), bc = step(i, c), ca = step(c, a);
+        double area2 = std::fabs(double(pos[i][0] - pos[a][0]) * (pos[c][2] - pos[a][2]) -
+                                 double(pos[i][2] - pos[a][2]) * (pos[c][0] - pos[a][0]));
+        if (area2 < 1e-6) continue;
+        double radius = ab * bc * ca / (2.0 * area2);
+        v[size_t(i)] = std::min(v[size_t(i)], std::sqrt(corner_g * g * radius));
+    }
+    for (int i = 0; vertical_g > 0.0 && i < n; i++) {
+        int a = point_at(i, -1), c = point_at(i, 1);
+        if (mph[size_t(i)] == 0 || a < 0 || c < 0) continue;
+        double before = 0.0, after = 0.0;
+        for (int j = a; j != i; j = next(j, 1)) before += step(j, next(j, 1));
+        for (int j = i; j != c; j = next(j, 1)) after += step(j, next(j, 1));
+        if (before <= 0.0 || after <= 0.0) continue;
+        double up = (pos[i][1] - pos[a][1]) / before, down = (pos[c][1] - pos[i][1]) / after;
+        double k = std::fabs(up - down) / (0.5 * (before + after));
+        if (k > 1e-6) v[size_t(i)] = std::min(v[size_t(i)], std::sqrt(vertical_g * g / k));
+    }
+    // Twice round, so a circuit's braking carries over its start.
+    for (int pass = 0; pass < (loop ? 2 : 1); pass++) {
+        for (int i = n - 1; i >= 0; i--) {
+            int j = next(i, 1);
+            if (j < 0 || v[size_t(i)] <= 0.0 || v[size_t(j)] <= 0.0) continue;
+            double d = step(i, j);
+            if (d >= gap) continue;
+            v[size_t(i)] = std::min(v[size_t(i)], std::sqrt(v[size_t(j)] * v[size_t(j)] + 2.0 * brake_ft_s2 * d));
+        }
+    }
+    for (int i = 0; i < n; i++) {
+        if (mph[size_t(i)] > 0) {
+            out[size_t(i)] = uint8_t(std::clamp((int)std::lround(v[size_t(i)] / mph_ft_s), 1, (int)mph[size_t(i)]));
+        }
+    }
+    return out;
 }

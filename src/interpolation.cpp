@@ -23,15 +23,18 @@
 
 #include "recomp.h"
 #include "rush2.h"
+#include "calspeed_billboards.h"
 
 #define F3DEX_GBI_2
 #include "rt64_extended_gbi.h"
+#include "scene_nodes.h"
 
 namespace {
     // Game addresses.
-    constexpr uint32_t node_pool = 0x800D9E90;  // Scene graph nodes, 0x38 bytes each.
+    constexpr uint32_t node_pool = rush2::scene_nodes::table;  // Scene graph nodes, 0x38 bytes each.
     constexpr uint32_t node_size = 0x38;
-    constexpr uint32_t max_nodes = 1024;
+    constexpr uint32_t max_nodes = rush2::scene_nodes::capacity; // node_id holds 12 bits of index
+    static_assert(max_nodes <= 0x1000);
     constexpr uint32_t camera_array = 0x800E79D0; // Per-view cameras, 0x40 bytes each.
     constexpr uint32_t poly_array = 0x800FAF00;   // World-space polygons, 0x58 bytes each.
     constexpr uint32_t poly_size = 0x58;
@@ -64,13 +67,13 @@ namespace {
     constexpr float camera_cut_cos = 0.5f; // 60 degrees
 
     // ID layout (never 0 = G_EX_ID_IGNORE or 0xFFFFFFFF = G_EX_ID_AUTO):
-    //   nodes:      1vvg gggg gggg gggg gggg ggnn nnnn nnnn  (bit 28 is always 0)
+    //   nodes:      1vv0 gggg gggg gggg gggg nnnn nnnn nnnn  (12 bits of node: the table holds 2,340, scene_nodes.h)
     //   polygons:   0001 vvgg gggg gggg gggg pppp pppp pppp
     //   projection: 0010 0000 0000 00vv gggg gggg gggg gggg
     //   view space: 0010 0001 0000 00vv 0000 0000 0000 0000  (the projection of camera-attached nodes)
     //   root view:  0011 0000 0000 00vv gggg gggg gggg gggg
     uint32_t node_id(uint32_t view, uint32_t gen, uint32_t node) {
-        return 0x80000000u | ((view & 3) << 29) | ((gen & 0x3FFFF) << 10) | (node & 0x3FF);
+        return 0x80000000u | ((view & 3) << 29) | ((gen & 0xFFFF) << 12) | (node & 0xFFF);
     }
 
     uint32_t poly_id(uint32_t view, uint32_t gen, uint32_t slot) {
@@ -404,6 +407,8 @@ extern "C" {
 // func_8007C624 entry. $a0 = view index. Detects camera cuts.
 void rush2_interp_view_begin(uint8_t* rdram, recomp_context* ctx) {
     cur_view = (uint32_t)ctx->r4 % max_views;
+    // LOOK BACK turns the camera now, so the cut detection below sees the drawn camera.
+    rush2::look_back_draw_view(rdram, (int)cur_view);
     depth = -1;
 
     uint32_t cam = camera_array + cur_view * 0x40;
@@ -453,11 +458,28 @@ void rush2_interp_projection(uint8_t* rdram, recomp_context* ctx) {
 }
 
 // func_8007C624, after the root modelview G_MTX (load) is written at $v0.
+// Also points RSP segment 0x0D at this view's camera-facing turn for the California Speed billboard trees
+// (src/calspeed/calspeed_billboards.cpp): view_billboard_basis_8007BF2C's yaw-only rotation (0x800E7C78, f32 4x4,
+// set for this view earlier in func_8007C624) as an Mtx in the side buffer, one per view and frame, built from it as
+// the game builds its own camera-facing nodes' matrices.
 void rush2_interp_root_modelview(uint8_t* rdram, recomp_context* ctx) {
     uint32_t cmd_addr = (uint32_t)ctx->r2;
-    GfxCommand cmds[3];
+    GfxCommand cmds[4];
     object_group(&cmds[0], view_id(0x30000000u, cur_view, views[cur_view].gen), G_EX_NOPUSH, G_EX_COMPONENT_SKIP);
     cmds[2] = read_command(rdram, cmd_addr);
+    constexpr uint32_t billboard_basis = 0x800E7C78;
+    uint32_t turn = side_alloc(64);
+    for (int i = 0; i < 16; i++) {
+        int row = i / 4, col = i % 4;
+        // By columns, as gfx_build_node_matrix_cols_8007B290 builds a flag 0x8000 node's matrix from it: Mtx row r is
+        // the basis's column r (rows taken as they are turn the card the other way about y).
+        float f = row < 3 && col < 3 ? read_f32(rdram, billboard_basis + (col * 4 + row) * 4) : (row == 3 && col == 3 ? 1.0f : 0.0f);
+        int32_t fixed = (int32_t)std::lround(f * 65536.0f);
+        MEM_H(i * 2, (int32_t)turn) = (int16_t)(fixed >> 16);
+        MEM_H(32 + i * 2, (int32_t)turn) = (int16_t)(fixed & 0xFFFF);
+    }
+    cmds[3].values.word0 = 0xDB060000u | (rush2::calspeed::billboard_segment * 4);  // G_MOVEWORD G_MW_SEGMENT
+    cmds[3].values.word1 = turn;
     views[cur_view].root_mtx = cmds[2].values.word1;
     // The view's rotation is the matrix the game multiplied into the projection a few commands back.
     for (uint32_t back = 1; back <= 8; back++) {
@@ -467,7 +489,7 @@ void rush2_interp_root_modelview(uint8_t* rdram, recomp_context* ctx) {
             break;
         }
     }
-    replace_with_call(rdram, cmd_addr, write_side_dl(rdram, cmds, 3));
+    replace_with_call(rdram, cmd_addr, write_side_dl(rdram, cmds, 4));
 }
 
 // func_8007C624, after the G_RDPPIPESYNC that starts each world-space polygon is written at $v0. $fp = polygon.

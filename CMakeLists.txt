@@ -58,14 +58,17 @@ endif()
 
 # Changes to the submodules in lib/ are kept as lib/patches/<submodule>.patch, so they commit with this project and the
 # submodules stay on their upstream commits. Each patch is applied to its submodule's working tree here. After editing
-# a submodule, write its patch again with `python tools/lib_patch.py save` before committing.
+# a submodule, write its patch again with `python tools/lib_patch.py save` before committing. Patches apply in name order,
+# so a nested submodule's (RecompFrontend--...) comes after its parent's.
 find_package(Git REQUIRED)
 if (NOT EMSCRIPTEN)
     file(GLOB LIB_PATCHES "${CMAKE_SOURCE_DIR}/lib/patches/*.patch")
 endif()
 foreach(LIB_PATCH ${LIB_PATCHES})
     get_filename_component(LIB_NAME ${LIB_PATCH} NAME_WE)
-    set(LIB_DIR "${CMAKE_SOURCE_DIR}/lib/${LIB_NAME}")
+    # A nested submodule's patch names its path with "--" for "/" (RecompFrontend--recompui--lib--RmlUi).
+    string(REPLACE "--" "/" LIB_SUBDIR ${LIB_NAME})
+    set(LIB_DIR "${CMAKE_SOURCE_DIR}/lib/${LIB_SUBDIR}")
     set(LIB_APPLIED "${CMAKE_BINARY_DIR}/lib_patches/${LIB_NAME}.patch") # The patch as it was last applied.
     set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${LIB_PATCH})
 
@@ -211,6 +214,15 @@ target_sources(Rush2Recompiled PRIVATE
     ${CMAKE_SOURCE_DIR}/src/track_mod/track_mod.cpp
     ${CMAKE_SOURCE_DIR}/src/track_mod/track_mod_convert.cpp
     ${CMAKE_SOURCE_DIR}/src/track_mod/track_mod_menu.cpp
+    ${CMAKE_SOURCE_DIR}/src/arcade2049/arcade_data.cpp
+    ${CMAKE_SOURCE_DIR}/src/arcade2049/arcade_glb.cpp
+    ${CMAKE_SOURCE_DIR}/src/arcade2049/arcade_track.cpp
+    ${CMAKE_SOURCE_DIR}/src/arcade2049/arcade_cars.cpp
+    ${CMAKE_SOURCE_DIR}/src/arcade2049/arcade_install.cpp
+    ${CMAKE_SOURCE_DIR}/src/arcade2049/arcade_checkpoints.cpp
+    ${CMAKE_SOURCE_DIR}/lib/Clipper2/CPP/Clipper2Lib/src/clipper.engine.cpp
+    ${CMAKE_SOURCE_DIR}/lib/Clipper2/CPP/Clipper2Lib/src/clipper.offset.cpp
+    ${CMAKE_SOURCE_DIR}/lib/Clipper2/CPP/Clipper2Lib/src/clipper.rectclip.cpp
     ${CMAKE_SOURCE_DIR}/src/asset_catalog.cpp
     ${CMAKE_SOURCE_DIR}/src/asset_catalog_walk.cpp
     ${CMAKE_SOURCE_DIR}/lib/hqx/hq2x.c
@@ -234,6 +246,7 @@ target_sources(Rush2Recompiled PRIVATE
     ${CMAKE_SOURCE_DIR}/src/npc_cars.cpp
     ${CMAKE_SOURCE_DIR}/src/paint_colors.cpp
     ${CMAKE_SOURCE_DIR}/src/game_fixes.cpp
+    ${CMAKE_SOURCE_DIR}/src/camera.cpp
     ${CMAKE_SOURCE_DIR}/src/games_tab.cpp
     ${CMAKE_SOURCE_DIR}/src/online_tab.cpp
     ${CMAKE_SOURCE_DIR}/src/online/online_game.cpp
@@ -272,11 +285,17 @@ target_sources(Rush2Recompiled PRIVATE
     ${CMAKE_SOURCE_DIR}/src/calspeed/calspeed_rom.cpp
     ${CMAKE_SOURCE_DIR}/src/calspeed/calspeed_convert.cpp
     ${CMAKE_SOURCE_DIR}/src/calspeed/calspeed_cars.cpp
+    ${CMAKE_SOURCE_DIR}/src/calspeed/calspeed_physics.cpp
+    ${CMAKE_SOURCE_DIR}/src/calspeed/calspeed_walls.cpp
     ${CMAKE_SOURCE_DIR}/src/calspeed/calspeed_logos.cpp
+    ${CMAKE_SOURCE_DIR}/src/calspeed/calspeed_scenery.cpp
+    ${CMAKE_SOURCE_DIR}/src/calspeed/calspeed_billboards.cpp
     ${CMAKE_SOURCE_DIR}/src/smooth_collision.cpp
     ${CMAKE_SOURCE_DIR}/src/surface_fx.cpp
     ${CMAKE_SOURCE_DIR}/src/rush2049/track2049.cpp
     ${CMAKE_SOURCE_DIR}/src/track_cache.cpp
+    ${CMAKE_SOURCE_DIR}/src/prewarm.cpp
+    ${CMAKE_SOURCE_DIR}/src/texture_prewarm.cpp
     ${CMAKE_SOURCE_DIR}/src/texture_origin.cpp
     ${CMAKE_SOURCE_DIR}/src/rush2049/track2049_art.cpp
     ${CMAKE_SOURCE_DIR}/src/rush2049/track2049_convert.cpp
@@ -324,6 +343,8 @@ target_include_directories(Rush2Recompiled PRIVATE
     ${CMAKE_SOURCE_DIR}/include
     ${CMAKE_SOURCE_DIR}/lib/N64ModernRuntime/N64Recomp/lib/tomlplusplus
     ${CMAKE_SOURCE_DIR}/lib/hqx
+    ${CMAKE_SOURCE_DIR}/lib/Clipper2/CPP/Clipper2Lib/include
+    ${CMAKE_SOURCE_DIR}/lib/earcut/include
     ${CMAKE_SOURCE_DIR}/lib/N64ModernRuntime/N64Recomp/include
     ${CMAKE_SOURCE_DIR}/lib/N64ModernRuntime/thirdparty/sse2neon
     ${CMAKE_SOURCE_DIR}/lib/rt64/include

@@ -72,6 +72,11 @@ namespace rush2::track2049 {
     // The track select's 38-entry diorama tables and asset 3 with the added tracks' dioramas (src/rush2049/track2049_menu.cpp),
     // for screens other than the track select that show them (the unlock system's shop): call before loading asset 3.
     void prepare_menu_art(uint8_t* rdram);
+    // Builds the track select's art container (asset 3 with the added tracks' dioramas and logos) ahead of its next
+    // visit, off the game thread (the background builds, src/prewarm.cpp); that visit then only installs it.
+    void prepare_menu_container();
+    // A mod's tracks changed under the same mod id (src/arcade2049 reinstalled one): the track select reads them again.
+    void mods_changed();
     // Asset 3 as the track select gets it (with the added tracks' art), built here when the game hasn't yet: for the
     // catalog (rush2::catalog), which dumps every texture the game can draw whichever menus have been opened. Any
     // thread. False when no other game's tracks are offered (asset 3 is Rush 2's own).
@@ -95,6 +100,9 @@ namespace rush2::track2049 {
     int host_menu_track(uint8_t* rdram, int t);
     // Track select entry t's in-race logo container (asset 4 + the slot host_menu_track gives it), as the race shows it.
     bool menu_track_logo(uint8_t* rdram, int t, std::vector<uint8_t>& out);
+    // Custom track `index`'s logo ([menu] logo) in the logo container of the slot it races in (asset `container`,
+    // 4 + HAWAII's or STUNT1's), so its race never shows the host's. False if it has none.
+    bool mod_race_logo(uint8_t* rdram, int index, int container, std::vector<uint8_t>& out);
     // Writes that logo's texels and palette over the loaded logo asset `asset` (4-16), which the game's widgets then
     // draw (the circuit review's card, the records screen). False if the asset isn't loaded or t has no logo.
     bool write_menu_logo(uint8_t* rdram, recomp_context* ctx, int asset, int t);
@@ -109,6 +117,14 @@ namespace rush2::track2049 {
     bool coin_icon(const rush2::rom2049::Source& rom2049, bool gold, std::vector<uint8_t>& texels,
                    std::vector<uint8_t>& palette);
 
+    // Converts every Rush 2049 track and arena of the source in use, and every California Speed track (as its scenery
+    // options are set), into the disk cache (those not there yet), when their options are on. Any thread
+    // (src/prewarm.cpp, at launch).
+    void prepare();
+    // Reads the cache entry of the 2049 or California Speed track that track select id t races into memory now, for
+    // the race about to load it (src/prewarm.cpp, from the car select). Any thread.
+    void preload(int t);
+
     // The 2049 track (1-6, or obstacle) raced in the host slot, or 0 (src/rush2049/track2049.cpp).
     int race_track();
     void set_race_track(int k);
@@ -121,6 +137,17 @@ namespace rush2::track2049 {
     void set_battle_arena(int n);
     // The Rush 2 slot the raced 2049 track or stunt arena is loaded in (host_slot or stunt_host_slot), or -1.
     int loaded_slot();
+    // Whether the race is on a custom track whose track.toml asks for California Speed's road hold
+    // ([track] road_hold = true; src/calspeed/calspeed_rom.cpp rush2_calspeed_road_hold).
+    bool mod_road_hold(uint8_t* rdram);
+    // Whether the race is on a custom track with no [audio] music, which plays a random one of the songs the player
+    // switched on (src/music.cpp).
+    bool mod_random_song(uint8_t* rdram);
+    // Whether the race is on a custom track that races with smooth collision (its track.toml smooth_collision), and its
+    // fold angle (degrees).
+    bool mod_smooth_collision(uint8_t* rdram, float* fold = nullptr);
+    // Whether the race is on a point-to-point custom track ([track] point_to_point = true).
+    bool mod_point_to_point(uint8_t* rdram);
     // Whether the race is on the obstacle course.
     bool obstacle_race(uint8_t* rdram);
     // Whether the race is in a battle arena (also true at race setup, before the menu id becomes the host slot's).
@@ -261,6 +288,15 @@ namespace rush2::track2049 {
     // Online lobbies (src/online/online_lobby.cpp): while on, the track select offers every track this machine has,
     // whatever its profile unlocked, so the host's choice is on it.
     void set_all_tracks_open(bool on);
+    // The tracks the track select offers now (its carousel, in display order): the host's, sent to the lobby.
+    std::vector<int> offered_tracks(uint8_t* rdram);
+    // With every track open, a joiner's track select offers only `tracks`, the host's offered_tracks (empty: all), so
+    // the host's unlocks and game filter apply and both carousels step through the same entries. A change while the
+    // track select is up rebuilds it.
+    void set_online_offered(uint8_t* rdram, const std::vector<int>& tracks);
+    // What the Start Game menu last chose (None before any choice). Leaving the menu pushes its row onto the front
+    // end's row stack and zeroes the row (0x80023064), so past Start Game the row no longer tells.
+    StartKind chosen_start_kind();
     // The track select's carousel entry showing track `t`, or -1 (the carousel is built as the screen opens).
     int carousel_index(uint8_t* rdram, int t);
     // Online play's name for track select id `t`: a custom track's rush2::track_mod::identity, which machines with

@@ -52,6 +52,7 @@
 
 #define F3DEX_GBI_2
 #include "rt64_extended_gbi.h"
+#include "scene_nodes.h"
 
 using namespace rush2::car2049;
 
@@ -225,11 +226,14 @@ namespace {
         float extent[3] = { 1.0f, 1.0f, 1.0f }; // half width, height, half length
         // Damage textures: the body's texture loads, each serving one panel (0 FR, 1 FL, 2 RR, 3 RL, 4 top), whose
         // G_SETTIMG reads the pristine texels or their scuffed copy by that panel's damage.
+        // A California Speed car's tail light textures also have lit copies of both (0: none), drawn while its brake
+        // lights are on (rush2_calspeed_brake_lights).
         struct DamageLoad {
             uint32_t at;        // file offset of the G_SETTIMG
             uint32_t pristine;  // file offsets of the texels
             uint32_t damaged;
             int panel;
+            uint32_t lit = 0, lit_damaged = 0;
         };
         std::vector<DamageLoad> damage_loads;
         // Rocket ZX exhaust flames (ROKTFLAMEG1-3): their vertices as modelled (at the origin, pointing back), and the
@@ -875,6 +879,20 @@ namespace {
         return out;
     }
 
+    // California Speed's tail lights: CARPALETTE's red ramp 128-143 (docs/calspeed_research.md#brake-lights-turn-
+    // california-speed-grays-red) on the car's body textures (texture record flags 0x20000000; the driver figures and
+    // other art drawn in those reds lack it). Lit, they are entry 187, 0xF801: the red Rush 2 lights its brake lights
+    // with (func_800599A0).
+    constexpr int tail_first = 128, tail_last = 143, tail_lit = 187;
+    bool calspeed_body_texture(const std::vector<uint8_t>& car, uint32_t texels) {
+        uint32_t table = be32(car, 8), count = be32(car, 20);
+        for (uint32_t i = 0; i < count && table + i * 0x20 + 0x20 <= car.size(); i++) {
+            uint32_t r = table + i * 0x20;
+            if (be32(car, r + 0x18) == texels) return (be32(car, r + 0x1C) & 0x20000000) != 0;
+        }
+        return false;
+    }
+
     // Gives the body (FRAME1, both LODs) damage textures. Its lists call a texture-load list (in the file's [7]..[8]
     // range) before each run of triangles; they are rewritten (appended to the file) with every load of a painted
     // texture inlined before the triangles of each panel it textures, so each load can be pointed at the pristine
@@ -898,10 +916,31 @@ namespace {
         struct Load {
             std::vector<uint8_t> commands;
             int settimg = -1;      // offset in `commands`
-            uint32_t texels = 0, damaged = 0;
+            uint32_t texels = 0, damaged = 0, lit = 0, lit_damaged = 0;
         };
         std::map<uint32_t, Load> loads;
         std::map<uint32_t, uint32_t> scuffed; // pristine texels -> copy
+        std::map<uint32_t, uint32_t> lit_copies; // texels -> their tail lights lit (0: no tail lights)
+        auto light = [&](uint32_t from, uint32_t size) -> uint32_t {
+            auto it = lit_copies.find(from);
+            if (it != lit_copies.end()) return it->second;
+            std::vector<uint8_t> copy(car.begin() + from, car.begin() + from + size);
+            bool any = false;
+            for (uint8_t& v : copy) {
+                if (v >= tail_first && v <= tail_last) {
+                    v = tail_lit;
+                    any = true;
+                }
+            }
+            uint32_t at = 0;
+            if (any) {
+                align();
+                at = uint32_t(car.size());
+                car.insert(car.end(), copy.begin(), copy.end());
+            }
+            lit_copies.emplace(from, at);
+            return at;
+        };
         auto load_at = [&](uint32_t list) -> const Load& {
             auto it = loads.find(list);
             if (it != loads.end()) return it->second;
@@ -974,6 +1013,15 @@ namespace {
                         car.insert(car.end(), copy.begin(), copy.end());
                     }
                     l.damaged = s->second;
+                }
+            }
+            if (p.calspeed && l.settimg >= 0 && ci8 && size > 0 && l.texels + size <= car.size() &&
+                calspeed_body_texture(car, l.texels)) {
+                l.lit = light(l.texels, size);
+                if (l.lit != 0) {
+                    // A load is switched only when it has a damaged copy: one without scuffs damages as itself.
+                    l.lit_damaged = l.damaged != 0 ? light(l.damaged, size) : l.lit;
+                    if (l.damaged == 0) l.damaged = l.texels;
                 }
             }
             return loads.emplace(list, std::move(l)).first->second;
@@ -1061,16 +1109,18 @@ namespace {
             put32(car, record + 4 + lod * 12 + 8, base);
             for (size_t i = 0; i < sites.size(); i++) {
                 const Load* l = site_loads[i].second;
-                p.damage_loads.push_back({ base + sites[i].first, l->texels, l->damaged, sites[i].second });
+                p.damage_loads.push_back({ base + sites[i].first, l->texels, l->damaged, sites[i].second, l->lit,
+                                           l->lit_damaged });
             }
         }
     }
 
     // Points each panel's body texture loads at the pristine or scuffed texels (asset copy at `base`), as the
-    // relocator would: 24-bit, rebased.
-    void set_damage_textures(uint8_t* rdram, uint32_t base, const Paint& p, const float level[5]) {
+    // relocator would: 24-bit, rebased. lit: the brake lights' copies where a load has them.
+    void set_damage_textures(uint8_t* rdram, uint32_t base, const Paint& p, const float level[5], bool lit = false) {
         for (const Paint::DamageLoad& d : p.damage_loads) {
-            uint32_t texels = level[d.panel] > 0.0f ? d.damaged : d.pristine;
+            uint32_t texels = level[d.panel] > 0.0f ? (lit && d.lit_damaged != 0 ? d.lit_damaged : d.damaged)
+                                                    : (lit && d.lit != 0 ? d.lit : d.pristine);
             MEM_W(0, (int32_t)(base + d.at + 4)) = (int32_t)((base + texels) & 0xFFFFFF);
         }
     }
@@ -1113,6 +1163,7 @@ namespace {
     }
 
     std::map<uint32_t, uint32_t> dented;   // asset copy base -> panel damage bits last applied
+    uint8_t brake_lit[8] = {};             // race car -> its California Speed tail lights lit (game thread)
 }
 
 namespace {
@@ -1156,6 +1207,53 @@ static void load_jobs(const std::vector<uint8_t>& car, const std::vector<rush2::
         if (p.job_rgb.size() <= job) p.job_rgb.resize(job + 1);
         p.job_rgb[job] = t.job_rgb;
     }
+}
+
+// Car k's converted container (k 0-based): from the disk cache (src/track_cache.cpp) when this build converted it from
+// the same source before, else converted and stored. Any thread: the background builds (rush2::car2049::prepare)
+// make them ahead of the boot, which then waits on the entry's claim instead of converting it again.
+static bool car_container(const rush2::rom2049::Source& rom, int k, std::vector<uint8_t>& car, std::string& error) {
+    std::string cache_name = "car2049_" + std::to_string(k + 1);
+    auto claim = rush2::track_cache::claim(rush2::track_cache::blob_entry(cache_name));
+    if (rush2::track_cache::load_blob(cache_name, rom.cache_key(), car)) return true;
+    if (!rush2::track2049::convert_car(rom, k + 1, "CAR" + std::to_string(k + 1), car, error)) return false;
+    rush2::track_cache::save_blob(cache_name, rom.cache_key(), car);
+    return true;
+}
+
+// The engine and tire models the unlock system's shop shows (src/unlocks_shop.cpp): the part centers (3 floats each)
+// followed by the model container, as kept on disk with the cars. Any thread, as car_container.
+static bool parts_container(const rush2::rom2049::Source& rom, std::vector<uint8_t>& packed, std::string& error) {
+    std::vector<std::string> names, sources;
+    for (int i = 0; i < part_models + tire_models; i++) {
+        names.push_back(part_model_name(i));
+        sources.push_back(i < part_models ? "ENGINE0" + std::to_string(first_part_model + i) + "G1"
+                                          : "TIRE0" + std::to_string(i - part_models + 1) + "G1");
+    }
+    auto claim = rush2::track_cache::claim(rush2::track_cache::blob_entry("parts2049"));
+    if (rush2::track_cache::load_blob("parts2049", rom.cache_key(), packed) &&
+        packed.size() >= names.size() * sizeof(std::array<float, 3>)) {
+        return true;
+    }
+    std::vector<uint8_t> parts;
+    std::vector<std::array<float, 3>> centers;
+    if (!rush2::track2049::convert_parts(rom, sources, names, parts, centers, error)) return false;
+    packed.resize(centers.size() * sizeof(centers[0]));
+    memcpy(packed.data(), centers.data(), packed.size());
+    packed.insert(packed.end(), parts.begin(), parts.end());
+    rush2::track_cache::save_blob("parts2049", rom.cache_key(), packed);
+    return true;
+}
+
+void rush2::car2049::prepare(const rush2::rom2049::Source& rom) {
+    for (int k = 0; k < car_count; k++) {
+        std::vector<uint8_t> car;
+        std::string error;
+        if (car_container(rom, k, car, error)) rush2::track_cache::preload_blob("car2049_" + std::to_string(k + 1));
+    }
+    std::vector<uint8_t> packed;
+    std::string error;
+    if (parts_container(rom, packed, error)) rush2::track_cache::preload_blob("parts2049");
 }
 
 // The 2049 cars' and parts' assets and their per-car data (paints), from the Rush 2049 source in use. At boot, and
@@ -1205,14 +1303,7 @@ static void load_cars(uint8_t* rdram) {
     for (int k = 0; k < car_count; k++) {
         std::vector<uint8_t> car;
         std::string error;
-        // The converted cars are kept on disk (src/track_cache.cpp), so they're converted once per build and source.
-        std::string cache_name = "car2049_" + std::to_string(k + 1);
-        bool converted = rush2::track_cache::load_blob(cache_name, rom->cache_key(), car);
-        if (!converted && rush2::track2049::convert_car(*rom, k + 1, "CAR" + std::to_string(k + 1), car, error)) {
-            rush2::track_cache::save_blob(cache_name, rom->cache_key(), car);
-            converted = true;
-        }
-        if (converted) {
+        if (car_container(*rom, k, car, error)) {
             Paint& p = paints[k];
             p.texture_table = be32(car, 8);
             p.texture_count = be32(car, 20);
@@ -1240,34 +1331,13 @@ static void load_cars(uint8_t* rdram) {
         }
     }
     // The engine and tire models the unlock system's shop shows (src/unlocks_shop.cpp).
-    std::vector<uint8_t> parts;
-    std::string error;
-    std::vector<std::string> names;
-    std::vector<std::string> sources;
-    for (int i = 0; i < part_models + tire_models; i++) {
-        names.push_back(part_model_name(i));
-        sources.push_back(i < part_models ? "ENGINE0" + std::to_string(first_part_model + i) + "G1"
-                                          : "TIRE0" + std::to_string(i - part_models + 1) + "G1");
-    }
-    // Kept on disk with the cars: the part centers (3 floats each) followed by the model container.
     std::vector<uint8_t> packed;
-    bool parts_ok = false;
-    if (rush2::track_cache::load_blob("parts2049", rom->cache_key(), packed) &&
-        packed.size() >= names.size() * sizeof(std::array<float, 3>)) {
-        size_t n = names.size();
+    std::string error;
+    if (parts_container(*rom, packed, error)) {
+        size_t n = size_t(part_models + tire_models);
         part_centers.resize(n);
         memcpy(part_centers.data(), packed.data(), n * sizeof(part_centers[0]));
-        parts.assign(packed.begin() + n * sizeof(part_centers[0]), packed.end());
-        parts_ok = true;
-    }
-    else if (rush2::track2049::convert_parts(*rom, sources, names, parts, part_centers, error)) {
-        packed.resize(part_centers.size() * sizeof(part_centers[0]));
-        memcpy(packed.data(), part_centers.data(), packed.size());
-        packed.insert(packed.end(), parts.begin(), parts.end());
-        rush2::track_cache::save_blob("parts2049", rom->cache_key(), packed);
-        parts_ok = true;
-    }
-    if (parts_ok) {
+        std::vector<uint8_t> parts(packed.begin() + n * sizeof(part_centers[0]), packed.end());
         rush2::assets::replace(rdram, rush2::car2049::parts_asset, parts, origin);
     }
     else {
@@ -1478,6 +1548,231 @@ void rush2::car2049::clear_mod_car(uint8_t* rdram, int n) {
     rebuild_select_bank(rdram);
 }
 
+void rush2::car2049::copy_mod_car(uint8_t* rdram, int n, int from) {
+    if (n < 0 || n >= rush2::car_types::count_mod || from < 0 || from >= rush2::car_types::count_mod || n == from) return;
+    int from_type = rush2::car_types::first_mod + from;
+    std::string prefix;
+    ModCar spec;
+    {
+        std::lock_guard lock{ side_mutex };
+        if (!mod_slots[from].loaded) return;
+        prefix = mod_slots[from].prefix;
+        spec = mod_slots[from].spec;
+    }
+    std::vector<uint8_t> car;
+    std::vector<rush2::assets::Span> spans;
+    if (!rush2::assets::read_current(car_asset(from_type), car, spans)) return;
+    std::map<uint32_t, std::vector<uint8_t>> scuffed = bodies[from_type].given_scuffs;
+    set_mod_car(rdram, n, std::move(car), prefix, scuffed, spec);
+}
+
+void rush2::car2049::set_stand_in_mod_car(uint8_t* rdram, int n, const ModCar& spec) {
+    if (n < 0 || n >= rush2::car_types::count_mod) return;
+    int type = rush2::car_types::first_mod + n;
+    int base = std::clamp(spec.base, 0, rush2_types - 1);
+    std::vector<uint8_t> car;
+    std::vector<rush2::assets::Span> spans;
+    if (!rush2::assets::read_current(car_asset(base), car, spans)) return;
+    // The physics as the mod sets them. Its per-type rows include the part name table's entry, left on the base car's
+    // name (set_mod_car gives a mod car its own), which the copy's parts are named by.
+    build_mod_physics(rdram, n, spec);
+    std::string prefix;
+    uint32_t name = (uint32_t)MEM_W(0, (int32_t)(name_table + type * 4));
+    for (int i = 0; i < 8 && rush2::in_game_ram(name) && MEM_B(i, (int32_t)name) != 0; i++) {
+        prefix += (char)MEM_B(i, (int32_t)name);
+    }
+    std::string logo = mod_logo_name(n);
+    for (size_t i = 0; i < 16; i++) {
+        MEM_B(0, (int32_t)(logo_names + (type - first_type) * 16 + i)) = i < logo.size() ? logo[i] : 0;
+    }
+    // Drawn and painted as the base Rush 2 car (not a body car), stripes included.
+    bodies[type] = Paint{};
+    MEM_W(0, (int32_t)(prefixes + type * 4)) = MEM_W(0, (int32_t)(old_prefixes + base * 4));
+    if (car.size() > (uint32_t)MEM_W(0, (int32_t)car_slot_size)) {
+        MEM_W(0, (int32_t)car_slot_size) = (int32_t)((car.size() + 15) & ~15u);
+    }
+    dented.clear();
+    rush2::assets::replace(rdram, car_asset(type), std::move(car), spans);
+    ModCar shown = spec;
+    shown.schemes = 1;
+    shown.paint_main = shown.paint_accent = true;
+    {
+        std::lock_guard lock{ side_mutex };
+        mod_slots[n].spec = shown;
+        mod_slots[n].prefix = prefix;
+        mod_slots[n].loaded = true;
+    }
+    mod_schemes[n] = 1;
+    mod_loaded[n] = true;
+    logos_mod[n] = spec.name;
+    rebuild_select_bank(rdram);
+}
+
+namespace {
+    // Slots lent to an online race (lend_mod_slot) and what this machine had in them, put back by return_mod_slots.
+    struct LentSlot {
+        bool lent = false;
+        bool had = false;
+        std::vector<uint8_t> car;
+        std::string prefix;
+        rush2::car2049::ModCar spec;
+        std::map<uint32_t, std::vector<uint8_t>> scuffed;
+    };
+    LentSlot lent_slots[rush2::car_types::count_mod];
+}
+
+void rush2::car2049::lend_mod_slot(uint8_t* rdram, int n, int from, const ModCar& spec) {
+    if (n < 0 || n >= rush2::car_types::count_mod) return;
+    LentSlot& l = lent_slots[n];
+    if (!l.lent) {
+        l = LentSlot{};
+        l.lent = true;
+        int type = rush2::car_types::first_mod + n;
+        std::vector<rush2::assets::Span> spans;
+        std::lock_guard lock{ side_mutex };
+        l.had = mod_slots[n].loaded && rush2::assets::read_current(car_asset(type), l.car, spans);
+        l.prefix = mod_slots[n].prefix;
+        l.spec = mod_slots[n].spec;
+        l.scuffed = bodies[type].given_scuffs;
+    }
+    if (from >= 0 && from != n && lent_slots[from].lent) {
+        // `from` was lent earlier this race (two machines hold the same cars in swapped slots): its own car is the
+        // one kept.
+        const LentSlot& f = lent_slots[from];
+        if (f.had) {
+            set_mod_car(rdram, n, f.car, f.prefix, f.scuffed, f.spec);
+        }
+    }
+    else if (from >= 0) {
+        copy_mod_car(rdram, n, from);
+    }
+    else {
+        set_stand_in_mod_car(rdram, n, spec);
+    }
+}
+
+void rush2::car2049::return_mod_slots(uint8_t* rdram) {
+    for (int n = 0; n < rush2::car_types::count_mod; n++) {
+        LentSlot& l = lent_slots[n];
+        if (!l.lent) continue;
+        if (l.had) {
+            set_mod_car(rdram, n, std::move(l.car), l.prefix, l.scuffed, l.spec);
+        }
+        else {
+            clear_mod_car(rdram, n);
+        }
+        l = LentSlot{};
+    }
+}
+
+namespace {
+    // ModCar's physics and look settings as bytes (mod_car_spec), little-endian, floats by their bits.
+    struct SpecWriter {
+        std::vector<uint8_t> out;
+        void u8(uint8_t v) { out.push_back(v); }
+        void u32(uint32_t v) { for (int i = 0; i < 4; i++) out.push_back(uint8_t(v >> (8 * i))); }
+        void f32(float f) { uint32_t v; memcpy(&v, &f, 4); u32(v); }
+    };
+    struct SpecReader {
+        const std::vector<uint8_t>& in;
+        size_t at = 0;
+        bool bad = false;
+        uint8_t u8() { if (at >= in.size()) { bad = true; return 0; } return in[at++]; }
+        uint32_t u32() { uint32_t v = 0; for (int i = 0; i < 4; i++) v |= uint32_t(u8()) << (8 * i); return v; }
+        float f32() { uint32_t v = u32(); float f; memcpy(&f, &v, 4); return f; }
+    };
+    constexpr uint8_t spec_version = 1;
+}
+
+std::vector<uint8_t> rush2::car2049::mod_car_spec(int n) {
+    ModCar m;
+    {
+        std::lock_guard lock{ side_mutex };
+        if (n < 0 || n >= rush2::car_types::count_mod || !mod_slots[n].loaded) return {};
+        m = mod_slots[n].spec;
+    }
+    SpecWriter w;
+    w.u8(spec_version);
+    w.u8(uint8_t(std::min<size_t>(m.name.size(), 32)));
+    for (size_t i = 0; i < m.name.size() && i < 32; i++) w.u8(uint8_t(m.name[i]));
+    w.u8(uint8_t(m.base));
+    w.u8(m.has_wheels ? 1 : 0);
+    for (auto& wheel : m.wheels) for (float f : wheel) w.f32(f);
+    w.f32(m.wheel_scale[0]);
+    w.f32(m.wheel_scale[1]);
+    w.u8(m.has_box ? 1 : 0);
+    for (float f : m.box) w.f32(f);
+    w.u32(uint32_t(m.main));
+    w.u32(uint32_t(m.accent));
+    w.u32(uint32_t(m.physics_from));
+    w.u32(uint32_t(m.top_gear));
+    w.u8(m.tires_2049 ? 1 : 0);
+    w.u32(uint32_t(m.desc_floats.size()));
+    for (const auto& [o, v] : m.desc_floats) { w.u32(o); w.f32(v); }
+    w.u32(uint32_t(m.table_floats.size()));
+    for (const auto& [o, v] : m.table_floats) { w.u32(o); w.f32(v); }
+    w.u32(uint32_t(m.table_bytes.size()));
+    for (const auto& [o, v] : m.table_bytes) { w.u32(o); w.u32(uint32_t(v)); }
+    return w.out;
+}
+
+bool rush2::car2049::read_mod_car_spec(const std::vector<uint8_t>& bytes, ModCar& m) {
+    SpecReader r{ bytes };
+    if (r.u8() != spec_version) return false;
+    m = ModCar{};
+    int name_size = r.u8();
+    for (int i = 0; i < name_size; i++) m.name += char(r.u8());
+    m.base = r.u8();
+    m.has_wheels = r.u8() != 0;
+    for (auto& wheel : m.wheels) for (float& f : wheel) f = r.f32();
+    m.wheel_scale[0] = r.f32();
+    m.wheel_scale[1] = r.f32();
+    m.has_box = r.u8() != 0;
+    for (float& f : m.box) f = r.f32();
+    m.main = int32_t(r.u32());
+    m.accent = int32_t(r.u32());
+    m.physics_from = int32_t(r.u32());
+    m.top_gear = int32_t(r.u32());
+    m.tires_2049 = r.u8() != 0;
+    // Counts are capped: a short message reads as bad, never as a huge list.
+    uint32_t count = std::min<uint32_t>(r.u32(), 4096);
+    for (uint32_t i = 0; i < count && !r.bad; i++) { uint32_t o = r.u32(); m.desc_floats.emplace_back(o, r.f32()); }
+    count = std::min<uint32_t>(r.u32(), 4096);
+    for (uint32_t i = 0; i < count && !r.bad; i++) { uint32_t o = r.u32(); m.table_floats.emplace_back(o, r.f32()); }
+    count = std::min<uint32_t>(r.u32(), 4096);
+    for (uint32_t i = 0; i < count && !r.bad; i++) { uint32_t o = r.u32(); m.table_bytes.emplace_back(o, int32_t(r.u32())); }
+    return !r.bad && m.base >= 0 && m.base < rush2_types;
+}
+
+uint32_t rush2::car2049::physics_hash(uint8_t* rdram, int type, int row, uint32_t h) {
+    if (type < 0 || type >= new_types) return h;
+    auto add = [&](uint32_t at, uint32_t size) {
+        for (uint32_t i = 0; i < size; i++) h = (h ^ (uint8_t)MEM_BU(0, (int32_t)(at + i))) * 16777619u;
+    };
+    // What the physics read for a car of `type` in row `row` (0 a computer car, player + 1): the per-type physics
+    // tables (as build_mod_physics counts them, with ENGINE), its descriptor and its box. Names, wheel scales, rims and
+    // colors are looks, which a stand-in mod car (set_stand_in_mod_car) has of its own.
+    constexpr uint32_t physics_tables[] = { types_::steer_base, types_::yaw_damping, types_::preload, types_::mass,
+                                            types_::inertia, types_::yaw_inertia, types_::weight, types_::engine,
+                                            types_::torque, types_::drive, types_::suspension, types_::tires };
+    for (const Table& t : tables) {
+        if (std::find(std::begin(physics_tables), std::end(physics_tables), t.old_base) == std::end(physics_tables)) {
+            continue;
+        }
+        int r = row < new_rows(t) ? row : 0;
+        add(types_::entry(t.old_base, r, type), (uint32_t)t.size);
+    }
+    int desc = (uint8_t)MEM_BU(0, (int32_t)(t_desc_index + type));
+    uint32_t at = (uint32_t)MEM_W(0, (int32_t)(desc_ptrs + desc * 4));
+    if (at >= 0x80000000u && at + desc_size <= 0x81000000u) {
+        // Words that are addresses (the tire curves, +0x68) point at the same data on every machine: their target is
+        // in the ROM's tables or build_physics' copies, laid out alike.
+        add(at, desc_size);
+    }
+    add(boxes + type * 16, 16);
+    return h;
+}
+
 int rush2::car2049::mod_car_paints(int type) {
     if (!rush2::car_types::is_mod(type)) return 3;
     std::lock_guard lock{ side_mutex };
@@ -1657,6 +1952,17 @@ extern "C" void rush2_car49_asset(uint8_t* rdram, recomp_context* ctx, uint64_t*
     if (type >= rush2::car2049::first_type && type < rush2::car2049::types) {
         *reg = (uint64_t)(int64_t)rush2::car2049::car_asset(type);
     }
+}
+
+// func_800A37F4's free heap checks (a car's model is loaded only if the heap holds its asset + 0x200; else a smaller
+// Rush 2 type's is): they read the size table at $s5 (asset_sizes) + type * 4 + 0x74, asset 0x1D + type, with the
+// type in $v1. reg is that address less 0x74: pointed at the type's own asset's entry. Unmapped, a 2049 type read a
+// track asset's size (type 24: 0x35, the HAWAII slot's geometry, which hosts the custom tracks), so a big custom track
+// (the arcade Presidio) failed the check and the player drove the Pickup.
+extern "C" void rush2_car49_asset_size(uint8_t* rdram, recomp_context* ctx, uint64_t* reg) {
+    uint64_t index = (uint64_t)(int64_t)((int32_t)ctx->r3 + 0x1D);
+    rush2_car49_asset(rdram, ctx, &index);
+    *reg = (uint64_t)(int64_t)(int32_t)((uint32_t)ctx->r21 + (uint32_t)index * 4 - 0x74);
 }
 
 bool rush2::car2049::type_available(int type) {
@@ -2493,8 +2799,8 @@ const char* rush2::car2049::display_name(int k) {
 
 // func_800A37F4, after a drone's random car type (0-15, $t7) is drawn from the seed just stepped ($a0) and before it
 // is stored and checked against the cars already chosen: with the 2049 cars available the draw covers them too
-// (types 23-35 after Rush 2's 16), as the Rush 2049 Computer Cars option allows, and California Speed's (36-56) as
-// its California Speed Computer Cars option allows. On one game's track with that game's "Tracks" setting it covers
+// (types 23-35 after Rush 2's 16), as the Rush 2049 Drones option allows, and California Speed's (36-56) as
+// its CS Drones option allows. On one game's track with that game's "Tracks" setting it covers
 // only that game's cars (13 or 21 types, enough for the 7 drones to differ).
 extern "C" void rush2_car49_drone(uint8_t* rdram, recomp_context* ctx) {
     using rush2::car2049::DroneCars;
@@ -2586,6 +2892,28 @@ namespace {
     }
 }
 
+// Start of func_800599A0, Rush 2's brake lights ($a0 = the race car's callback entry, car index at +0xE; $a1 = braking):
+// every frame it rewrites entries 161-175 of the car's palette, Rush 2's tail light ramp, with 0xF801 when lit and
+// CARPALETTE's own when not. On a California Speed car those entries are the grays of its white, silver and chrome,
+// which it turned red, so for one it is skipped (returns true) and its own tail lights (CARPALETTE 128-143 on its body
+// textures) are lit by the same rule instead: rush2_car49_dent swaps in their lit copies (add_damage_textures).
+// docs/calspeed_research.md#brake-lights-turn-california-speed-grays-red
+extern "C" bool rush2_calspeed_brake_lights(uint8_t* rdram, recomp_context* ctx) {
+    if (MEM_BU(0, (int32_t)0x800E7BB0) != 0) return false; // Rush 2 leaves the lights alone then
+    int car = (int16_t)MEM_H(0, (int32_t)((uint32_t)ctx->r4 + 0xE));
+    if (car < 0 || car >= 8) return false;
+    uint32_t base = 0;
+    const Paint* p = car_instance(rdram, car, base);
+    if (p == nullptr || !p->calspeed) {
+        brake_lit[car] = 0;
+        return false;
+    }
+    // Lit while braking, when the car's flags have 0x1000 and not 0x10 (0x80059A1C-0x80059A28).
+    uint32_t flags = (uint32_t)MEM_W(0, (int32_t)(0x80112584 + car * 0x354));
+    brake_lit[car] = (int16_t)ctx->r5 != 0 && (flags & 0x1000) != 0 && (flags & 0x10) == 0;
+    return true;
+}
+
 extern "C" void rush2_car49_dent(uint8_t* rdram, recomp_context* ctx) {
     int car = (int16_t)MEM_H(0, (int32_t)((uint32_t)ctx->r4 + 0xE));
     if (car < 0 || car >= 8) {
@@ -2619,19 +2947,21 @@ extern "C" void rush2_car49_dent(uint8_t* rdram, recomp_context* ctx) {
         level[k] = v == 0 ? 0.0f : v == 1 ? 0.8f : 1.0f;
     }
     key |= uint32_t(livery + 1) << 16; // a livery shown since: its body takes the damage too
+    bool lit = brake_lit[car] != 0 && !(state >= 0 && state <= 2);
+    key |= uint32_t(lit) << 30;
     auto it = dented.find(base);
     if (it != dented.end() && it->second == key) {
         return;
     }
     dented[base] = key;
     if (p != nullptr) {
-        set_damage_textures(rdram, base, *p, level);
+        set_damage_textures(rdram, base, *p, level, lit);
         dent_body(rdram, base, p, level);
     }
     if (livery >= 0 && livery_base == base) {
         std::lock_guard lock{ livery_mutex };
         if (livery < (int)livery_bodies.size()) {
-            set_damage_textures(rdram, base, livery_bodies[livery], level);
+            set_damage_textures(rdram, base, livery_bodies[livery], level, lit);
             dent_body(rdram, base, &livery_bodies[livery], level);
         }
     }
@@ -2933,9 +3263,9 @@ namespace {
     uint32_t light_side_cursor = light_side_start;
     constexpr uint32_t car_body_nodes = types_::car_states; // + car * 0x134: the car's body scene node index
     constexpr uint32_t car_body_node_stride = 0x134;
-    constexpr uint32_t scene_nodes = 0x800D9E90;
+    constexpr uint32_t scene_node_table = rush2::scene_nodes::table;
     constexpr uint32_t scene_node_size = 0x38;
-    constexpr int max_scene_nodes = 0x400;
+    constexpr int max_scene_nodes = (int)rush2::scene_nodes::capacity;
     constexpr uint32_t game_state = 0x8010C0D0;       // 0-2 menus and the car select, 3 and up a race
 
     // Rush 2's car combiners that blend toward ENV by ENV alpha (every one the car models use), and their copies'
@@ -3005,7 +3335,7 @@ namespace {
                     if (n < 0 || n >= max_scene_nodes || car_of_node.contains(n)) continue;
                     car_of_node[n] = car;
                     parent_of_node[n] = parent;
-                    uint32_t node = scene_nodes + uint32_t(n) * scene_node_size;
+                    uint32_t node = scene_node_table + uint32_t(n) * scene_node_size;
                     stack.push_back({ (int16_t)MEM_H(0, (int32_t)(node + 0xE)), n });                  // first child
                     if (n != root) stack.push_back({ (int16_t)MEM_H(0, (int32_t)(node + 0x10)), parent });  // next sibling
                 }
@@ -3029,8 +3359,8 @@ namespace {
     void node_rotation(uint8_t* rdram, int n, float out[9]) {
         float m[9] = { 1, 0, 0, 0, 1, 0, 0, 0, 1 };
         for (int depth = 0; n >= 0 && n < max_scene_nodes && depth < 16; depth++) {
-            uint32_t transform = (uint32_t)MEM_W(4, (int32_t)(scene_nodes + uint32_t(n) * scene_node_size));
-            if (transform >= 0x80000000u && transform < 0x80800000u) {
+            uint32_t transform = (uint32_t)MEM_W(4, (int32_t)(scene_node_table + uint32_t(n) * scene_node_size));
+            if (rush2::in_game_ram(transform)) {
                 float r[9], p[9];
                 for (int i = 0; i < 9; i++) {
                     uint32_t bits = (uint32_t)MEM_W(i * 4, (int32_t)transform);
@@ -3075,8 +3405,8 @@ void rush2::car2049::light_model(uint8_t* rdram, recomp_context* ctx, uint32_t d
     }
     uint32_t node_addr = (uint32_t)ctx->r23;
     int car = -1;
-    if (node_addr >= scene_nodes && !car_of_node.empty()) {
-        auto it = car_of_node.find(int((node_addr - scene_nodes) / scene_node_size));
+    if (node_addr >= scene_node_table && !car_of_node.empty()) {
+        auto it = car_of_node.find(int((node_addr - scene_node_table) / scene_node_size));
         if (it != car_of_node.end()) car = it->second;
     }
     uint32_t rgba = 0;
@@ -3087,12 +3417,12 @@ void rush2::car2049::light_model(uint8_t* rdram, recomp_context* ctx, uint32_t d
     // instead; PRIM's alpha is kept.
     if (probes_ready && car >= 0) {
         float rot[9];
-        node_rotation(rdram, int((node_addr - scene_nodes) / scene_node_size), rot);
+        node_rotation(rdram, int((node_addr - scene_node_table) / scene_node_size), rot);
         uint32_t relit = rush2::probes::relight(rdram, car, (uint32_t)ctx->r30, rot);
         if (relit != 0) {
             uint32_t prim_alpha = 0xFF;
             if (!body) {
-                uint32_t body_node = scene_nodes + uint32_t((int32_t)MEM_W(0, (int32_t)(car_body_nodes + uint32_t(car) * car_body_node_stride))) * scene_node_size;
+                uint32_t body_node = scene_node_table + uint32_t((int32_t)MEM_W(0, (int32_t)(car_body_nodes + uint32_t(car) * car_body_node_stride))) * scene_node_size;
                 if ((uint32_t)MEM_W(0, (int32_t)body_node) & 0x2000) prim_alpha = MEM_BU(0, (int32_t)(body_node + 0x33));
             }
             GfxCommand env_push, env_pop, prim_push, prim_pop;
@@ -3144,7 +3474,7 @@ void rush2::car2049::light_model(uint8_t* rdram, recomp_context* ctx, uint32_t d
         if (copy != 0) {
             // Rush 2's own darkening: the car body node's ENV (flag 0x4000), black at alpha a, is a multiply by
             // 1 - a; its PRIM (flag 0x2000) is what the plain parts multiply by.
-            uint32_t body_node = scene_nodes + uint32_t((int32_t)MEM_W(0, (int32_t)(car_body_nodes + uint32_t(car) * car_body_node_stride))) * scene_node_size;
+            uint32_t body_node = scene_node_table + uint32_t((int32_t)MEM_W(0, (int32_t)(car_body_nodes + uint32_t(car) * car_body_node_stride))) * scene_node_size;
             uint32_t body_flags = (uint32_t)MEM_W(0, (int32_t)body_node);
             float keep = (body_flags & 0x4000) ? 1.0f - float(MEM_BU(0, (int32_t)(body_node + 0x37))) / 255.0f : 1.0f;
             uint32_t body_prim = (body_flags & 0x2000) ? (uint32_t)MEM_W(0, (int32_t)(body_node + 0x30)) : 0xFFFFFFFF;
@@ -3265,7 +3595,7 @@ namespace {
             for (const SheenSlot& s : sheen_slots) {
                 int n = (int32_t)MEM_W(0, (int32_t)(record + s.offset));
                 if (n < 0 || n >= max_scene_nodes) continue;
-                uint16_t h = MEM_HU(0, (int32_t)(scene_nodes + uint32_t(n) * scene_node_size + 0xC));
+                uint16_t h = MEM_HU(0, (int32_t)(scene_node_table + uint32_t(n) * scene_node_size + 0xC));
                 if (h == 0) continue;
                 if (h != MEM_HU(0, (int32_t)(parts + s.part * 2)) && h != MEM_HU(0, (int32_t)(parts + s.part * 2 + 2))) continue;
                 sheen_nodes.emplace(n, SheenNode{ rush2049, id, s.sheen });
@@ -3287,10 +3617,10 @@ void rush2::car2049::sheen_model(uint8_t* rdram, recomp_context* ctx) {
         built_at = now;
     }
     uint32_t node_addr = (uint32_t)ctx->r23;
-    if (node_addr < scene_nodes) {
+    if (node_addr < scene_node_table) {
         return;
     }
-    auto it = sheen_nodes.find(int((node_addr - scene_nodes) / scene_node_size));
+    auto it = sheen_nodes.find(int((node_addr - scene_node_table) / scene_node_size));
     if (it == sheen_nodes.end()) {
         return;
     }
@@ -3552,13 +3882,20 @@ extern "C" void rush2_car49_setup_desc(uint8_t* rdram, recomp_context* ctx) {
     int tires = row_byte(rdram, t_tires, row, type);
     bool slick = (tires == slicks || tires == pro_slicks) && setup49.loaded;
     bool fast = speeds_2049();
-    if (!car49 && !slick && !fast) {
+    // California Speed's physics (src/calspeed/calspeed_physics.cpp): a native car already reads its California Speed
+    // values from this copy (the options below then change it in place); a converted car gets a copy converted for
+    // the heavier road hold.
+    bool cs_converted = rush2::calspeed::physics::converted(rdram, car);
+    if (!car49 && !slick && !fast && !cs_converted) {
         return;
     }
     uint32_t desc = (uint32_t)ctx->r30;
     uint32_t copy = car_descs + slot * desc_size;
     for (uint32_t o = 0; o < desc_size; o += 4) {
         MEM_W(0, (int32_t)(copy + o)) = MEM_W(0, (int32_t)(desc + o));
+    }
+    if (cs_converted) {
+        rush2::calspeed::physics::convert_descriptor(rdram, copy);
     }
     float torque = 1.0f;
     const Setup49& s = setup49;
@@ -3641,11 +3978,15 @@ extern "C" int rush2_car49_offroad(uint8_t* rdram, recomp_context* ctx) {
     return 1;
 }
 
-// Car select, func_803B9478: changing a player's TIRES value (0x803BA0BC: the row byte at $v0 + 0x24 before the change;
-// 0x803BA134: the new value in $v1 after Rush 2's wrap at 11; type $a3, direction $a1, 0 = back to the default; player
-// $s7). While the 2049 cars are on, every car's row goes on to SLICKS and PRO SLICKS; the unlock system skips the ones
+// Car select, func_803B9478: changing a player's TIRES value (0x803BA0BC: the row byte at $v0 + row_offset before the
+// change; 0x803BA134: the new value in $v1 after Rush 2's wrap at 11; type $a3, direction $a1, 0 = back to the default;
+// player $s7). While the 2049 cars are on, every car's row goes on to SLICKS and PRO SLICKS; the unlock system skips the ones
 // it keeps locked (src/unlocks.cpp).
 namespace {
+    // The car select addresses a player's row byte as $reg + the table width (row player + 1 of the widened per-type
+    // tables, include/car_types.h; us.toml's "row offset" patches), not Rush 2's 0x16.
+    constexpr uint32_t row_offset = (uint32_t)types;
+
     int tires_before = -1;
 
     // Rush 2's own sets are always open; SLICKS (1) and PRO SLICKS (2) are the unlock system's.
@@ -3658,7 +3999,7 @@ namespace {
 }
 
 extern "C" void rush2_car49_tires_before(uint8_t* rdram, recomp_context* ctx) {
-    tires_before = (int8_t)MEM_B(0, (int32_t)((uint32_t)ctx->r2 + 0x24));
+    tires_before = (int8_t)MEM_B(0, (int32_t)((uint32_t)ctx->r2 + row_offset));
 }
 
 extern "C" void rush2_car49_tires_value(uint8_t* rdram, recomp_context* ctx) {
@@ -3675,7 +4016,7 @@ extern "C" void rush2_car49_tires_value(uint8_t* rdram, recomp_context* ctx) {
     do {
         value = (value + step + count) % count;
     } while (!tires_open(rdram, player, value));
-    MEM_B(0, (int32_t)((uint32_t)ctx->r2 + 0x24)) = (int8_t)value;
+    MEM_B(0, (int32_t)((uint32_t)ctx->r2 + row_offset)) = (int8_t)value;
     ctx->r3 = (uint64_t)(int64_t)value;
 }
 
@@ -3696,15 +4037,15 @@ const char* rush2::car2049::tire_name(int tire) {
     return tire >= 0 && tire < tires49_count ? tire_names[tire] : "";
 }
 
-// Car select, func_803B9478: changing a player's ENGINE value. At 0x803B9E3C the row byte is at $v1 + 0x24 (type $a3,
-// direction $a1, player $s7); at 0x803B9E78 the new value is in $v0, after Rush 2's wrap at 10 and its skip of a
+// Car select, func_803B9478: changing a player's ENGINE value. At 0x803B9E3C the row byte is at $v1 + row_offset (type
+// $a3, direction $a1, player $s7); at 0x803B9E78 the new value is in $v0, after Rush 2's wrap at 10 and its skip of a
 // locked engine. The 2049 cars have 9 engines; the unlock system may lock levels 3-8 (src/unlocks.cpp).
 namespace {
     int engine_before = -1;
 }
 
 extern "C" void rush2_car49_engine_before(uint8_t* rdram, recomp_context* ctx) {
-    engine_before = (int8_t)MEM_B(0, (int32_t)((uint32_t)ctx->r3 + 0x24));
+    engine_before = (int8_t)MEM_B(0, (int32_t)((uint32_t)ctx->r3 + row_offset));
 }
 
 extern "C" void rush2_car49_engine_value(uint8_t* rdram, recomp_context* ctx) {
@@ -3720,7 +4061,7 @@ extern "C" void rush2_car49_engine_value(uint8_t* rdram, recomp_context* ctx) {
     do {
         value = (value + step + engine_levels) % engine_levels;
     } while (value != 0 && !rush2::unlocks::engine_open(rdram, player, value));
-    MEM_B(0, (int32_t)((uint32_t)ctx->r3 + 0x24)) = (int8_t)value;
+    MEM_B(0, (int32_t)((uint32_t)ctx->r3 + row_offset)) = (int8_t)value;
     ctx->r2 = (uint64_t)value;
 }
 
@@ -4442,12 +4783,13 @@ void rush2::car2049::set_accurate_bars(bool on) {
 
 // The top of the main loop, once per frame (rush2_cheats_frame). Working out the bars' ranges drives every selectable
 // car through every option that sets a bar's ends, about a second of work, which the first car select (or the unlock
-// system's shop, which runs the car select's setup) would otherwise stall on. It runs here instead, a few
-// milliseconds a frame so no frame stalls, while the game is in the menus, track select or car select (game state
-// 0x8010C0D0 0-2: no race is using the test car's slot): from the first frame after boot, and again in the menus after
-// Car Speeds, the 2049 cars or Torque Rebalance change. A car select reached before it finishes does the rest at once
-// (find_ranges). The ranges are cached on disk (plan_ranges), so this only runs after a new build or a change of those
-// inputs.
+// system's shop, which runs the car select's setup) would otherwise stall on. It runs here instead, a slice a frame
+// so no frame stalls, while the game is in the menus, track select or car select (game state 0x8010C0D0 0-2: no race
+// is using the test car's slot): from the first frame after boot, and again in the menus after Car Speeds, the 2049
+// cars or Torque Rebalance change. The boot logos, title screen and attract demo draw almost nothing, so there the
+// slice is 10 ms instead of 6 (20 ms made every logo frame late): after a new build the ranges are done about 4 s
+// into the logos, long before a car select (one reached before they finish does the rest at once, find_ranges). The
+// ranges are cached on disk (plan_ranges), so this only runs after a new build or a change of those inputs.
 void rush2::car2049::prepare_bars(uint8_t* rdram, recomp_context* ctx) {
     constexpr uint32_t game_state = 0x8010C0D0;
     if (!accurate_bars.load(std::memory_order_relaxed) || cache().ranged) {
@@ -4457,7 +4799,10 @@ void rush2::car2049::prepare_bars(uint8_t* rdram, recomp_context* ctx) {
     if (state < 0 || state > 2) {
         return;
     }
-    constexpr auto slice = std::chrono::milliseconds(6);
+    constexpr uint32_t front_end_screen = 0x800E7BC4;   // s16: 0xE boot logos, 0x10 title, 0x11-0x12 attract demo
+    int16_t screen = (int16_t)MEM_H(0, (int32_t)front_end_screen);
+    bool idle_screen = state == 0 && (screen == 0xE || screen == 0x10 || screen == 0x11 || screen == 0x12);
+    const auto slice = std::chrono::milliseconds(idle_screen ? 10 : 6);
     TestCache& c = cache();
     plan_ranges(rdram, c);
     if (c.ranged) {

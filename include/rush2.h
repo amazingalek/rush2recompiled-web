@@ -12,6 +12,12 @@ namespace rush2 {
     inline const std::u8string program_id = u8"Rush2Recompiled";
     inline const std::string program_name = "Rush 2: Recompiled";
 
+    // Whether a game pointer is in the game's 16 MB of RDRAM (mod memory starts at 0x81000000). The game heap reaches
+    // 0x80AE0000 (src/assets.cpp), so a check against the old 8 MB end rejects data a big track pushes past 0x80800000.
+    inline bool in_game_ram(uint32_t address) {
+        return address >= 0x80000000u && address < 0x81000000u;
+    }
+
     void register_overlays();
 
     // Creates the config menu tabs. Must be called before recomp::start.
@@ -24,6 +30,17 @@ namespace rush2 {
     void set_stunt_first_gear(bool enabled);
     // Hide Respawning Cars (src/game_fixes.cpp): a computer car is hidden through its glide back after a wreck.
     void set_hide_respawning_cars(bool enabled);
+    // Hood View Front Wheels (src/game_fixes.cpp): the open-wheel cars show their front wheels in the hood camera.
+    void set_hood_front_wheels(bool enabled);
+    // Chase Camera (src/camera.cpp): the VIEW button also reaches the attract demo's high chase camera.
+    void set_attract_camera(bool enabled);
+    // Look Back (src/camera.cpp): the LOOK BACK button and its Controller Setup row.
+    void set_look_back(bool enabled);
+    bool look_back_enabled();
+    // LOOK BACK turns a view's camera only while the frame is drawn (src/camera.cpp): before the view is drawn, and back
+    // after the frame's views and HUD.
+    void look_back_draw_view(uint8_t* rdram, int view);
+    void look_back_draw_end(uint8_t* rdram);
     // Car model fixes (src/game_fixes.cpp): replaces the ROCKET's asset with its windshield unpainted, the FORMULA's
     // with its wishbones mirrored and the STALLION's with its spoiler centered. Call at boot.
     void fix_car_models(uint8_t* rdram);
@@ -227,6 +244,8 @@ namespace rush2 {
         bool is_controller_enabled(int32_t joystick_id);
         // The controller currently driving a port, or -1.
         int32_t get_port_controller(int port);
+        // Whether RUSH2_TEST_VPAD's virtual controller drives the port (a simulation run reads it like a real one).
+        bool is_test_vpad_port(int port);
         // The port the keyboard drives, or -1 for none (off, or it hasn't pressed anything yet).
         int get_keyboard_port();
         bool get_keyboard_enabled();
@@ -245,10 +264,11 @@ namespace rush2 {
     // Button bindings for driving (src/controls.cpp). In races each player's bound inputs are turned into the game's
     // default N64 layout, which the game's own binding table is locked to; menus use a fixed layout.
     namespace controls {
-        // The rows of the game's Controller Setup screen, in order. Fire and DropWeapon are the battle arenas' weapon
-        // buttons (src/rush2049/battle.cpp): they aren't N64 buttons of the game's layout, and are read with battle_buttons.
+        // The actions of the game's Controller Setup screen. Fire and DropWeapon are the battle arenas' weapon
+        // buttons (src/rush2049/battle.cpp), read with battle_buttons, and LookBack turns the camera around while held
+        // (src/camera.cpp, look_back_held): none of them are N64 buttons of the game's layout.
         enum class Action : uint8_t {
-            Gas, Brake, Steering, ShiftUp, ShiftDown, Reverse, Abort, View, Horn, Wings, Fire, DropWeapon, Count
+            Gas, Brake, Steering, ShiftUp, ShiftDown, Reverse, Abort, View, Horn, Wings, Fire, DropWeapon, LookBack, Count
         };
         constexpr int action_count = static_cast<int>(Action::Count);
 
@@ -294,6 +314,8 @@ namespace rush2 {
         // arrow), which fires a weapon backward (rush2::battle::set_fire_backward).
         constexpr uint8_t battle_fire = 1, battle_drop = 2, battle_back = 4;
         uint8_t battle_buttons(int port);
+        // Whether LOOK BACK is held on a port, as of its last race input.
+        bool look_back_held(int port);
         // True if an input on the port's devices is held (used to wait for releases).
         bool any_input_held(int port);
 

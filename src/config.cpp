@@ -22,6 +22,7 @@
 #include "music.h"
 #include "pause_menu.h"
 #include "track1.h"
+#include "arcade2049.h"
 #include "calspeed.h"
 #include "track2049.h"
 #include "collectibles.h"
@@ -43,19 +44,29 @@ static void add_remaining_options(rush2::ui::OptionsPage* page, recomp::config::
     }
 }
 
-// Shows a config's options under headings, replacing the frontend's tab for it (which lists them in the order they
-// were added, and is hidden by the caller). Each section is a heading and its option ids; options not listed go last.
+// A heading of an ordered tab and its option ids. new_column starts it at the top of the next column.
+struct TabSection {
+    std::string heading;
+    std::vector<std::string> ids;
+    bool new_column = false;
+};
+
+// Shows a config's options under headings in columns (rush2::ui::OptionsPage's column layout), replacing the frontend's
+// tab for it (which lists them in the order they were added, and is hidden by the caller). Options not listed go last.
 // section_extras adds elements at the end of the named sections.
-static void create_ordered_tab(const std::string& name, const std::string& tab_id, const std::string& config_id,
-                               std::vector<std::pair<std::string, std::vector<std::string>>> sections,
+static void create_ordered_tab(const std::string& name, const std::string& tab_id, const std::string& config_id, int columns,
+                               std::vector<TabSection> sections,
                                std::function<void(rush2::ui::OptionsPage*)> add_extra = nullptr,
                                std::map<std::string, std::function<void(rush2::ui::OptionsPage*)>> section_extras = {}) {
     recompui::config::create_tab(name, tab_id,
-        [config_id, sections, add_extra, section_extras](recompui::ContextId context, recompui::Element* parent) {
+        [config_id, columns, sections, add_extra, section_extras](recompui::ContextId context, recompui::Element* parent) {
             recomp::config::Config& config = recompui::config::get_config(config_id);
-            auto* page = context.create_element<rush2::ui::OptionsPage>(parent);
+            auto* page = context.create_element<rush2::ui::OptionsPage>(parent, "", columns);
             std::vector<std::string> added;
-            for (const auto& [heading, ids] : sections) {
+            for (const auto& [heading, ids, new_column] : sections) {
+                if (new_column) {
+                    page->next_column();
+                }
                 page->add_heading(heading);
                 for (const std::string& id : ids) {
                     page->add_option(config, id);
@@ -148,6 +159,9 @@ static void customize_general_options(recomp::config::Config& config) {
                                    recompui::config::general::options::joystick_deadzone }) {
         const_cast<recomp::config::ConfigOption&>(config.get_option(id)).hidden = true;
     }
+    // Short enough for one line in the General tab's column.
+    const_cast<recomp::config::ConfigOption&>(config.get_option(recompui::config::general::options::background_input_mode)).name =
+        "Background Input";
 }
 
 namespace lod_option {
@@ -271,10 +285,10 @@ static void add_font_option(recomp::config::Config& config) {
         "Fonts",
         "Sets how the game's text and race HUD numbers are drawn. "
         "<recomp-color primary>Original</recomp-color> uses the original low-resolution fonts. "
-        "<recomp-color primary>High Resolution</recomp-color> uses redrawn versions that stay sharp at any resolution.",
+        "<recomp-color primary>HD</recomp-color> uses redrawn versions that stay sharp at any resolution.",
         {
             { FontMode::Original, "Original", "Original" },
-            { FontMode::HighResolution, "HighResolution", "High Resolution" },
+            { FontMode::HighResolution, "HighResolution", "HD" },
         },
         FontMode::HighResolution
     );
@@ -663,6 +677,67 @@ static void add_hide_respawn_option(recomp::config::Config& config) {
         });
 }
 
+namespace hood_wheels_option {
+    const std::string id = "hood_front_wheels";
+}
+
+// Hood View Front Wheels: the open-wheel cars keep their front wheels in the hood camera (src/game_fixes.cpp).
+static void add_hood_wheels_option(recomp::config::Config& config) {
+    config.add_bool_option(
+        hood_wheels_option::id,
+        "Hood View Front Wheels",
+        "In the hood view, the FORMULA, MOUNTAIN DEW and FORMULA 1 show their front wheels. Off, as in Rush 2, the "
+        "hood view hides every car's wheels. Takes effect at once, even mid-race.",
+        true
+    );
+
+    config.add_option_change_callback(hood_wheels_option::id,
+        [](recomp::config::ConfigValueVariant cur_value, recomp::config::ConfigValueVariant, recomp::config::OptionChangeContext) {
+            rush2::set_hood_front_wheels(std::get<bool>(cur_value));
+        });
+}
+
+namespace attract_camera_option {
+    const std::string id = "attract_camera";
+}
+
+// Chase Camera (id attract_camera, kept so saved settings stay valid): the VIEW button also reaches the attract demo's high chase camera (src/camera.cpp).
+static void add_attract_camera_option(recomp::config::Config& config) {
+    config.add_bool_option(
+        attract_camera_option::id,
+        "Chase Camera",
+        "Adds the attract demo's high chase camera, far behind and high above the car, to the cameras the VIEW "
+        "button goes through, after the two chase cameras. Off, as in Rush 2, VIEW goes through four cameras. Takes "
+        "effect at the next VIEW press, even mid-race.",
+        false
+    );
+
+    config.add_option_change_callback(attract_camera_option::id,
+        [](recomp::config::ConfigValueVariant cur_value, recomp::config::ConfigValueVariant, recomp::config::OptionChangeContext) {
+            rush2::set_attract_camera(std::get<bool>(cur_value));
+        });
+}
+
+namespace look_back_option {
+    const std::string id = "look_back";
+}
+
+// Look Back: the LOOK BACK button turns the camera around while held (src/camera.cpp).
+static void add_look_back_option(recomp::config::Config& config) {
+    config.add_bool_option(
+        look_back_option::id,
+        "Look Back",
+        "Hold the LOOK BACK button (D-pad left by default) to look behind the car. Off, as in Rush 2, there's no LOOK "
+        "BACK button and the Controller Setup screen doesn't list it. Takes effect at once.",
+        true
+    );
+
+    config.add_option_change_callback(look_back_option::id,
+        [](recomp::config::ConfigValueVariant cur_value, recomp::config::ConfigValueVariant, recomp::config::OptionChangeContext) {
+            rush2::set_look_back(std::get<bool>(cur_value));
+        });
+}
+
 namespace catch_up_option {
     const std::string id = "drone_catch_up";
 }
@@ -872,26 +947,35 @@ void rush2::init_config() {
     rush2::control_profiles::load(); // Before finalize() saves general.json without the options it moves in from.
     {
         namespace general = recompui::config::general;
-        create_ordered_tab(general::tab_name, "rush2_general", general::id, {
+        // The third column is left for the AI Opponents and Circuit Courses lists, which open there (one at a time),
+        // so showing one moves nothing in the others.
+        create_ordered_tab(general::tab_name, "rush2_general", general::id, 3, {
             { "Gameplay", { car_stats_option::id, torque_option::id, stunt_gear_option::id, hide_respawn_option::id,
-                            catch_up_option::id, pause_extras_option::id, rush2::game_filter::option_id(), circuit_review_option::id, more_circuit_option::id, circuit_fixed_difficulty_option::id, ghost_option::id, ghosts_kept_option::id } },
+                            hood_wheels_option::id, attract_camera_option::id, look_back_option::id, catch_up_option::id, pause_extras_option::id, rush2::game_filter::option_id() } },
             { "System", { general::options::background_input_mode, menu_background_option::id, data_location_option::id } },
+            { "Circuits", { circuit_review_option::id, more_circuit_option::id, circuit_fixed_difficulty_option::id }, true },
+            { "Ghosts", { ghost_option::id, ghosts_kept_option::id } },
+            { "Opponents", {} },
         }, nullptr, {
-            { "Gameplay", [](rush2::ui::OptionsPage* page) {
-                rush2::npc_cars::add_section(page->get_list(), page->text_shower(rush2::npc_cars::description));
-                rush2::circuit::add_section(page->get_list(), [page](const std::string& text) { return page->text_shower(text); });
+            { "Circuits", [](rush2::ui::OptionsPage* page) {
+                rush2::circuit::add_section(page->get_list(), [page](const std::string& text) { return page->text_shower(text); },
+                                            page->expand_panel());
+            } },
+            { "Opponents", [](rush2::ui::OptionsPage* page) {
+                rush2::npc_cars::add_section(page->get_list(), page->text_shower(rush2::npc_cars::description),
+                                             page->expand_panel());
             } },
         });
         namespace graphics = recompui::config::graphics;
-        create_ordered_tab(graphics::tab_name, "rush2_graphics", graphics::id, {
+        create_ordered_tab(graphics::tab_name, "rush2_graphics", graphics::id, 3, {
             { "Display", { graphics::options::wm_option, graphics::options::res_option, graphics::options::ds_option, graphics::options::ar_option,
                            graphics::options::hr_option, graphics::options::rr_option, graphics::options::rr_manual_value,
                            graphics::options::api_option } },
-            { "Quality", { graphics::options::msaa_option, anisotropy_option::id, mipmap_option::id, lod_option::id, draw_distance_option::id, font_option::id } },
+            { "Quality", { graphics::options::msaa_option, anisotropy_option::id, mipmap_option::id, lod_option::id, draw_distance_option::id, font_option::id }, true },
             { "Effects", { ambient_occlusion_option::id, car_lighting_option::id, car_sheen_option::id, car_reflections_option::id, reflection_blur_option::id, reflection_rate_option::id } },
-            { "Textures", { rush2::upscale::dreamcast_option_id, rush2::upscale::mode_option_id,
-                            rush2::upscale::command_option_id, rush2::upscale::interface_option_id,
-                            rush2::upscale::car_colors_option_id } },
+            { "Textures", { rush2::upscale::dreamcast_option_id, rush2::upscale::interface_option_id,
+                            rush2::upscale::car_colors_option_id, rush2::upscale::mode_option_id,
+                            rush2::upscale::command_option_id }, true },
         }, rush2::upscale::add_buttons);
     }
 
@@ -907,6 +991,9 @@ void rush2::init_config() {
     add_torque_option(general_config);
     add_stunt_gear_option(general_config);
     add_hide_respawn_option(general_config);
+    add_hood_wheels_option(general_config);
+    add_attract_camera_option(general_config);
+    add_look_back_option(general_config);
     add_catch_up_option(general_config);
     add_pause_extras_option(general_config);
     rush2::game_filter::add_option(general_config);
@@ -986,6 +1073,12 @@ void rush2::init_config() {
         recompui::config::get_general_config().get_option_value(stunt_gear_option::id)));
     rush2::set_hide_respawning_cars(std::get<bool>(
         recompui::config::get_general_config().get_option_value(hide_respawn_option::id)));
+    rush2::set_hood_front_wheels(std::get<bool>(
+        recompui::config::get_general_config().get_option_value(hood_wheels_option::id)));
+    rush2::set_attract_camera(std::get<bool>(
+        recompui::config::get_general_config().get_option_value(attract_camera_option::id)));
+    rush2::set_look_back(std::get<bool>(
+        recompui::config::get_general_config().get_option_value(look_back_option::id)));
     rush2::npc_cars::set_catch_up(std::get<bool>(
         recompui::config::get_general_config().get_option_value(catch_up_option::id)));
     rush2::game_filter::apply(std::get<bool>(
@@ -1007,6 +1100,7 @@ void rush2::init_config() {
     rush2::circuit::load_config();
     rush2::track1::load_config();
     rush2::calspeed::load_config();
+    rush2::arcade2049::load_config();
     rush2::music::load_config();
     // Last: the lobby compares the settings of the configs loaded above.
     rush2::online_tab::load_config();
