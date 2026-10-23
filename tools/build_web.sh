@@ -70,8 +70,9 @@ if [[ "$(cat $prep/web-patched 2> /dev/null)" != "$stamp" ]]; then
         git -C $s reset -q --hard && git -C $s clean -fdq
         rm -f "$(git -C $s rev-parse --path-format=absolute --git-dir)"/n64recomp-browser-*
     done
-    for patch in lib/patches/*.patch; do
-        git -C "lib/$(basename "$patch" .patch)" apply --whitespace=nowarn "$root/$patch"
+    for patch in lib/patches/*.patch; do  # a nested submodule's names its path with -- for / (CMakeLists.txt)
+        sub="$(basename "$patch" .patch)"
+        git -C "lib/${sub//--//}" apply --whitespace=nowarn "$root/$patch"
     done
     while read -r name checkout skip; do
         cmake -P $browser/patches/apply.cmake "$name" "$checkout" $skip
