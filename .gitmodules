@@ -20,4 +20,4 @@
 	ignore = dirty
 [submodule "lib/N64Recomp-browser"]
 	path = lib/N64Recomp-browser
-	url = https://github.com/amazingalek/N64Recomp-browser
+	url = https://github.com/n64hub/N64Recomp-browser

@@ -153,7 +153,7 @@ tab and buttons are bound in the game's own Controls screen.
 
 This fork's `main` branch also builds with [Emscripten](https://emscripten.org) into a page, `Rush2Recompiled.html`,
 that draws through WebGPU. `lib/rt64`, `lib/N64ModernRuntime` and `lib/RecompFrontend` are Rush 2 Recompiled's own, at
-the same commits, and [N64Recomp-browser](https://github.com/amazingalek/N64Recomp-browser) (`lib/N64Recomp-browser`)
+the same commits, and [N64Recomp-browser](https://github.com/n64hub/N64Recomp-browser) (`lib/N64Recomp-browser`)
 patches their checkouts with the web support and makes the game a page. The desktop build is unchanged: its patches,
 `lib/patches`, are applied by `CMakeLists.txt` as before, and nothing of the web's is.
 
@@ -188,8 +188,8 @@ page remembers it and builds it with the rest on the next visit. `web/play_plan.
 minutes; their headers say how.
 
 How the page plays, in each browser and on which GPU, is recorded in N64Recomp-browser's
-[plays.jsonl](https://github.com/amazingalek/N64Recomp-browser/blob/main/plays.jsonl) and its
-[games table](https://github.com/amazingalek/N64Recomp-browser#games).
+[plays.jsonl](https://github.com/n64hub/N64Recomp-browser/blob/main/plays.jsonl) and its
+[games table](https://github.com/n64hub/N64Recomp-browser#games).
 
 ## Releases
 

@@ -1,6 +1,6 @@
 > [!WARNING]
-> **This is amazingalek/rush2recompiled-web, a fork, not Rush 2 Recompiled.** Its `main` branch builds the game into a
-> web page (WebGPU, through [N64Recomp-browser](https://github.com/amazingalek/N64Recomp-browser)), and everything on
+> **This is n64hub/rush2recompiled-web, a fork, not Rush 2 Recompiled.** Its `main` branch builds the game into a
+> web page (WebGPU, through [N64Recomp-browser](https://github.com/n64hub/N64Recomp-browser)), and everything on
 > that branch past upstream's commits was written by AI (Claude). It is not made, endorsed or supported by Rush 2
 > Recompiled's author: nothing here is offered upstream, and please don't take issues with this fork to them. Building
 > the page: [docs/BUILDING.md](docs/BUILDING.md#the-web-page).
@@ -8,7 +8,7 @@
 > This port is here to build out and test N64Recomp-browser's web support on another game than the ones it was written
 > for: what it turns up is fixed there where it can be, so every recomp's page gets the fix.
 
-**Play it in the browser: https://amazingalek.github.io/rush2recompiled-web/**, with your own Rush 2 ROM (US), picked
+**Play it in the browser: https://n64hub.com/rush-2/**, with your own Rush 2 ROM (US), picked
 in the launcher and kept in the browser. It needs WebGPU (Chrome or Edge 113 and up). The page is built from this
 branch and published with N64Recomp-browser's `tools/publish_page.sh`, so it can be a commit or two behind. Online
 play is the desktop game's only: a browser gives a page no connections to race over.
